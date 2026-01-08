@@ -60,7 +60,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 # Navigate to the project directory
 cd /path/to/gc-analyze
 
-# Sync dependencies (creates virtual environment automatically)
+# Install Python 3.13 (if not already available)
+uv python install 3.13
+
+# Create virtual environment with Python 3.13
+uv venv --python 3.13
+
+# Sync dependencies (installs packages into the virtual environment)
 uv sync
 ```
 
