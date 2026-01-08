@@ -129,6 +129,62 @@ class MetaspaceAnalysis(BaseModel):
     metaspace_warnings: list[str] = Field(default_factory=list)
 
 
+class JVMHeapConfig(BaseModel):
+    """JVM heap and GC tuning configuration extracted from CommandLine flags."""
+
+    # Heap sizing
+    initial_heap_size_bytes: int | None = None  # -Xms or -XX:InitialHeapSize
+    max_heap_size_bytes: int | None = None  # -Xmx or -XX:MaxHeapSize
+    new_size_bytes: int | None = None  # -Xmn or -XX:NewSize
+    max_new_size_bytes: int | None = None  # -XX:MaxNewSize
+    old_size_bytes: int | None = None  # -XX:OldSize
+    new_ratio: int | None = None  # -XX:NewRatio
+    survivor_ratio: int | None = None  # -XX:SurvivorRatio
+    initial_survivor_ratio: int | None = None  # -XX:InitialSurvivorRatio
+    target_survivor_ratio: int | None = None  # -XX:TargetSurvivorRatio
+    max_tenuring_threshold: int | None = None  # -XX:MaxTenuringThreshold
+    max_heap_free_ratio: int | None = None  # -XX:MaxHeapFreeRatio
+    min_heap_free_ratio: int | None = None  # -XX:MinHeapFreeRatio
+
+    # Metaspace
+    metaspace_size_bytes: int | None = None  # -XX:MetaspaceSize
+    max_metaspace_size_bytes: int | None = None  # -XX:MaxMetaspaceSize
+    max_direct_memory_size_bytes: int | None = None  # -XX:MaxDirectMemorySize
+
+    # GC Threading
+    parallel_gc_threads: int | None = None  # -XX:ParallelGCThreads
+    conc_gc_threads: int | None = None  # -XX:ConcGCThreads
+
+    # GC Behavior Tuning
+    max_gc_pause_millis: int | None = None  # -XX:MaxGCPauseMillis
+    gc_time_ratio: int | None = None  # -XX:GCTimeRatio
+
+    # G1-specific
+    g1_heap_region_size_bytes: int | None = None  # -XX:G1HeapRegionSize
+    initiating_heap_occupancy_percent: int | None = None  # -XX:InitiatingHeapOccupancyPercent
+    g1_reserve_percent: int | None = None  # -XX:G1ReservePercent
+    g1_new_size_percent: int | None = None  # -XX:G1NewSizePercent
+    g1_max_new_size_percent: int | None = None  # -XX:G1MaxNewSizePercent
+    g1_mixed_gc_count_target: int | None = None  # -XX:G1MixedGCCountTarget
+
+    # CMS-specific
+    cms_initiating_occupancy_fraction: int | None = None  # -XX:CMSInitiatingOccupancyFraction
+
+    def format_size(self, size_bytes: int | None) -> str:
+        """Format bytes to human-readable size."""
+        if size_bytes is None:
+            return "Not set"
+
+        # Convert to appropriate unit
+        if size_bytes >= 1024**3:  # GB
+            return f"{size_bytes / (1024**3):.1f}G"
+        elif size_bytes >= 1024**2:  # MB
+            return f"{size_bytes / (1024**2):.1f}M"
+        elif size_bytes >= 1024:  # KB
+            return f"{size_bytes / 1024:.1f}K"
+        return f"{size_bytes}B"
+
+
 class G1Metrics(BaseModel):
     """G1 GC-specific diagnostic metrics."""
 
@@ -241,6 +297,7 @@ class GCSummary(BaseModel):
     metaspace_analysis: MetaspaceAnalysis | None = None
     g1_metrics: G1Metrics | None = None
     cms_metrics: CMSMetrics | None = None
+    jvm_heap_config: JVMHeapConfig | None = None
 
     # Warnings
     warnings: list[str] = Field(default_factory=list)
@@ -449,7 +506,9 @@ class G1GCParser:
                     current_event["survivor_before_kb"] = parse_size_to_kb(
                         survivor_match.group("before")
                     )
-                    current_event["survivor_after_kb"] = parse_size_to_kb(survivor_match.group("after"))
+                    current_event["survivor_after_kb"] = parse_size_to_kb(
+                        survivor_match.group("after")
+                    )
                     if survivor_match.group("total"):
                         current_event["survivor_total_kb"] = parse_size_to_kb(
                             survivor_match.group("total")
@@ -1085,7 +1144,6 @@ def calculate_cms_metrics(events: list[GCEvent], runtime_hours: float) -> CMSMet
     """Calculate CMS-specific metrics from events."""
     # Filter CMS-related events
     concurrent_events = [e for e in events if e.gc_kind == "Concurrent"]
-    full_events = [e for e in events if e.gc_kind == "Full"]
 
     # Only return metrics if we have CMS concurrent events (distinguishes CMS from other collectors)
     if not concurrent_events:
@@ -1117,8 +1175,123 @@ def calculate_cms_metrics(events: list[GCEvent], runtime_hours: float) -> CMSMet
     )
 
 
+def parse_jvm_size_to_bytes(value: str, unit: str | None) -> int:
+    """Convert JVM size notation to bytes.
+
+    Args:
+        value: Numeric value as string
+        unit: Unit suffix (k/m/g or None for bytes)
+
+    Returns:
+        Size in bytes
+    """
+    num = int(value)
+    if unit is None:
+        return num
+
+    unit_lower = unit.lower()
+    if unit_lower == "k":
+        return num * 1024
+    elif unit_lower == "m":
+        return num * 1024 * 1024
+    elif unit_lower == "g":
+        return num * 1024 * 1024 * 1024
+    return num
+
+
+def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
+    """Extract JVM heap and GC tuning arguments from CommandLine flags.
+
+    Args:
+        log_lines: Raw GC log lines
+
+    Returns:
+        JVMHeapConfig if CommandLine flags found, None otherwise
+    """
+    # Pattern to match CommandLine flags line
+    commandline_pattern = re.compile(r"CommandLine flags:\s*(.+)")
+
+    # Heap-related flag patterns (byte values)
+    byte_patterns = {
+        "initial_heap_size_bytes": re.compile(r"-XX:InitialHeapSize=(\d+)"),
+        "max_heap_size_bytes": re.compile(r"-XX:MaxHeapSize=(\d+)"),
+        "new_size_bytes": re.compile(r"-XX:NewSize=(\d+)"),
+        "max_new_size_bytes": re.compile(r"-XX:MaxNewSize=(\d+)"),
+        "old_size_bytes": re.compile(r"-XX:OldSize=(\d+)"),
+        "metaspace_size_bytes": re.compile(r"-XX:MetaspaceSize=(\d+)"),
+        "max_metaspace_size_bytes": re.compile(r"-XX:MaxMetaspaceSize=(\d+)"),
+        "max_direct_memory_size_bytes": re.compile(r"-XX:MaxDirectMemorySize=(\d+)"),
+        "g1_heap_region_size_bytes": re.compile(r"-XX:G1HeapRegionSize=(\d+)"),
+    }
+
+    # Integer/percentage patterns
+    int_patterns = {
+        "new_ratio": re.compile(r"-XX:NewRatio=(\d+)"),
+        "survivor_ratio": re.compile(r"-XX:SurvivorRatio=(\d+)"),
+        "initial_survivor_ratio": re.compile(r"-XX:InitialSurvivorRatio=(\d+)"),
+        "target_survivor_ratio": re.compile(r"-XX:TargetSurvivorRatio=(\d+)"),
+        "max_tenuring_threshold": re.compile(r"-XX:MaxTenuringThreshold=(\d+)"),
+        "max_heap_free_ratio": re.compile(r"-XX:MaxHeapFreeRatio=(\d+)"),
+        "min_heap_free_ratio": re.compile(r"-XX:MinHeapFreeRatio=(\d+)"),
+        "parallel_gc_threads": re.compile(r"-XX:ParallelGCThreads=(\d+)"),
+        "conc_gc_threads": re.compile(r"-XX:ConcGCThreads=(\d+)"),
+        "max_gc_pause_millis": re.compile(r"-XX:MaxGCPauseMillis=(\d+)"),
+        "gc_time_ratio": re.compile(r"-XX:GCTimeRatio=(\d+)"),
+        "initiating_heap_occupancy_percent": re.compile(
+            r"-XX:InitiatingHeapOccupancyPercent=(\d+)"
+        ),
+        "g1_reserve_percent": re.compile(r"-XX:G1ReservePercent=(\d+)"),
+        "g1_new_size_percent": re.compile(r"-XX:G1NewSizePercent=(\d+)"),
+        "g1_max_new_size_percent": re.compile(r"-XX:G1MaxNewSizePercent=(\d+)"),
+        "g1_mixed_gc_count_target": re.compile(r"-XX:G1MixedGCCountTarget=(\d+)"),
+        "cms_initiating_occupancy_fraction": re.compile(
+            r"-XX:CMSInitiatingOccupancyFraction=(\d+)"
+        ),
+    }
+
+    # Also support -Xms, -Xmx, -Xmn formats
+    xms_pattern = re.compile(r"-Xms(\d+)([kmgKMG])?")
+    xmx_pattern = re.compile(r"-Xmx(\d+)([kmgKMG])?")
+    xmn_pattern = re.compile(r"-Xmn(\d+)([kmgKMG])?")
+
+    # Search for CommandLine flags
+    for line in log_lines:
+        if match := commandline_pattern.search(line):
+            flags_str = match.group(1)
+            config_dict: dict[str, Any] = {}
+
+            # Parse byte-value flags
+            for field, pattern in byte_patterns.items():
+                if field_match := pattern.search(flags_str):
+                    value = int(field_match.group(1))
+                    config_dict[field] = value
+
+            # Parse integer/percentage flags
+            for field, pattern in int_patterns.items():
+                if field_match := pattern.search(flags_str):
+                    value = int(field_match.group(1))
+                    config_dict[field] = value
+
+            # Parse -Xms, -Xmx, -Xmn (convert to bytes, override if present)
+            if xms := xms_pattern.search(flags_str):
+                config_dict["initial_heap_size_bytes"] = parse_jvm_size_to_bytes(
+                    xms.group(1), xms.group(2)
+                )
+            if xmx := xmx_pattern.search(flags_str):
+                config_dict["max_heap_size_bytes"] = parse_jvm_size_to_bytes(
+                    xmx.group(1), xmx.group(2)
+                )
+            if xmn := xmn_pattern.search(flags_str):
+                config_dict["new_size_bytes"] = parse_jvm_size_to_bytes(xmn.group(1), xmn.group(2))
+
+            if config_dict:
+                return JVMHeapConfig(**config_dict)
+
+    return None
+
+
 def build_comprehensive_summary(
-    events: list[GCEvent], thresholds: DiagnosticThresholds
+    events: list[GCEvent], thresholds: DiagnosticThresholds, log_lines: list[str]
 ) -> GCSummary:
     """Build comprehensive GC summary with enhanced diagnostics."""
     pauses_young = [e.pause_time_seconds for e in events if e.gc_kind == "Young"]
@@ -1246,9 +1419,7 @@ def build_comprehensive_summary(
     # Old gen growth (percentage point change)
     old_start = old[0] if old else None
     old_end = old[-1] if old else None
-    old_growth = (
-        (old_end - old_start) if old_start is not None and old_end is not None else 0.0
-    )
+    old_growth = (old_end - old_start) if old_start is not None and old_end is not None else 0.0
 
     # Young Gen Analysis
     promotions: list[int] = []
@@ -1465,6 +1636,9 @@ def build_comprehensive_summary(
         summary.warnings.append(
             "⚠️ WARNING: CMS Full GC causes not parsed - concurrent mode failures are not reported"
         )
+
+    # Add JVM heap configuration
+    summary.jvm_heap_config = parse_jvm_heap_config(log_lines)
 
     return summary
 
@@ -1684,9 +1858,7 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
             "GC overhead >20%; reduce allocation rate or tune GC to improve throughput"
         )
     elif summary.gc_overhead_pct > 10:
-        recommendations.append(
-            "GC overhead >10%; investigate allocation hotspots and GC tuning"
-        )
+        recommendations.append("GC overhead >10%; investigate allocation hotspots and GC tuning")
 
     if summary.p99_pause > 10:
         recommendations.append(
@@ -1703,9 +1875,7 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
         )
 
     if summary.full_gc_per_hour > 1:
-        recommendations.append(
-            "Frequent Full GCs; review old-gen pressure and allocation patterns"
-        )
+        recommendations.append("Frequent Full GCs; review old-gen pressure and allocation patterns")
 
     if summary.metaspace_analysis:
         if summary.metaspace_analysis.peak_metaspace_used_percentage > 90:
@@ -1713,14 +1883,10 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
                 "Metaspace >90% peak; investigate classloader leaks or metaspace sizing"
             )
         if summary.metaspace_analysis.metaspace_growth_kb > 50 * 1024:
-            recommendations.append(
-                "Metaspace grew >50MB; investigate classloading churn"
-            )
+            recommendations.append("Metaspace grew >50MB; investigate classloading churn")
 
     if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 0:
-        recommendations.append(
-            "High allocation rate observed; review allocation-heavy code paths"
-        )
+        recommendations.append("High allocation rate observed; review allocation-heavy code paths")
 
     return recommendations
 
@@ -1731,6 +1897,106 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
     console.print()
     console.print(Panel(f"GC Type: {gc_type}", style="header", expand=False))
     console.print()
+
+    # JVM Heap Configuration (if available)
+    if summary.jvm_heap_config:
+        config = summary.jvm_heap_config
+        jvm_table = Table(
+            title="JVM Heap & GC Tuning Configuration",
+            show_header=False,
+            box=None,
+            padding=(0, 2),
+        )
+        jvm_table.add_column("Metric", style="label")
+        jvm_table.add_column("Value", style="metric")
+
+        # Heap Sizing
+        if config.initial_heap_size_bytes:
+            jvm_table.add_row(
+                "Initial Heap Size (-Xms)", config.format_size(config.initial_heap_size_bytes)
+            )
+        if config.max_heap_size_bytes:
+            jvm_table.add_row(
+                "Maximum Heap Size (-Xmx)", config.format_size(config.max_heap_size_bytes)
+            )
+        if config.new_size_bytes:
+            jvm_table.add_row(
+                "New Generation Size (-Xmn)", config.format_size(config.new_size_bytes)
+            )
+        if config.max_new_size_bytes:
+            jvm_table.add_row(
+                "Max New Generation Size", config.format_size(config.max_new_size_bytes)
+            )
+        if config.old_size_bytes:
+            jvm_table.add_row("Old Generation Size", config.format_size(config.old_size_bytes))
+
+        # Ratios and Thresholds
+        if config.new_ratio is not None:
+            jvm_table.add_row("New Ratio (Old/New)", str(config.new_ratio))
+        if config.survivor_ratio is not None:
+            jvm_table.add_row("Survivor Ratio (Eden/Survivor)", str(config.survivor_ratio))
+        if config.initial_survivor_ratio is not None:
+            jvm_table.add_row("Initial Survivor Ratio", str(config.initial_survivor_ratio))
+        if config.target_survivor_ratio is not None:
+            jvm_table.add_row("Target Survivor Ratio", f"{config.target_survivor_ratio}%")
+        if config.max_tenuring_threshold is not None:
+            jvm_table.add_row("Max Tenuring Threshold", str(config.max_tenuring_threshold))
+        if config.min_heap_free_ratio is not None:
+            jvm_table.add_row("Min Heap Free Ratio", f"{config.min_heap_free_ratio}%")
+        if config.max_heap_free_ratio is not None:
+            jvm_table.add_row("Max Heap Free Ratio", f"{config.max_heap_free_ratio}%")
+
+        # Metaspace
+        if config.metaspace_size_bytes:
+            jvm_table.add_row("Metaspace Size", config.format_size(config.metaspace_size_bytes))
+        if config.max_metaspace_size_bytes:
+            jvm_table.add_row(
+                "Max Metaspace Size", config.format_size(config.max_metaspace_size_bytes)
+            )
+        if config.max_direct_memory_size_bytes:
+            jvm_table.add_row(
+                "Max Direct Memory Size", config.format_size(config.max_direct_memory_size_bytes)
+            )
+
+        # GC Threading
+        if config.parallel_gc_threads is not None:
+            jvm_table.add_row("Parallel GC Threads", str(config.parallel_gc_threads))
+        if config.conc_gc_threads is not None:
+            jvm_table.add_row("Concurrent GC Threads", str(config.conc_gc_threads))
+
+        # GC Behavior Tuning
+        if config.max_gc_pause_millis is not None:
+            jvm_table.add_row("Max GC Pause Target", f"{config.max_gc_pause_millis}ms")
+        if config.gc_time_ratio is not None:
+            jvm_table.add_row("GC Time Ratio", str(config.gc_time_ratio))
+
+        # G1-Specific
+        if config.g1_heap_region_size_bytes:
+            jvm_table.add_row(
+                "G1 Heap Region Size", config.format_size(config.g1_heap_region_size_bytes)
+            )
+        if config.initiating_heap_occupancy_percent is not None:
+            jvm_table.add_row(
+                "Initiating Heap Occupancy %", f"{config.initiating_heap_occupancy_percent}%"
+            )
+        if config.g1_reserve_percent is not None:
+            jvm_table.add_row("G1 Reserve Percent", f"{config.g1_reserve_percent}%")
+        if config.g1_new_size_percent is not None:
+            jvm_table.add_row("G1 New Size Percent", f"{config.g1_new_size_percent}%")
+        if config.g1_max_new_size_percent is not None:
+            jvm_table.add_row("G1 Max New Size Percent", f"{config.g1_max_new_size_percent}%")
+        if config.g1_mixed_gc_count_target is not None:
+            jvm_table.add_row("G1 Mixed GC Count Target", str(config.g1_mixed_gc_count_target))
+
+        # CMS-Specific
+        if config.cms_initiating_occupancy_fraction is not None:
+            jvm_table.add_row(
+                "CMS Initiating Occupancy Fraction",
+                f"{config.cms_initiating_occupancy_fraction}%",
+            )
+
+        console.print(jvm_table)
+        console.print()
 
     # Quick Diagnosis
     diagnosis = determine_quick_diagnosis(summary)
@@ -1936,6 +2202,98 @@ def export_markdown_summary(summary: GCSummary, gc_type: str, output_path: Path)
     md_content.append("# GC Analysis Report\n\n")
     md_content.append(f"**Generated:** {datetime.now().isoformat()}\n\n")
     md_content.append(f"**GC Type:** {gc_type}\n\n")
+
+    # JVM Heap Configuration
+    if summary.jvm_heap_config:
+        config = summary.jvm_heap_config
+        md_content.append("## JVM Heap & GC Tuning Configuration\n\n")
+
+        # Heap Sizing
+        if config.initial_heap_size_bytes:
+            size = config.format_size(config.initial_heap_size_bytes)
+            md_content.append(f"- **Initial Heap Size (-Xms)**: {size}\n")
+        if config.max_heap_size_bytes:
+            size = config.format_size(config.max_heap_size_bytes)
+            md_content.append(f"- **Maximum Heap Size (-Xmx)**: {size}\n")
+        if config.new_size_bytes:
+            md_content.append(
+                f"- **New Generation Size (-Xmn)**: {config.format_size(config.new_size_bytes)}\n"
+            )
+        if config.max_new_size_bytes:
+            md_content.append(
+                f"- **Max New Generation Size**: {config.format_size(config.max_new_size_bytes)}\n"
+            )
+        if config.old_size_bytes:
+            md_content.append(
+                f"- **Old Generation Size**: {config.format_size(config.old_size_bytes)}\n"
+            )
+
+        # Ratios
+        if config.new_ratio is not None:
+            md_content.append(f"- **New Ratio**: {config.new_ratio}\n")
+        if config.survivor_ratio is not None:
+            md_content.append(f"- **Survivor Ratio**: {config.survivor_ratio}\n")
+        if config.initial_survivor_ratio is not None:
+            md_content.append(f"- **Initial Survivor Ratio**: {config.initial_survivor_ratio}\n")
+        if config.target_survivor_ratio is not None:
+            md_content.append(f"- **Target Survivor Ratio**: {config.target_survivor_ratio}%\n")
+        if config.max_tenuring_threshold is not None:
+            md_content.append(f"- **Max Tenuring Threshold**: {config.max_tenuring_threshold}\n")
+        if config.min_heap_free_ratio is not None:
+            md_content.append(f"- **Min Heap Free Ratio**: {config.min_heap_free_ratio}%\n")
+        if config.max_heap_free_ratio is not None:
+            md_content.append(f"- **Max Heap Free Ratio**: {config.max_heap_free_ratio}%\n")
+
+        # Metaspace
+        if config.metaspace_size_bytes:
+            md_content.append(
+                f"- **Metaspace Size**: {config.format_size(config.metaspace_size_bytes)}\n"
+            )
+        if config.max_metaspace_size_bytes:
+            md_content.append(
+                f"- **Max Metaspace Size**: {config.format_size(config.max_metaspace_size_bytes)}\n"
+            )
+        if config.max_direct_memory_size_bytes:
+            size = config.format_size(config.max_direct_memory_size_bytes)
+            md_content.append(f"- **Max Direct Memory**: {size}\n")
+
+        # GC Threading
+        if config.parallel_gc_threads is not None:
+            md_content.append(f"- **Parallel GC Threads**: {config.parallel_gc_threads}\n")
+        if config.conc_gc_threads is not None:
+            md_content.append(f"- **Concurrent GC Threads**: {config.conc_gc_threads}\n")
+
+        # GC Behavior
+        if config.max_gc_pause_millis is not None:
+            md_content.append(f"- **Max GC Pause Target**: {config.max_gc_pause_millis}ms\n")
+        if config.gc_time_ratio is not None:
+            md_content.append(f"- **GC Time Ratio**: {config.gc_time_ratio}\n")
+
+        # G1-Specific
+        if config.g1_heap_region_size_bytes:
+            size = config.format_size(config.g1_heap_region_size_bytes)
+            md_content.append(f"- **G1 Heap Region Size**: {size}\n")
+        if config.initiating_heap_occupancy_percent is not None:
+            md_content.append(
+                f"- **Initiating Heap Occupancy**: {config.initiating_heap_occupancy_percent}%\n"
+            )
+        if config.g1_reserve_percent is not None:
+            md_content.append(f"- **G1 Reserve Percent**: {config.g1_reserve_percent}%\n")
+        if config.g1_new_size_percent is not None:
+            md_content.append(f"- **G1 New Size Percent**: {config.g1_new_size_percent}%\n")
+        if config.g1_max_new_size_percent is not None:
+            md_content.append(f"- **G1 Max New Size Percent**: {config.g1_max_new_size_percent}%\n")
+        if config.g1_mixed_gc_count_target is not None:
+            md_content.append(
+                f"- **G1 Mixed GC Count Target**: {config.g1_mixed_gc_count_target}\n"
+            )
+
+        # CMS-Specific
+        if config.cms_initiating_occupancy_fraction is not None:
+            frac = config.cms_initiating_occupancy_fraction
+            md_content.append(f"- **CMS Initiating Occupancy Fraction**: {frac}%\n")
+
+        md_content.append("\n")
 
     # Overall Status
     if summary.leak_severity.severity_level in ["High", "Critical"]:
@@ -2144,7 +2502,7 @@ def analyze(
         thresholds = DiagnosticThresholds(
             heap_warning_percentage=heap_warning, heap_critical_percentage=heap_critical
         )
-        summary = build_comprehensive_summary(events, thresholds)
+        summary = build_comprehensive_summary(events, thresholds, lines)
 
         # Render output
         render_rich_output(summary, parser.gc_type_name)
