@@ -2072,7 +2072,7 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
     """Render comprehensive analysis using Rich components."""
     # Header
     console.print()
-    console.print(Panel(f"GC Type: {gc_type}", style="header", expand=False))
+    console.print(Panel(f"GC Type: {gc_type}", style="header", expand=True))
     console.print()
 
     # JVM Heap Configuration (if available)
