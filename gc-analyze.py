@@ -139,6 +139,14 @@ class JVMHeapConfig(BaseModel):
     new_size_bytes: int | None = None  # -Xmn or -XX:NewSize
     max_new_size_bytes: int | None = None  # -XX:MaxNewSize
     old_size_bytes: int | None = None  # -XX:OldSize
+    max_ram_bytes: int | None = None  # -XX:MaxRAM
+    initial_ram_percentage: int | None = None  # -XX:InitialRAMPercentage
+    min_ram_percentage: int | None = None  # -XX:MinRAMPercentage
+    max_ram_percentage: int | None = None  # -XX:MaxRAMPercentage
+    max_ram_fraction: int | None = None  # -XX:MaxRAMFraction (legacy)
+    soft_max_heap_size_bytes: int | None = None  # -XX:SoftMaxHeapSize (ZGC)
+    always_pre_touch: bool | None = None  # -XX:+AlwaysPreTouch
+    thread_stack_size_kb: int | None = None  # -XX:ThreadStackSize
     new_ratio: int | None = None  # -XX:NewRatio
     survivor_ratio: int | None = None  # -XX:SurvivorRatio
     initial_survivor_ratio: int | None = None  # -XX:InitialSurvivorRatio
@@ -159,6 +167,9 @@ class JVMHeapConfig(BaseModel):
     # GC Behavior Tuning
     max_gc_pause_millis: int | None = None  # -XX:MaxGCPauseMillis
     gc_time_ratio: int | None = None  # -XX:GCTimeRatio
+    adaptive_size_policy_weight: int | None = None  # -XX:AdaptiveSizePolicyWeight
+    use_adaptive_size_policy: bool | None = None  # -XX:+UseAdaptiveSizePolicy
+    use_adaptive_size_policy_footprint_goal: bool | None = None  # -XX:+UseAdaptiveSizePolicyFootprintGoal
 
     # G1-specific
     g1_heap_region_size_bytes: int | None = None  # -XX:G1HeapRegionSize
@@ -167,9 +178,16 @@ class JVMHeapConfig(BaseModel):
     g1_new_size_percent: int | None = None  # -XX:G1NewSizePercent
     g1_max_new_size_percent: int | None = None  # -XX:G1MaxNewSizePercent
     g1_mixed_gc_count_target: int | None = None  # -XX:G1MixedGCCountTarget
+    g1_heap_waste_percent: int | None = None  # -XX:G1HeapWastePercent
+    g1_mixed_gc_live_threshold_percent: int | None = None  # -XX:G1MixedGCLiveThresholdPercent
+    g1_rset_updating_pause_time_percent: int | None = None  # -XX:G1RSetUpdatingPauseTimePercent
+    g1_old_cset_region_threshold_percent: int | None = None  # -XX:G1OldCSetRegionThresholdPercent
 
     # CMS-specific
     cms_initiating_occupancy_fraction: int | None = None  # -XX:CMSInitiatingOccupancyFraction
+    use_cms_initiating_occupancy_only: bool | None = None  # -XX:+UseCMSInitiatingOccupancyOnly
+    cms_full_gcs_before_compaction: int | None = None  # -XX:CMSFullGCsBeforeCompaction
+    cms_wait_duration: int | None = None  # -XX:CMSWaitDuration
 
     def format_size(self, size_bytes: int | None) -> str:
         """Format bytes to human-readable size."""
@@ -1248,6 +1266,8 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
         "new_size_bytes": re.compile(r"-XX:NewSize=(\d+)"),
         "max_new_size_bytes": re.compile(r"-XX:MaxNewSize=(\d+)"),
         "old_size_bytes": re.compile(r"-XX:OldSize=(\d+)"),
+        "max_ram_bytes": re.compile(r"-XX:MaxRAM=(\d+)"),
+        "soft_max_heap_size_bytes": re.compile(r"-XX:SoftMaxHeapSize=(\d+)"),
         "metaspace_size_bytes": re.compile(r"-XX:MetaspaceSize=(\d+)"),
         "max_metaspace_size_bytes": re.compile(r"-XX:MaxMetaspaceSize=(\d+)"),
         "max_direct_memory_size_bytes": re.compile(r"-XX:MaxDirectMemorySize=(\d+)"),
@@ -1267,6 +1287,12 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
         "conc_gc_threads": re.compile(r"-XX:ConcGCThreads=(\d+)"),
         "max_gc_pause_millis": re.compile(r"-XX:MaxGCPauseMillis=(\d+)"),
         "gc_time_ratio": re.compile(r"-XX:GCTimeRatio=(\d+)"),
+        "adaptive_size_policy_weight": re.compile(r"-XX:AdaptiveSizePolicyWeight=(\d+)"),
+        "initial_ram_percentage": re.compile(r"-XX:InitialRAMPercentage=(\d+)"),
+        "min_ram_percentage": re.compile(r"-XX:MinRAMPercentage=(\d+)"),
+        "max_ram_percentage": re.compile(r"-XX:MaxRAMPercentage=(\d+)"),
+        "max_ram_fraction": re.compile(r"-XX:MaxRAMFraction=(\d+)"),
+        "thread_stack_size_kb": re.compile(r"-XX:ThreadStackSize=(\d+)"),
         "initiating_heap_occupancy_percent": re.compile(
             r"-XX:InitiatingHeapOccupancyPercent=(\d+)"
         ),
@@ -1274,8 +1300,31 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
         "g1_new_size_percent": re.compile(r"-XX:G1NewSizePercent=(\d+)"),
         "g1_max_new_size_percent": re.compile(r"-XX:G1MaxNewSizePercent=(\d+)"),
         "g1_mixed_gc_count_target": re.compile(r"-XX:G1MixedGCCountTarget=(\d+)"),
+        "g1_heap_waste_percent": re.compile(r"-XX:G1HeapWastePercent=(\d+)"),
+        "g1_mixed_gc_live_threshold_percent": re.compile(
+            r"-XX:G1MixedGCLiveThresholdPercent=(\d+)"
+        ),
+        "g1_rset_updating_pause_time_percent": re.compile(
+            r"-XX:G1RSetUpdatingPauseTimePercent=(\d+)"
+        ),
+        "g1_old_cset_region_threshold_percent": re.compile(
+            r"-XX:G1OldCSetRegionThresholdPercent=(\d+)"
+        ),
         "cms_initiating_occupancy_fraction": re.compile(
             r"-XX:CMSInitiatingOccupancyFraction=(\d+)"
+        ),
+        "cms_full_gcs_before_compaction": re.compile(r"-XX:CMSFullGCsBeforeCompaction=(\d+)"),
+        "cms_wait_duration": re.compile(r"-XX:CMSWaitDuration=(\d+)"),
+    }
+
+    bool_patterns = {
+        "always_pre_touch": re.compile(r"-XX:\+AlwaysPreTouch"),
+        "use_adaptive_size_policy": re.compile(r"-XX:\+UseAdaptiveSizePolicy"),
+        "use_adaptive_size_policy_footprint_goal": re.compile(
+            r"-XX:\+UseAdaptiveSizePolicyFootprintGoal"
+        ),
+        "use_cms_initiating_occupancy_only": re.compile(
+            r"-XX:\+UseCMSInitiatingOccupancyOnly"
         ),
     }
 
@@ -1313,6 +1362,11 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
                 )
             if xmn := xmn_pattern.search(flags_str):
                 config_dict["new_size_bytes"] = parse_jvm_size_to_bytes(xmn.group(1), xmn.group(2))
+
+            # Parse boolean flags
+            for field, pattern in bool_patterns.items():
+                if pattern.search(flags_str):
+                    config_dict[field] = True
 
             if config_dict:
                 return JVMHeapConfig(**config_dict)
@@ -2212,6 +2266,22 @@ def render_rich_output(
             )
         if config.old_size_bytes:
             jvm_table.add_row("Old Generation Size", config.format_size(config.old_size_bytes))
+        if config.max_ram_bytes:
+            jvm_table.add_row("Max RAM", config.format_size(config.max_ram_bytes))
+        if config.initial_ram_percentage is not None:
+            jvm_table.add_row("Initial RAM %", f"{config.initial_ram_percentage}%")
+        if config.min_ram_percentage is not None:
+            jvm_table.add_row("Min RAM %", f"{config.min_ram_percentage}%")
+        if config.max_ram_percentage is not None:
+            jvm_table.add_row("Max RAM %", f"{config.max_ram_percentage}%")
+        if config.max_ram_fraction is not None:
+            jvm_table.add_row("Max RAM Fraction", str(config.max_ram_fraction))
+        if config.soft_max_heap_size_bytes:
+            jvm_table.add_row("Soft Max Heap Size", config.format_size(config.soft_max_heap_size_bytes))
+        if config.always_pre_touch is True:
+            jvm_table.add_row("Always Pre Touch", "enabled")
+        if config.thread_stack_size_kb is not None:
+            jvm_table.add_row("Thread Stack Size", f"{config.thread_stack_size_kb}K")
 
         # Ratios and Thresholds
         if config.new_ratio is not None:
@@ -2252,6 +2322,12 @@ def render_rich_output(
             jvm_table.add_row("Max GC Pause Target", f"{config.max_gc_pause_millis}ms")
         if config.gc_time_ratio is not None:
             jvm_table.add_row("GC Time Ratio", str(config.gc_time_ratio))
+        if config.adaptive_size_policy_weight is not None:
+            jvm_table.add_row("Adaptive Size Policy Weight", str(config.adaptive_size_policy_weight))
+        if config.use_adaptive_size_policy is True:
+            jvm_table.add_row("Adaptive Size Policy", "enabled")
+        if config.use_adaptive_size_policy_footprint_goal is True:
+            jvm_table.add_row("Adaptive Size Policy Footprint Goal", "enabled")
 
         # G1-Specific
         if config.g1_heap_region_size_bytes:
@@ -2270,6 +2346,23 @@ def render_rich_output(
             jvm_table.add_row("G1 Max New Size Percent", f"{config.g1_max_new_size_percent}%")
         if config.g1_mixed_gc_count_target is not None:
             jvm_table.add_row("G1 Mixed GC Count Target", str(config.g1_mixed_gc_count_target))
+        if config.g1_heap_waste_percent is not None:
+            jvm_table.add_row("G1 Heap Waste Percent", f"{config.g1_heap_waste_percent}%")
+        if config.g1_mixed_gc_live_threshold_percent is not None:
+            jvm_table.add_row(
+                "G1 Mixed GC Live Threshold Percent",
+                f"{config.g1_mixed_gc_live_threshold_percent}%",
+            )
+        if config.g1_rset_updating_pause_time_percent is not None:
+            jvm_table.add_row(
+                "G1 RSet Updating Pause Time Percent",
+                f"{config.g1_rset_updating_pause_time_percent}%",
+            )
+        if config.g1_old_cset_region_threshold_percent is not None:
+            jvm_table.add_row(
+                "G1 Old CSet Region Threshold Percent",
+                f"{config.g1_old_cset_region_threshold_percent}%",
+            )
 
         # CMS-Specific
         if config.cms_initiating_occupancy_fraction is not None:
@@ -2277,6 +2370,15 @@ def render_rich_output(
                 "CMS Initiating Occupancy Fraction",
                 f"{config.cms_initiating_occupancy_fraction}%",
             )
+        if config.use_cms_initiating_occupancy_only is True:
+            jvm_table.add_row("Use CMS Initiating Occupancy Only", "enabled")
+        if config.cms_full_gcs_before_compaction is not None:
+            jvm_table.add_row(
+                "CMS Full GCs Before Compaction",
+                str(config.cms_full_gcs_before_compaction),
+            )
+        if config.cms_wait_duration is not None:
+            jvm_table.add_row("CMS Wait Duration", f"{config.cms_wait_duration}ms")
 
         console.print(jvm_table)
         console.print()
@@ -2618,6 +2720,24 @@ def export_markdown_summary(
             md_content.append(
                 f"- **Old Generation Size**: {config.format_size(config.old_size_bytes)}\n"
             )
+        if config.max_ram_bytes:
+            md_content.append(f"- **Max RAM**: {config.format_size(config.max_ram_bytes)}\n")
+        if config.initial_ram_percentage is not None:
+            md_content.append(f"- **Initial RAM %**: {config.initial_ram_percentage}%\n")
+        if config.min_ram_percentage is not None:
+            md_content.append(f"- **Min RAM %**: {config.min_ram_percentage}%\n")
+        if config.max_ram_percentage is not None:
+            md_content.append(f"- **Max RAM %**: {config.max_ram_percentage}%\n")
+        if config.max_ram_fraction is not None:
+            md_content.append(f"- **Max RAM Fraction**: {config.max_ram_fraction}\n")
+        if config.soft_max_heap_size_bytes:
+            md_content.append(
+                f"- **Soft Max Heap Size**: {config.format_size(config.soft_max_heap_size_bytes)}\n"
+            )
+        if config.always_pre_touch is True:
+            md_content.append("- **Always Pre Touch**: enabled\n")
+        if config.thread_stack_size_kb is not None:
+            md_content.append(f"- **Thread Stack Size**: {config.thread_stack_size_kb}K\n")
 
         # Ratios
         if config.new_ratio is not None:
@@ -2659,6 +2779,14 @@ def export_markdown_summary(
             md_content.append(f"- **Max GC Pause Target**: {config.max_gc_pause_millis}ms\n")
         if config.gc_time_ratio is not None:
             md_content.append(f"- **GC Time Ratio**: {config.gc_time_ratio}\n")
+        if config.adaptive_size_policy_weight is not None:
+            md_content.append(
+                f"- **Adaptive Size Policy Weight**: {config.adaptive_size_policy_weight}\n"
+            )
+        if config.use_adaptive_size_policy is True:
+            md_content.append("- **Adaptive Size Policy**: enabled\n")
+        if config.use_adaptive_size_policy_footprint_goal is True:
+            md_content.append("- **Adaptive Size Policy Footprint Goal**: enabled\n")
 
         # G1-Specific
         if config.g1_heap_region_size_bytes:
@@ -2678,11 +2806,37 @@ def export_markdown_summary(
             md_content.append(
                 f"- **G1 Mixed GC Count Target**: {config.g1_mixed_gc_count_target}\n"
             )
+        if config.g1_heap_waste_percent is not None:
+            md_content.append(f"- **G1 Heap Waste Percent**: {config.g1_heap_waste_percent}%\n")
+        if config.g1_mixed_gc_live_threshold_percent is not None:
+            md_content.append(
+                f"- **G1 Mixed GC Live Threshold Percent**: "
+                f"{config.g1_mixed_gc_live_threshold_percent}%\n"
+            )
+        if config.g1_rset_updating_pause_time_percent is not None:
+            md_content.append(
+                f"- **G1 RSet Updating Pause Time Percent**: "
+                f"{config.g1_rset_updating_pause_time_percent}%\n"
+            )
+        if config.g1_old_cset_region_threshold_percent is not None:
+            md_content.append(
+                f"- **G1 Old CSet Region Threshold Percent**: "
+                f"{config.g1_old_cset_region_threshold_percent}%\n"
+            )
 
         # CMS-Specific
         if config.cms_initiating_occupancy_fraction is not None:
             frac = config.cms_initiating_occupancy_fraction
             md_content.append(f"- **CMS Initiating Occupancy Fraction**: {frac}%\n")
+        if config.use_cms_initiating_occupancy_only is True:
+            md_content.append("- **Use CMS Initiating Occupancy Only**: enabled\n")
+        if config.cms_full_gcs_before_compaction is not None:
+            md_content.append(
+                f"- **CMS Full GCs Before Compaction**: "
+                f"{config.cms_full_gcs_before_compaction}\n"
+            )
+        if config.cms_wait_duration is not None:
+            md_content.append(f"- **CMS Wait Duration**: {config.cms_wait_duration}ms\n")
 
         md_content.append("\n")
 
