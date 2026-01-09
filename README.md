@@ -21,14 +21,12 @@ Given a GC log file, the tool:
 
 ## Quick start
 
-This repo includes sample logs under `test-logs/`.
-
 ```bash
 # uv
-uv run python gc-analyze.py analyze test-logs/gcSASServer01_1_29Dec2025_12.02.37_2126.log
+uv run python gc-analyze.py analyze path/to/gc.log
 
 # standard Python (after you set up a venv + dependencies; see below)
-python gc-analyze.py analyze test-logs/gcSASServer01_1_29Dec2025_12.02.37_2126.log
+python gc-analyze.py analyze path/to/gc.log
 ```
 
 ## Setup
