@@ -1,275 +1,253 @@
-# gc-analyze.py
+# gc-analyze
 
-A modern, type-safe Java GC (Garbage Collection) log analyzer for production troubleshooting and performance optimization.
+`gc-analyze.py` is a command-line utility that parses JVM garbage-collection (GC) logs and produces an operations-oriented summary: GC rate, pause distributions (P50/P95/P99), heap/old-gen pressure signals, and a memory-leak risk score with actionable recommendations.
 
-## Overview
+## What it does
 
-`gc-analyze.py` is a command-line tool that parses Java GC log files and generates comprehensive diagnostic reports with:
+Given a GC log file, the tool:
 
-- **Memory leak detection** with severity scoring (0-100)
-- **Pause time analysis** (P50, P95, P99 percentiles)
-- **GC frequency and overhead metrics**
-- **Heap and old generation utilization tracking**
-- **Metaspace analysis**
-- **Rich terminal output** with color-coded warnings and tables
-- **Optional Markdown export** for sharing with teams
+- Detects the collector format from the beginning of the log (Parallel, G1, or CMS).
+- Parses GC events and normalizes them into a common event model.
+- Computes runtime-window statistics (rates, percentiles, utilization, trends).
+- Emits a rich terminal report and (optionally) a Markdown report for sharing.
 
-## Supported GC Types
+### Supported GC log formats
 
-- **Parallel GC** (PSYoungGen/ParOldGen)
-- **G1 GC** (unified logging Java 9+ and legacy Java 8 format)
-  - Mixed GC tracking
-  - Humongous allocation detection
-  - Evacuation failure monitoring
-- **CMS GC** (Concurrent Mark Sweep with ParNew)
-  - Concurrent cycle metrics
-  - Concurrent mode failure detection
+- **Parallel GC**: `PSYoungGen` / `ParOldGen`
+- **G1 GC**:
+  - Java 9+ unified logging (e.g., `-Xlog:gc*`)
+  - Java 8-era “legacy” formats (e.g., `G1Young`, `G1Mixed`)
+- **CMS GC**: `ParNew` + `CMS`
 
-## Features
+## Quick start
 
-### Diagnostics
-
-- **Memory Leak Detection**: Analyzes old generation growth patterns with severity scoring
-- **Pause Time Analysis**: Statistical analysis of GC pause times (mean, median, P95, P99, max)
-- **GC Overhead**: Calculates percentage of time spent in GC
-- **Frequency Metrics**: Young GC and Full GC events per hour
-- **Heap Utilization**: Tracks heap usage patterns and headroom
-- **GC-Specific Metrics**:
-  - G1: Mixed GC ratio, humongous allocations, evacuation failures
-  - CMS: Concurrent cycles, concurrent mode failures
-
-### Output
-
-- **Rich Terminal UI**: Color-coded severity levels (green/yellow/red)
-- **Formatted Tables**: Clear presentation of statistics and diagnostics
-- **Markdown Export**: Generate shareable reports for team collaboration
-- **Exit Codes**: Machine-readable status (0=success, 1=warnings, 2=critical)
-
-## Installation and Usage
-
-### Method 1: Using uv (Recommended)
-
-`uv` is a fast Python package installer and environment manager. This is the recommended approach.
-
-#### Initial Setup
+This repo includes sample logs under `test-logs/`.
 
 ```bash
-# Install uv if not already installed
+# uv
+uv run python gc-analyze.py analyze test-logs/gcSASServer01_1_29Dec2025_12.02.37_2126.log
+
+# standard Python (after you set up a venv + dependencies; see below)
+python gc-analyze.py analyze test-logs/gcSASServer01_1_29Dec2025_12.02.37_2126.log
+```
+
+## Setup
+
+### Requirements
+
+- Python **3.11+**
+
+The project dependencies are defined in `pyproject.toml`:
+
+- `pydantic` (event validation/modeling)
+- `typer` (CLI)
+- `rich` (terminal UI)
+
+### Option A: uv (recommended)
+
+Install `uv` (see the official installer docs if these commands change):
+
+```bash
+# macOS / Linux
 curl -LsSf https://astral.sh/uv/install.sh | sh
-
-# Navigate to the project directory
-cd /path/to/gc-analyze
-
-# Install Python 3.13 (if not already available)
-uv python install 3.13
-
-# Create virtual environment with Python 3.13
-uv venv --python 3.13
-
-# Sync dependencies (installs packages into the virtual environment)
-uv sync
 ```
 
-#### Run the Tool
-
-```bash
-# Analyze a GC log file
-uv run python gc-analyze.py analyze gc.log
-
-# Analyze with Markdown export
-uv run python gc-analyze.py analyze gc.log --export report.md
-
-# Analyze with custom thresholds
-uv run python gc-analyze.py analyze gc.log --heap-warning 70 --heap-critical 90
-
-# Verbose mode for debugging
-uv run python gc-analyze.py analyze gc.log --verbose
-
-# Display version and features
-uv run python gc-analyze.py version
+```powershell
+# Windows (PowerShell)
+irm https://astral.sh/uv/install.ps1 | iex
 ```
 
-#### Update Dependencies
+Create an environment and install dependencies:
 
 ```bash
-# Update all dependencies
-uv sync --upgrade
-
-# Add a new dependency
-uv add <package-name>
+uv python install 3.11
+uv venv --python 3.11
+uv sync --frozen
 ```
 
-### Method 2: Using pip and venv
-
-Traditional Python workflow using pip and virtual environments.
-
-#### Initial Setup
+Run the analyzer:
 
 ```bash
-# Navigate to the project directory
-cd /path/to/gc-analyze
+uv run python gc-analyze.py analyze path/to/gc.log
+uv run python gc-analyze.py analyze path/to/gc.log --export report.md
+```
 
-# Create a virtual environment
+### Option B: Standard Python (venv + pip)
+
+Create and activate a virtual environment:
+
+```bash
+# macOS / Linux
 python3 -m venv .venv
-
-# Activate the virtual environment
-# On macOS/Linux:
 source .venv/bin/activate
-# On Windows:
-.venv\Scripts\activate
-
-# Install dependencies
-pip install pydantic typer rich
+python -m pip install --upgrade pip
 ```
 
-#### Run the Tool
+```powershell
+# Windows (PowerShell)
+py -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+```
 
-After activating the virtual environment:
+Install dependencies from the project metadata:
 
 ```bash
-# Analyze a GC log file
-python gc-analyze.py analyze gc.log
-
-# Analyze with Markdown export
-python gc-analyze.py analyze gc.log --export report.md
-
-# Analyze with custom thresholds
-python gc-analyze.py analyze gc.log --heap-warning 70 --heap-critical 90
-
-# Verbose mode for debugging
-python gc-analyze.py analyze gc.log --verbose
-
-# Display version and features
-python gc-analyze.py version
+python -m pip install -e .
 ```
 
-#### Deactivate Virtual Environment
+Run the analyzer:
 
 ```bash
-deactivate
+python gc-analyze.py analyze path\\to\\gc.log
+python gc-analyze.py analyze path\\to\\gc.log --export report.md
 ```
 
-## Command Reference
+## Usage
 
-### `analyze`
-
-Analyze JVM GC log files and generate comprehensive diagnostic reports.
-
-**Usage:**
-```bash
-gc-analyze.py analyze [OPTIONS] LOG_FILE
-```
-
-**Arguments:**
-- `LOG_FILE` - Path to GC log file to analyze (required)
-
-**Options:**
-- `--export, -e PATH` - Export analysis report to Markdown file (e.g., report.md)
-- `--heap-warning FLOAT` - Heap utilization percentage to trigger warnings (default: 80.0, range: 0-100)
-- `--heap-critical FLOAT` - Heap utilization percentage to trigger critical alerts (default: 95.0, range: 0-100)
-- `--verbose, -v` - Enable verbose output with detailed parsing information
-- `--help` - Show help message
-
-**Examples:**
+### Analyze a log
 
 ```bash
-# Basic analysis
-uv run python gc-analyze.py analyze gc.log
-
-# Export to Markdown
-uv run python gc-analyze.py analyze gc.log --export report.md
-
-# Custom thresholds
-uv run python gc-analyze.py analyze gc.log --heap-warning 70 --heap-critical 90
-
-# Debug parsing issues
-uv run python gc-analyze.py analyze gc.log --verbose
+python gc-analyze.py analyze [OPTIONS] LOG_FILE
 ```
 
-### `version`
+Options:
 
-Display version and feature information.
+- `--export`, `-e`: write a Markdown report to the given path
+- `--heap-warning`: peak heap % threshold for warnings (default `80.0`)
+- `--heap-critical`: peak heap % threshold for critical warnings (default `95.0`)
+- `--verbose`, `-v`: print parsing details and exception tracebacks
 
-**Usage:**
-```bash
-gc-analyze.py version
+## Producing GC logs (examples)
+
+These are common configurations; ensure your log includes timestamps and/or uptime so the analyzer can compute rates.
+
+```text
+# Java 9+ unified logging
+-Xlog:gc*:file=gc.log:time,uptime,level,tags
 ```
 
-## Output Examples
+```text
+# Java 8-style logging (examples; exact flags vary by JVM/vendor)
+-XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log
+```
 
-### Terminal Output
+## Understanding the terminal summary output
 
-The tool generates rich terminal output with:
+The terminal report is organized into sections. Not every section appears for every log; some require collector-specific fields.
 
-- **Summary Panel**: Total events, time range, GC type detected
-- **Statistics Table**: Pause times (mean, P50, P95, P99, max), heap usage, GC frequency
-- **GC-Specific Metrics**: G1/CMS specific statistics when applicable
-- **Diagnostics Section**: Color-coded warnings and recommendations
-- **Leak Severity Score**: 0-100 scale with interpretation
+### Quick Diagnosis
 
-### Markdown Export
+A single-line health classification derived from the computed metrics:
 
-When using `--export`, generates a comprehensive Markdown report including:
+- Healthy (no major issues detected)
+- Memory pressure / degraded (elevated overhead, pauses, or GC frequency)
+- High risk / critical (leak signals or severe thrashing)
 
-- Executive summary
-- All statistics in table format
-- Diagnostic findings
-- Operational recommendations
-- Suitable for sharing in tickets, documentation, or post-mortems
+### At-a-Glance
 
-## Requirements
+A compact panel intended for “first look” triage:
 
-- **Python**: 3.11 or higher
-- **Dependencies**:
-  - `pydantic` >= 2.0 (data validation and parsing)
-  - `typer` >= 0.9.0 (CLI framework)
-  - `rich` >= 13.0 (terminal formatting)
+- **Runtime**: time span covered by parsed events
+- **GC Events**: number of parsed events
+- **GC Overhead**: % of runtime spent in GC pauses
+- **P99 STW Pause**: 99th percentile pause (seconds) across all parsed events
+- **Peak Heap**: maximum observed heap utilization %
+- **Full GCs/hr**: Full GC rate normalized per hour
+- **Leak Level**: `None` / `Low` / `Medium` / `High` / `Critical`
 
-## Typical Workflow
+### JVM Heap & GC Tuning Configuration (when present)
 
-1. **Collect GC Logs**: Enable GC logging on your JVM with appropriate flags
-   ```bash
-   # Java 9+ unified logging
-   -Xlog:gc*:file=gc.log:time,uptime,level,tags
+If the log contains a `CommandLine flags:` line (or certain unified-logging headers), the report extracts and displays heap sizing and common GC tuning knobs (e.g., `-Xms`, `-Xmx`, `-XX:MaxGCPauseMillis`, selected G1/CMS flags).
 
-   # Java 8
-   -XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log
-   ```
+### GC Frequency & Rate
 
-2. **Analyze Logs**:
-   ```bash
-   uv run python gc-analyze.py analyze gc.log --export report.md
-   ```
+How often collections occur over the observed runtime window:
 
-3. **Review Output**: Check terminal for immediate feedback and review Markdown report
+- **Young GCs per hour**
+- **Full GCs per hour**
+- **Avg time between Full GCs** (if there are multiple Full GCs)
 
-4. **Take Action**: Follow diagnostic recommendations for tuning or troubleshooting
+### GC Overhead & Throughput
 
-## Troubleshooting
+- **Total time in GC**: sum of all parsed pause times
+- **GC overhead**: `(total pause time / runtime window) * 100`
+- **Application throughput**: `100 - GC overhead`
 
-### "No GC events parsed"
+### Heap Utilization
 
-- Verify log format matches supported GC types
-- Use `--verbose` to see parsing details
-- Check that GC logging is enabled in JVM
+- **Peak heap usage**: maximum observed heap usage %
+- **Average heap usage**: average post-GC heap usage %
+- **Heap headroom**: `100 - peak heap usage` (lower headroom means higher OOM risk)
 
-### "Module not found" errors
+### Old Generation Analysis (when old-gen data is available)
 
-- Ensure dependencies are installed: `uv sync` or `pip install pydantic typer rich`
-- Verify virtual environment is activated (if using pip method)
+Old-gen pressure is one of the strongest early warning signals for leaks and long-tail latency:
 
-### Incorrect metrics
+- **Old gen at start / end**: old-gen utilization % at the beginning vs end of the log window
+- **Net old gen growth**: end-start in percentage points (e.g., `+12.4 pts`)
+- **Peak old gen usage**
+- **Avg reclaimed per Full GC** and **Full GCs reducing old gen** (effectiveness indicators)
 
-- Ensure complete log file (not truncated)
-- Verify timestamp format is consistent
-- Check for mixed GC types in single log (may affect analysis)
+### Allocation Pressure (when calculable)
 
-## License
+- **Allocation rate** (MB/sec), derived from young-gen activity and event cadence
+- **Average promotion** (KB promoted per Young GC), when available
 
-This tool is provided as-is for GC log analysis and diagnostics.
+### Pause Time Analysis
 
-## Version
+A distribution table showing (by GC type) count, average, median, P95, P99, and maximum pause times. The “Overall (All Types)” row reports P50/P95/P99 across all parsed events.
 
-Current version: **3.0.0**
+### Memory Leak Assessment
 
-Built with Python 3.11+, Pydantic v2, Typer, and Rich.
+Leak severity is a score from **0–100** plus a qualitative level:
+
+- `None` (<20)
+- `Low` (20–39)
+- `Medium` (40–59)
+- `High` (60–79)
+- `Critical` (80+)
+
+The score is computed from multiple indicators, including:
+
+- Net old-gen growth over the log window (percentage points)
+- Declining memory reclamation effectiveness over time
+- Accelerating Full GC frequency
+- High residual old-gen occupancy after Full GC
+- Low heap headroom
+
+The report lists the specific indicators that contributed to the score.
+
+### Metaspace Analysis (when metaspace is present)
+
+- **Peak metaspace usage %**
+- **Metaspace growth** (MB) over the log window
+- Warnings for high peak usage (e.g., >90%) or large growth (e.g., >50MB)
+
+### G1 GC Metrics (G1 logs only, when detected)
+
+- Mixed GC count and mixed GC rate (per hour)
+- Humongous allocation signals
+- Evacuation failures / to-space exhaustion counts
+
+### CMS GC Metrics (CMS logs only, when detected)
+
+- Approximate CMS cycles per hour
+- Average concurrent pause time
+
+### Evidence-Based Recommendations
+
+A short, metric-linked recommendation list (e.g., reduce allocation hotspots, capture heap dumps when post-Full-GC old-gen stays high).
+
+### Warnings and Overall Status
+
+Warnings are emitted when thresholds are exceeded (for example: peak heap beyond `--heap-warning`/`--heap-critical`, high Full GC rate, high overhead, high P99 pause, consecutive Full GCs). The final “Overall Status” panel summarizes severity across all warnings.
+
+## Markdown export (`--export`)
+
+When you pass `--export report.md`, the tool writes a Markdown report containing:
+
+- GC type and generation time
+- Runtime overview and leak assessment (including indicators)
+- Warnings and evidence-based recommendations
+- Extracted JVM heap/GC configuration (when present)

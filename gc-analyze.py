@@ -35,7 +35,7 @@ from rich.theme import Theme
 # TYPE ALIASES
 # ============================================================
 
-GCKind: TypeAlias = Literal["Young", "Full", "Mixed", "Concurrent"]
+GCKind: TypeAlias = Literal["Young", "Full", "Mixed", "Remark", "Cleanup", "Concurrent"]
 KilobytesValue: TypeAlias = int
 PercentageValue: TypeAlias = float
 SecondsValue: TypeAlias = float
@@ -226,6 +226,9 @@ class GCSummary(BaseModel):
     total_event_count: int
     young_gc_count: int
     full_gc_count: int
+    mixed_gc_count: int = 0
+    remark_gc_count: int = 0
+    cleanup_gc_count: int = 0
 
     # Frequency
     young_gc_per_hour: float
@@ -254,6 +257,27 @@ class GCSummary(BaseModel):
     median_full_pause: float
     p95_full_pause: float
     p99_full_pause: float
+
+    # Mixed GC pauses
+    avg_mixed_pause: float = 0.0
+    max_mixed_pause: float = 0.0
+    median_mixed_pause: float = 0.0
+    p95_mixed_pause: float = 0.0
+    p99_mixed_pause: float = 0.0
+
+    # Remark pauses (G1)
+    avg_remark_pause: float = 0.0
+    max_remark_pause: float = 0.0
+    median_remark_pause: float = 0.0
+    p95_remark_pause: float = 0.0
+    p99_remark_pause: float = 0.0
+
+    # Cleanup pauses (G1)
+    avg_cleanup_pause: float = 0.0
+    max_cleanup_pause: float = 0.0
+    median_cleanup_pause: float = 0.0
+    p95_cleanup_pause: float = 0.0
+    p99_cleanup_pause: float = 0.0
 
     # Overall pauses
     p50_pause: float
@@ -423,9 +447,10 @@ class G1GCParser:
 
     # Unified logging patterns (Java 9+)
     UNIFIED_PAUSE_PATTERN: re.Pattern[str] = re.compile(
-        r"\[(?P<timestamp>[\d-]+T[\d:.+-]+)\](?:\[(?P<uptime>[\d.]+)s\])?\[info\]"
+        r"\[(?P<timestamp>[\d-]+T[\d:.+-]+)\](?:\[(?P<uptime>[\d.]+)s\])?"
+        r"(?:\[\d+\])?(?:\[\d+\])?\[info\]"  # Optional PID and TID fields
         r"\[gc[^\]]*\]\s+"
-        r"GC\((?P<gc_id>\d+)\)\s+Pause\s+(?P<type>Young|Full)\s+"
+        r"GC\((?P<gc_id>\d+)\)\s+Pause\s+(?P<type>Young|Full|Remark|Cleanup)\s+"
         r"(?:\((?P<subtype>[^)]+)\)\s*)?"
         r"(?:\((?P<reason>[^)]+)\)\s*)?"
         r"(?P<heap_before>\d+)M->(?P<heap_after>\d+)M\((?P<heap_total>\d+)M\)\s+"
@@ -562,6 +587,10 @@ class G1GCParser:
         # Determine GC kind
         if pause_type == "Full":
             gc_kind: GCKind = "Full"
+        elif pause_type == "Remark":
+            gc_kind = "Remark"
+        elif pause_type == "Cleanup":
+            gc_kind = "Cleanup"
         elif subtype and "Mixed" in subtype:
             gc_kind = "Mixed"
         else:
@@ -1287,6 +1316,54 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
             if config_dict:
                 return JVMHeapConfig(**config_dict)
 
+    # If no CommandLine flags found, try unified logging format (Java 9+)
+    # Patterns for unified logging (G1 GC with -Xlog:gc*)
+    unified_heap_size_pattern = re.compile(
+        r"Heap address:.*?size:\s*(\d+)\s*(MB|GB|KB|B)?", re.IGNORECASE
+    )
+    unified_region_size_pattern = re.compile(r"Heap region size:\s*(\d+)\s*(MB|KB|M|K)?")
+    unified_workers_pattern = re.compile(r"Using\s+(\d+)\s+workers?\s+of\s+(\d+)")
+
+    unified_config: dict[str, Any] = {}
+
+    for line in log_lines:
+        # Parse heap size from unified format
+        if match := unified_heap_size_pattern.search(line):
+            size_value = int(match.group(1))
+            size_unit = match.group(2) if match.group(2) else "MB"
+            # Convert to bytes
+            if size_unit.upper() in ("MB", "M"):
+                unified_config["max_heap_size_bytes"] = size_value * 1024 * 1024
+                unified_config["initial_heap_size_bytes"] = size_value * 1024 * 1024
+            elif size_unit.upper() in ("GB", "G"):
+                unified_config["max_heap_size_bytes"] = size_value * 1024 * 1024 * 1024
+                unified_config["initial_heap_size_bytes"] = size_value * 1024 * 1024 * 1024
+            elif size_unit.upper() in ("KB", "K"):
+                unified_config["max_heap_size_bytes"] = size_value * 1024
+                unified_config["initial_heap_size_bytes"] = size_value * 1024
+            else:
+                unified_config["max_heap_size_bytes"] = size_value
+                unified_config["initial_heap_size_bytes"] = size_value
+
+        # Parse G1 region size
+        if match := unified_region_size_pattern.search(line):
+            size_value = int(match.group(1))
+            size_unit = match.group(2) if match.group(2) else "M"
+            # Convert to bytes
+            if size_unit.upper() in ("MB", "M"):
+                unified_config["g1_heap_region_size_bytes"] = size_value * 1024 * 1024
+            elif size_unit.upper() in ("KB", "K"):
+                unified_config["g1_heap_region_size_bytes"] = size_value * 1024
+
+        # Parse GC threads (use the max workers available)
+        if match := unified_workers_pattern.search(line):
+            total_workers = int(match.group(2))
+            if "parallel_gc_threads" not in unified_config:
+                unified_config["parallel_gc_threads"] = total_workers
+
+    if unified_config:
+        return JVMHeapConfig(**unified_config)
+
     return None
 
 
@@ -1296,6 +1373,9 @@ def build_comprehensive_summary(
     """Build comprehensive GC summary with enhanced diagnostics."""
     pauses_young = [e.pause_time_seconds for e in events if e.gc_kind == "Young"]
     pauses_full = [e.pause_time_seconds for e in events if e.gc_kind == "Full"]
+    pauses_mixed = [e.pause_time_seconds for e in events if e.gc_kind == "Mixed"]
+    pauses_remark = [e.pause_time_seconds for e in events if e.gc_kind == "Remark"]
+    pauses_cleanup = [e.pause_time_seconds for e in events if e.gc_kind == "Cleanup"]
     pauses_all = [e.pause_time_seconds for e in events if e.pause_time_seconds > 0]
     old = [e.old_used_percentage for e in events if e.old_used_percentage is not None]
     heap = [e.heap_used_percentage for e in events]
@@ -1355,6 +1435,15 @@ def build_comprehensive_summary(
 
     p95_full = percentile(pauses_full, 95) if pauses_full else 0.0
     p99_full = percentile(pauses_full, 99) if pauses_full else 0.0
+
+    p95_mixed = percentile(pauses_mixed, 95) if pauses_mixed else 0.0
+    p99_mixed = percentile(pauses_mixed, 99) if pauses_mixed else 0.0
+
+    p95_remark = percentile(pauses_remark, 95) if pauses_remark else 0.0
+    p99_remark = percentile(pauses_remark, 99) if pauses_remark else 0.0
+
+    p95_cleanup = percentile(pauses_cleanup, 95) if pauses_cleanup else 0.0
+    p99_cleanup = percentile(pauses_cleanup, 99) if pauses_cleanup else 0.0
 
     # Pause threshold violations
     pauses_over_1s = sum(1 for p in pauses_all if p > 1.0)
@@ -1574,6 +1663,9 @@ def build_comprehensive_summary(
         total_event_count=len(events),
         young_gc_count=len(pauses_young),
         full_gc_count=len(pauses_full),
+        mixed_gc_count=len(pauses_mixed),
+        remark_gc_count=len(pauses_remark),
+        cleanup_gc_count=len(pauses_cleanup),
         young_gc_per_hour=young_gc_per_hour,
         full_gc_per_hour=full_gc_per_hour,
         avg_full_gc_interval_min=avg_full_gc_interval,
@@ -1594,6 +1686,21 @@ def build_comprehensive_summary(
         median_full_pause=median(pauses_full) if pauses_full else 0.0,
         p95_full_pause=p95_full,
         p99_full_pause=p99_full,
+        avg_mixed_pause=mean(pauses_mixed) if pauses_mixed else 0.0,
+        max_mixed_pause=max(pauses_mixed) if pauses_mixed else 0.0,
+        median_mixed_pause=median(pauses_mixed) if pauses_mixed else 0.0,
+        p95_mixed_pause=p95_mixed,
+        p99_mixed_pause=p99_mixed,
+        avg_remark_pause=mean(pauses_remark) if pauses_remark else 0.0,
+        max_remark_pause=max(pauses_remark) if pauses_remark else 0.0,
+        median_remark_pause=median(pauses_remark) if pauses_remark else 0.0,
+        p95_remark_pause=p95_remark,
+        p99_remark_pause=p99_remark,
+        avg_cleanup_pause=mean(pauses_cleanup) if pauses_cleanup else 0.0,
+        max_cleanup_pause=max(pauses_cleanup) if pauses_cleanup else 0.0,
+        median_cleanup_pause=median(pauses_cleanup) if pauses_cleanup else 0.0,
+        p95_cleanup_pause=p95_cleanup,
+        p99_cleanup_pause=p99_cleanup,
         p50_pause=p50_pause,
         p95_pause=p95_pause,
         p99_pause=p99_pause,
@@ -1695,7 +1802,7 @@ def create_at_a_glance_panel(summary: GCSummary) -> Panel:
     table.add_row("Runtime", f"{summary.runtime_hours:.2f} hrs")
     table.add_row("GC Events", f"{summary.total_event_count}")
     table.add_row("GC Overhead", f"{summary.gc_overhead_pct:.2f}%")
-    table.add_row("P99 Pause", f"{summary.p99_pause:.3f}s")
+    table.add_row("P99 STW Pause", f"{summary.p99_pause:.3f}s")
     table.add_row("Peak Heap", f"{summary.peak_heap_pct:.1f}%")
     table.add_row("Full GCs/hr", f"{summary.full_gc_per_hour:.2f}")
     table.add_row("Leak Level", f"{summary.leak_severity.severity_level}")
@@ -1718,8 +1825,14 @@ def create_runtime_overview_table(summary: GCSummary) -> Table:
     table.add_row("Young GC events", f"{summary.young_gc_count}")
     table.add_row("Full GC events", f"{summary.full_gc_count}")
 
-    if summary.g1_metrics:
-        table.add_row("Mixed GC events", f"{summary.g1_metrics.mixed_gc_count}")
+    if summary.mixed_gc_count > 0:
+        table.add_row("Mixed GC events", f"{summary.mixed_gc_count}")
+
+    if summary.remark_gc_count > 0:
+        table.add_row("Remark events (G1)", f"{summary.remark_gc_count}")
+
+    if summary.cleanup_gc_count > 0:
+        table.add_row("Cleanup events (G1)", f"{summary.cleanup_gc_count}")
 
     return table
 
@@ -1729,6 +1842,7 @@ def create_pause_distribution_table(summary: GCSummary) -> Table:
     table = Table(title="Pause Time Analysis", show_header=True, header_style="header")
 
     table.add_column("GC Type", style="info")
+    table.add_column("Count", justify="right", style="metric")
     table.add_column("Average", justify="right", style="metric")
     table.add_column("Median", justify="right", style="metric")
     table.add_column("P95", justify="right", style="metric")
@@ -1740,33 +1854,89 @@ def create_pause_distribution_table(summary: GCSummary) -> Table:
             return f"{s:.1f}s ({s / 60:.1f}m)"
         return f"{s:.3f}s"
 
-    table.add_row(
-        "Young GC",
-        format_seconds(summary.avg_young_pause),
-        format_seconds(summary.median_young_pause),
-        format_seconds(summary.p95_young_pause),
-        format_seconds(summary.p99_young_pause),
-        format_seconds(summary.max_young_pause),
+    # Calculate total count for Overall row
+    total_count = (
+        summary.young_gc_count
+        + summary.full_gc_count
+        + summary.mixed_gc_count
+        + summary.remark_gc_count
+        + summary.cleanup_gc_count
     )
 
+    # Add "Overall (All Types)" row first for context
     table.add_row(
-        "Full GC",
-        format_seconds(summary.avg_full_pause),
-        format_seconds(summary.median_full_pause),
-        format_seconds(summary.p95_full_pause),
-        format_seconds(summary.p99_full_pause),
-        format_seconds(summary.max_full_pause),
-        style="critical" if summary.max_full_pause > 30 else None,
+        "Overall (All Types)",
+        str(total_count),
+        "—",  # Average of mixed types is misleading
+        format_seconds(summary.p50_pause),
+        format_seconds(summary.p95_pause),
+        format_seconds(summary.p99_pause),
+        "—",  # Max of mixed types is misleading
+        style="bold",
     )
 
-    if summary.g1_metrics and summary.g1_metrics.mixed_gc_count > 0:
+    # Add separator row
+    table.add_row("", "", "", "", "", "", "")
+
+    # Young GC row (always show if any events exist)
+    if summary.young_gc_count > 0:
         table.add_row(
-            "Mixed GC",
-            format_seconds(summary.g1_metrics.average_mixed_gc_pause_seconds),
-            "—",
-            "—",
-            "—",
-            "—",
+            "Young GC",
+            str(summary.young_gc_count),
+            format_seconds(summary.avg_young_pause),
+            format_seconds(summary.median_young_pause),
+            format_seconds(summary.p95_young_pause),
+            format_seconds(summary.p99_young_pause),
+            format_seconds(summary.max_young_pause),
+        )
+
+    # Full GC row (always show if any events exist)
+    if summary.full_gc_count > 0:
+        table.add_row(
+            "Full GC",
+            str(summary.full_gc_count),
+            format_seconds(summary.avg_full_pause),
+            format_seconds(summary.median_full_pause),
+            format_seconds(summary.p95_full_pause),
+            format_seconds(summary.p99_full_pause),
+            format_seconds(summary.max_full_pause),
+            style="critical" if summary.max_full_pause > 30 else None,
+        )
+
+    # Mixed GC row (G1 only, show if any events exist)
+    if summary.mixed_gc_count > 0:
+        table.add_row(
+            "Mixed GC (G1)",
+            str(summary.mixed_gc_count),
+            format_seconds(summary.avg_mixed_pause),
+            format_seconds(summary.median_mixed_pause),
+            format_seconds(summary.p95_mixed_pause),
+            format_seconds(summary.p99_mixed_pause),
+            format_seconds(summary.max_mixed_pause),
+        )
+
+    # Remark row (G1 concurrent marking, show if any events exist)
+    if summary.remark_gc_count > 0:
+        table.add_row(
+            "Remark (G1)",
+            str(summary.remark_gc_count),
+            format_seconds(summary.avg_remark_pause),
+            format_seconds(summary.median_remark_pause),
+            format_seconds(summary.p95_remark_pause),
+            format_seconds(summary.p99_remark_pause),
+            format_seconds(summary.max_remark_pause),
+        )
+
+    # Cleanup row (G1 concurrent marking, show if any events exist)
+    if summary.cleanup_gc_count > 0:
+        table.add_row(
+            "Cleanup (G1)",
+            str(summary.cleanup_gc_count),
+            format_seconds(summary.avg_cleanup_pause),
+            format_seconds(summary.median_cleanup_pause),
+            format_seconds(summary.p95_cleanup_pause),
+            format_seconds(summary.p99_cleanup_pause),
+            format_seconds(summary.max_cleanup_pause),
         )
 
     return table
