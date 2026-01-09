@@ -1776,21 +1776,31 @@ def render_warning_banner(warnings: list[str]) -> Panel:
             Text("✓ No critical warnings", style="success"), title="Status", border_style="green"
         )
 
-    warning_text = Text()
-    for warning in warnings:
-        if "CRITICAL" in warning:
-            warning_text.append("⚠ ", style="critical")
-            warning_text.append(warning + "\n", style="critical")
-        else:
-            warning_text.append("⚠ ", style="warning")
-            warning_text.append(warning + "\n", style="warning")
+    critical_count = sum(1 for warning in warnings if "CRITICAL" in warning)
+    warning_count = sum(1 for warning in warnings if "WARNING" in warning)
 
-    return Panel(
-        warning_text,
-        title="[critical]CRITICAL WARNINGS[/critical]",
-        border_style="red",
-        expand=False,
-    )
+    if critical_count > 0:
+        title_text = "[critical]CRITICAL WARNINGS[/critical]"
+        border_style = "red"
+    elif warning_count > 0:
+        title_text = "[warning]WARNINGS[/warning]"
+        border_style = "yellow"
+    else:
+        title_text = "Status"
+        border_style = "green"
+
+    warning_text = Text()
+    for index, warning in enumerate(warnings):
+        clean_warning = warning.removeprefix("⚠️ ").removeprefix("⚠ ")
+        line_ending = "\n" if index < len(warnings) - 1 else ""
+        if "CRITICAL" in warning:
+            warning_text.append("• ", style="critical")
+            warning_text.append(clean_warning + line_ending, style="critical")
+        else:
+            warning_text.append("• ", style="warning")
+            warning_text.append(clean_warning + line_ending, style="warning")
+
+    return Panel(warning_text, title=title_text, border_style=border_style, expand=True)
 
 
 def create_at_a_glance_panel(summary: GCSummary) -> Panel:
@@ -1801,7 +1811,7 @@ def create_at_a_glance_panel(summary: GCSummary) -> Panel:
 
     table.add_row("Runtime", f"{summary.runtime_hours:.2f} hrs")
     table.add_row("GC Events", f"{summary.total_event_count}")
-    table.add_row("GC Overhead", f"{summary.gc_overhead_pct:.2f}%")
+    table.add_row("GC Overhead (pause time)", f"{summary.gc_overhead_pct:.2f}%")
     table.add_row("P99 STW Pause", f"{summary.p99_pause:.3f}s")
     table.add_row("Peak Heap", f"{summary.peak_heap_pct:.1f}%")
     table.add_row("Full GCs/hr", f"{summary.full_gc_per_hour:.2f}")
@@ -1960,53 +1970,50 @@ def render_leak_severity_panel(leak_severity: LeakSeverity) -> Panel:
     content.append("Level: ", style="label")
     content.append(f"{leak_severity.severity_level}\n\n", style=color)
 
+    if any("Insufficient old-gen data" in indicator for indicator in leak_severity.indicators):
+        content.append("Note: ", style="label")
+        content.append("Score not computed without old-gen data.\n\n", style="warning")
+
     if leak_severity.indicators:
         content.append("Indicators:\n", style="label")
-        for indicator in leak_severity.indicators:
-            content.append(f"  • {indicator}\n", style=color)
+        for index, indicator in enumerate(leak_severity.indicators):
+            line_ending = "\n" if index < len(leak_severity.indicators) - 1 else ""
+            content.append(f"  • {indicator}{line_ending}", style=color)
 
     return Panel(content, title=f"[{color}]Memory Leak Assessment[/{color}]", border_style=color)
 
 
 def determine_quick_diagnosis(summary: GCSummary) -> str:
-    """Determine single-line quick diagnosis of JVM health."""
+    """Determine concise two-line diagnosis: GC health + leak risk."""
+    critical_count = sum(1 for warning in summary.warnings if "CRITICAL" in warning)
+    warning_count = sum(1 for warning in summary.warnings if "WARNING" in warning)
+
+    if critical_count > 0:
+        health_line = "🔴 GC HEALTH: Critical issues detected"
+    elif warning_count > 0:
+        health_line = "🟡 GC HEALTH: Degraded; review warnings"
+    else:
+        health_line = "✅ GC HEALTH: Stable"
+
     severity = summary.leak_severity.severity_level
+    has_old_gen_data = not any(
+        "Insufficient old-gen data" in indicator for indicator in summary.leak_severity.indicators
+    )
 
-    # Critical: Memory leak suspected
-    if severity == "Critical":
-        growth_pct = summary.old_growth
-        return (
-            f"🔴 CRITICAL: Memory leak suspected (old gen +{growth_pct:.1f} pts) "
-            "- investigate immediately"
-        )
+    if not has_old_gen_data:
+        leak_line = "⚪ LEAK RISK: Not assessed (insufficient old-gen data)"
+    elif severity == "Critical":
+        leak_line = f"🔴 LEAK RISK: Critical (old gen +{summary.old_growth:.1f} pts)"
+    elif severity == "High":
+        leak_line = f"🔴 LEAK RISK: High (old gen +{summary.old_growth:.1f} pts)"
+    elif severity == "Medium":
+        leak_line = "🟡 LEAK RISK: Medium"
+    elif severity == "Low":
+        leak_line = "🟡 LEAK RISK: Low"
+    else:
+        leak_line = "🟢 LEAK RISK: None detected"
 
-    if severity == "High":
-        growth_pct = summary.old_growth
-        return (
-            f"🔴 HIGH RISK: Old gen growing +{growth_pct:.1f} pts "
-            "- monitor closely, prepare heap dump"
-        )
-
-    # Consecutive Full GCs (memory thrashing)
-    if summary.consecutive_full_gcs > 1:
-        count = summary.consecutive_full_gcs
-        return f"🟠 MEMORY THRASHING: {count} consecutive Full GCs - severe pressure"
-
-    # High GC overhead
-    if summary.gc_overhead_pct > 20:
-        gc_pct = summary.gc_overhead_pct
-        return f"🟠 SEVERE GC OVERHEAD: {gc_pct:.1f}% time in GC - major performance impact"
-
-    # Medium severity leak or high overhead
-    if severity == "Medium" or summary.gc_overhead_pct > 10:
-        return "🟡 MEMORY PRESSURE: Monitor for worsening trends"
-
-    # Frequent Full GCs but stable
-    if summary.full_gc_per_hour > 10:
-        return f"🟡 HIGH FULL GC RATE: {summary.full_gc_per_hour:.0f}/hr - may need heap tuning"
-
-    # All good
-    return "✅ HEALTHY: No critical issues detected"
+    return f"{health_line}\n{leak_line}"
 
 
 def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
