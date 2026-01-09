@@ -25,6 +25,7 @@ from typing import Annotated, Any, Literal, Protocol, TypeAlias
 import typer
 from pydantic import BaseModel, ConfigDict, Field
 from rich.console import Console
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -1780,10 +1781,10 @@ def render_warning_banner(warnings: list[str]) -> Panel:
     warning_count = sum(1 for warning in warnings if "WARNING" in warning)
 
     if critical_count > 0:
-        title_text = "[critical]CRITICAL WARNINGS[/critical]"
+        title_text = "[critical]Critical Warnings[/critical]"
         border_style = "red"
     elif warning_count > 0:
-        title_text = "[warning]WARNINGS[/warning]"
+        title_text = "[warning]Warnings[/warning]"
         border_style = "yellow"
     else:
         title_text = "Status"
@@ -1844,6 +1845,50 @@ def create_runtime_overview_table(summary: GCSummary) -> Table:
     if summary.cleanup_gc_count > 0:
         table.add_row("Cleanup events (G1)", f"{summary.cleanup_gc_count}")
 
+    return table
+
+
+def create_parsing_coverage_table(
+    total_log_lines: int,
+    raw_event_count: int,
+    usable_event_count: int,
+    unparsed_full_gc_headers: int | None = None,
+) -> Table:
+    """Create parsing coverage table to make data quality explicit."""
+    table = Table(title="Parsing Coverage", show_header=False, box=None, padding=(0, 2))
+    table.add_column("Metric", style="label")
+    table.add_column("Value", style="metric")
+
+    table.add_row("Total log lines", str(total_log_lines))
+    table.add_row("Parsed events (raw)", str(raw_event_count))
+    table.add_row("Usable events", str(usable_event_count))
+    table.add_row("Dropped events", str(max(0, raw_event_count - usable_event_count)))
+
+    if raw_event_count > 0:
+        usable_pct = usable_event_count / raw_event_count * 100.0
+        table.add_row("Usable rate", f"{usable_pct:.1f}%")
+
+    if unparsed_full_gc_headers is not None and unparsed_full_gc_headers > 0:
+        table.add_row("Unparsed Full GC headers", str(unparsed_full_gc_headers))
+
+    return table
+
+
+def create_time_window_table(
+    first_timestamp: datetime,
+    last_timestamp: datetime,
+    first_uptime_seconds: float,
+    last_uptime_seconds: float,
+) -> Table:
+    """Create explicit time window table for correlation with incidents/deployments."""
+    table = Table(title="Time Window", show_header=False, box=None, padding=(0, 2))
+    table.add_column("Metric", style="label")
+    table.add_column("Value", style="metric")
+
+    table.add_row("First event timestamp", first_timestamp.isoformat())
+    table.add_row("Last event timestamp", last_timestamp.isoformat())
+    table.add_row("First event uptime", f"{first_uptime_seconds:.3f}s")
+    table.add_row("Last event uptime", f"{last_uptime_seconds:.3f}s")
     return table
 
 
@@ -1983,10 +2028,24 @@ def render_leak_severity_panel(leak_severity: LeakSeverity) -> Panel:
     return Panel(content, title=f"[{color}]Memory Leak Assessment[/{color}]", border_style=color)
 
 
+def classify_warning_for_health(warning: str) -> Literal["health", "data"]:
+    """Classify warnings into health vs data/coverage limitations."""
+    data_markers = (
+        "Old generation utilization not available",
+        "Log runtime only",
+        "CMS Full GC causes not parsed",
+        "trend analysis unreliable",
+    )
+    if any(marker in warning for marker in data_markers):
+        return "data"
+    return "health"
+
+
 def determine_quick_diagnosis(summary: GCSummary) -> str:
     """Determine concise two-line diagnosis: GC health + leak risk."""
-    critical_count = sum(1 for warning in summary.warnings if "CRITICAL" in warning)
-    warning_count = sum(1 for warning in summary.warnings if "WARNING" in warning)
+    health_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "health"]
+    critical_count = sum(1 for warning in health_warnings if "CRITICAL" in warning)
+    warning_count = sum(1 for warning in health_warnings if "WARNING" in warning)
 
     if critical_count > 0:
         health_line = "🔴 GC HEALTH: Critical issues detected"
@@ -2068,12 +2127,59 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
     return recommendations
 
 
-def render_rich_output(summary: GCSummary, gc_type: str) -> None:
+def render_rich_output(
+    summary: GCSummary,
+    gc_type: str,
+    *,
+    events: list[GCEvent] | None = None,
+    total_log_lines: int | None = None,
+    raw_event_count: int | None = None,
+    unparsed_full_gc_headers: int | None = None,
+) -> None:
     """Render comprehensive analysis using Rich components."""
     # Header
     console.print()
     console.print(Panel(f"GC Type: {gc_type}", style="header", expand=True))
     console.print()
+
+    # Data quality / parsing coverage (if provided)
+    if total_log_lines is not None and raw_event_count is not None:
+        console.print(
+            create_parsing_coverage_table(
+                total_log_lines=total_log_lines,
+                raw_event_count=raw_event_count,
+                usable_event_count=summary.total_event_count,
+                unparsed_full_gc_headers=unparsed_full_gc_headers,
+            )
+        )
+        console.print()
+
+    # Explicit time window (if events are provided)
+    if events:
+        first_event = min(events, key=lambda e: e.timestamp)
+        last_event = max(events, key=lambda e: e.timestamp)
+        console.print(
+            create_time_window_table(
+                first_timestamp=first_event.timestamp,
+                last_timestamp=last_event.timestamp,
+                first_uptime_seconds=first_event.uptime_seconds,
+                last_uptime_seconds=last_event.uptime_seconds,
+            )
+        )
+        console.print()
+
+    # Data Notes (data quality or coverage limitations)
+    if summary.warnings:
+        data_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "data"]
+        if data_warnings:
+            notes_text = Text()
+            for index, warning in enumerate(data_warnings):
+                clean_warning = warning.removeprefix("⚠️ ").removeprefix("⚠ ")
+                line_ending = "\n" if index < len(data_warnings) - 1 else ""
+                notes_text.append("• ", style="info")
+                notes_text.append(clean_warning + line_ending, style="info")
+            console.print(Panel(notes_text, title="[info]Data Notes[/info]", border_style="cyan"))
+            console.print()
 
     # JVM Heap Configuration (if available)
     if summary.jvm_heap_config:
@@ -2230,7 +2336,45 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
     console.print(heap_table)
     console.print()
 
-    # Old Generation Analysis
+    # Pause Time Analysis
+    console.print(create_pause_distribution_table(summary))
+    console.print()
+
+    # Top pauses (fast triage)
+    if events:
+        top_n = 5
+        top_pauses = sorted(events, key=lambda e: e.pause_time_seconds, reverse=True)[:top_n]
+        if top_pauses:
+            top_table = Table(
+                title=f"Top {min(top_n, len(top_pauses))} Longest Pauses",
+                show_header=True,
+                header_style="header",
+            )
+            top_table.add_column("Timestamp", style="info")
+            top_table.add_column("GC", style="info")
+            top_table.add_column("Pause", justify="right", style="metric")
+            top_table.add_column("Heap after", justify="right", style="metric")
+            top_table.add_column("Old gen", justify="right", style="metric")
+
+            for e in top_pauses:
+                heap_after_mb = e.heap_after_kb / 1024
+                heap_total_mb = e.heap_total_kb / 1024
+                heap_after_text = f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
+                old_text = f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "—"
+                top_table.add_row(
+                    e.timestamp.isoformat(),
+                    e.gc_kind,
+                    f"{e.pause_time_seconds:.3f}s",
+                    heap_after_text,
+                    old_text,
+                )
+
+            console.print(top_table)
+            console.print()
+
+    # Collector-Specific Diagnostics
+    collector_blocks: list[Table] = []
+
     if summary.old_start is not None and summary.old_end is not None:
         old_table = Table(
             title="Old Generation Analysis", show_header=False, box=None, padding=(0, 2)
@@ -2242,7 +2386,6 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
         old_table.add_row("Net old gen growth", f"{summary.old_growth:+.1f} pts")
         old_table.add_row("Peak old gen usage", f"{summary.peak_old_pct:.1f}%")
 
-        # Full GC reclamation effectiveness
         if summary.full_gc_count > 0:
             avg_reclaimed_mb = summary.avg_reclaimed_kb / 1024
             old_table.add_row("Avg reclaimed per Full GC", f"{avg_reclaimed_mb:.1f} MB")
@@ -2252,50 +2395,42 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
             if summary.reclamation_declining:
                 old_table.add_row("  [warning]⚠ Reclamation declining over time[/warning]", "")
 
-        console.print(old_table)
-        console.print()
+        collector_blocks.append(old_table)
 
-    # Allocation Pressure (if calculated)
+        if summary.period_stats:
+            trend_table = Table(
+                title="Trend (Early / Mid / Late)",
+                show_header=True,
+                header_style="header",
+                box=None,
+                padding=(0, 2),
+            )
+            trend_table.add_column("Period", style="info")
+            trend_table.add_column("Avg old gen %", justify="right", style="metric")
+            trend_table.add_column("Full GC count", justify="right", style="metric")
+            for period_name in ["early", "mid", "late"]:
+                if period_name in summary.period_stats:
+                    p = summary.period_stats[period_name]
+                    trend_table.add_row(
+                        period_name,
+                        f"{p.average_old_gen_percentage:.1f}%",
+                        str(p.full_gc_count),
+                    )
+            collector_blocks.append(trend_table)
+
     if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 0:
         alloc_table = Table(
             title="Allocation Pressure", show_header=False, box=None, padding=(0, 2)
         )
         alloc_table.add_column("Metric", style="label")
         alloc_table.add_column("Value", style="metric")
-
         alloc_table.add_row("Allocation rate", f"{summary.allocation_rate_mb_sec:.2f} MB/sec")
-
         if summary.avg_promotion_kb:
             alloc_table.add_row(
                 "Average promotion", f"{summary.avg_promotion_kb:.0f} KB per Young GC"
             )
+        collector_blocks.append(alloc_table)
 
-        console.print(alloc_table)
-        console.print()
-
-    # Pause Time Analysis
-    console.print(create_pause_distribution_table(summary))
-    console.print()
-
-    # Memory Leak Assessment
-    console.print(render_leak_severity_panel(summary.leak_severity))
-    console.print()
-
-    # Metaspace Analysis
-    if summary.metaspace_analysis:
-        meta = summary.metaspace_analysis
-        meta_table = Table(title="Metaspace Analysis", show_header=False, box=None, padding=(0, 2))
-        meta_table.add_column("Metric", style="label")
-        meta_table.add_column("Value", style="metric")
-        meta_table.add_row("Peak metaspace usage", f"{meta.peak_metaspace_used_percentage:.1f}%")
-        meta_table.add_row("Metaspace growth", f"{meta.metaspace_growth_kb // 1024}MB")
-        if meta.metaspace_warnings:
-            for warning in meta.metaspace_warnings:
-                console.print(f"  [warning]⚠ {warning}[/warning]")
-        console.print(meta_table)
-        console.print()
-
-    # G1 Metrics
     if summary.g1_metrics:
         g1 = summary.g1_metrics
         g1_table = Table(title="G1 GC Metrics", show_header=False, box=None, padding=(0, 2))
@@ -2303,17 +2438,11 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
         g1_table.add_column("Value", style="metric")
         g1_table.add_row("Mixed GC count", f"{g1.mixed_gc_count}")
         g1_table.add_row("Mixed GCs per hour", f"{g1.mixed_gc_frequency_per_hour:.2f}")
-        g1_table.add_row("Humongous allocations", f"{g1.humongous_allocation_count}")
+        g1_table.add_row("Humongous activity (events)", f"{g1.humongous_allocation_count}")
         g1_table.add_row("Evacuation failures", f"{g1.evacuation_failure_count}")
         g1_table.add_row("To-space exhaustion events", f"{g1.to_space_exhausted_count}")
-        console.print(g1_table)
-        if g1.g1_warnings:
-            console.print()
-            for warning in g1.g1_warnings:
-                console.print(f"  [warning]⚠ {warning}[/warning]")
-        console.print()
+        collector_blocks.append(g1_table)
 
-    # CMS Metrics
     if summary.cms_metrics:
         cms = summary.cms_metrics
         cms_table = Table(title="CMS GC Metrics", show_header=False, box=None, padding=(0, 2))
@@ -2328,8 +2457,29 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
             cms_table.add_row(
                 "  [warning]⚠ Failures indicate old gen filled before cycle completed[/warning]", ""
             )
-        console.print(cms_table)
+        collector_blocks.append(cms_table)
+
+    if collector_blocks:
+        console.print(Panel(f"Collector-Specific Diagnostics: {gc_type}", style="header", expand=True))
         console.print()
+        for table in collector_blocks:
+            console.print(table)
+            console.print()
+
+    # Metaspace Analysis
+    if summary.metaspace_analysis:
+        meta = summary.metaspace_analysis
+        meta_table = Table(title="Metaspace Analysis", show_header=False, box=None, padding=(0, 2))
+        meta_table.add_column("Metric", style="label")
+        meta_table.add_column("Value", style="metric")
+        meta_table.add_row("Peak metaspace usage", f"{meta.peak_metaspace_used_percentage:.1f}%")
+        meta_table.add_row("Metaspace growth", f"{meta.metaspace_growth_kb // 1024}MB")
+        console.print(meta_table)
+        console.print()
+
+    # Memory Leak Assessment
+    console.print(render_leak_severity_panel(summary.leak_severity))
+    console.print()
 
     # Evidence-based Recommendations
     recommendations = build_evidence_based_recommendations(summary)
@@ -2342,10 +2492,12 @@ def render_rich_output(summary: GCSummary, gc_type: str) -> None:
         console.print(rec_panel)
         console.print()
 
-    # Warning banner
+    # Warning banner (health only)
     if summary.warnings:
-        console.print(render_warning_banner(summary.warnings))
-        console.print()
+        health_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "health"]
+        if health_warnings:
+            console.print(render_warning_banner(health_warnings))
+            console.print()
 
     # Overall Status
     critical_count = sum(1 for w in summary.warnings if "CRITICAL" in w)
@@ -2682,7 +2834,22 @@ def analyze(
         summary = build_comprehensive_summary(events, thresholds, lines)
 
         # Render output
-        render_rich_output(summary, parser.gc_type_name)
+        possible_full_gc_headers: int | None = None
+        if parser.gc_type_name == "Parallel GC":
+            possible_full_gc_headers = sum(1 for line in lines if "Full GC" in line)
+
+        unparsed_full_gc_headers: int | None = None
+        if possible_full_gc_headers is not None:
+            unparsed_full_gc_headers = max(0, possible_full_gc_headers - summary.full_gc_count)
+
+        render_rich_output(
+            summary,
+            parser.gc_type_name,
+            events=events,
+            total_log_lines=len(lines),
+            raw_event_count=len(raw_events),
+            unparsed_full_gc_headers=unparsed_full_gc_headers,
+        )
 
         # Export if requested
         if export:

@@ -118,15 +118,35 @@ Options:
 
 ## Understanding the terminal summary output
 
-The terminal report is organized into sections. Not every section appears for every log; some require collector-specific fields.
+The terminal report is organized into a consistent core, plus a collector-specific block. Not every
+section appears for every log; some require collector-specific fields.
 
 ### Quick Diagnosis
 
-A single-line health classification derived from the computed metrics:
+A two-line health classification derived from the computed metrics:
 
-- Healthy (no major issues detected)
-- Memory pressure / degraded (elevated overhead, pauses, or GC frequency)
-- High risk / critical (leak signals or severe thrashing)
+- **GC Health**: overall GC health based on warning thresholds (critical/degraded/stable)
+- **Leak Risk**: leak risk level derived from old-gen trends (or “not assessed” if data is missing)
+
+### Parsing Coverage
+
+A data-quality summary for the input log:
+
+- **Total log lines**, **Parsed events (raw)**, **Usable events**, **Dropped events**
+- **Usable rate** as a percentage of parsed events
+- **Unparsed Full GC headers** (Parallel GC logs with multi-line full GC entries)
+
+### Time Window
+
+Explicit first/last timestamps and uptimes to correlate GC behavior with incidents or deploys:
+
+- **First event timestamp** / **Last event timestamp**
+- **First event uptime** / **Last event uptime**
+
+### Data Notes
+
+Up-front data limitations (for example, old-gen not present in the log) so readers don’t
+misinterpret leak scoring or trend indicators.
 
 ### At-a-Glance
 
@@ -134,7 +154,7 @@ A compact panel intended for “first look” triage:
 
 - **Runtime**: time span covered by parsed events
 - **GC Events**: number of parsed events
-- **GC Overhead**: % of runtime spent in GC pauses
+- **GC Overhead (pause time)**: % of runtime spent in GC pauses
 - **P99 STW Pause**: 99th percentile pause (seconds) across all parsed events
 - **Peak Heap**: maximum observed heap utilization %
 - **Full GCs/hr**: Full GC rate normalized per hour
@@ -182,6 +202,18 @@ Old-gen pressure is one of the strongest early warning signals for leaks and lon
 
 A distribution table showing (by GC type) count, average, median, P95, P99, and maximum pause times. The “Overall (All Types)” row reports P50/P95/P99 across all parsed events.
 
+### Top Longest Pauses
+
+A short list of the longest pauses with timestamp, GC type, pause time, heap-after, and old-gen % (if available).
+
+### Collector-Specific Diagnostics
+
+A single block containing only the diagnostics that apply to the detected collector:
+
+- **G1 GC Metrics**: mixed GC count/rate, humongous activity, evacuation/to-space failures
+- **Parallel GC**: old-gen analysis, early/mid/late trend view, allocation pressure
+- **CMS GC Metrics**: CMS cycles per hour, average concurrent pause, CMS-specific notes
+
 ### Memory Leak Assessment
 
 Leak severity is a score from **0–100** plus a qualitative level:
@@ -206,18 +238,6 @@ The report lists the specific indicators that contributed to the score.
 
 - **Peak metaspace usage %**
 - **Metaspace growth** (MB) over the log window
-- Warnings for high peak usage (e.g., >90%) or large growth (e.g., >50MB)
-
-### G1 GC Metrics (G1 logs only, when detected)
-
-- Mixed GC count and mixed GC rate (per hour)
-- Humongous allocation signals
-- Evacuation failures / to-space exhaustion counts
-
-### CMS GC Metrics (CMS logs only, when detected)
-
-- Approximate CMS cycles per hour
-- Average concurrent pause time
 
 ### Evidence-Based Recommendations
 
