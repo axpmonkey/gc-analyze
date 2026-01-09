@@ -2524,13 +2524,75 @@ def render_rich_output(
 # ============================================================
 
 
-def export_markdown_summary(summary: GCSummary, gc_type: str, output_path: Path) -> None:
+def export_markdown_summary(
+    summary: GCSummary,
+    gc_type: str,
+    output_path: Path,
+    *,
+    events: list[GCEvent] | None = None,
+    total_log_lines: int | None = None,
+    raw_event_count: int | None = None,
+    unparsed_full_gc_headers: int | None = None,
+) -> None:
     """Export analysis summary to Markdown format."""
     md_content: list[str] = []
 
     md_content.append("# GC Analysis Report\n\n")
     md_content.append(f"**Generated:** {datetime.now().isoformat()}\n\n")
     md_content.append(f"**GC Type:** {gc_type}\n\n")
+
+    def format_seconds(seconds: float) -> str:
+        if seconds > 60:
+            return f"{seconds:.1f}s ({seconds / 60:.1f}m)"
+        return f"{seconds:.3f}s"
+
+    def sanitize_text(text: str) -> str:
+        return (
+            text.replace("⚠️ ", "")
+            .replace("⚠ ", "")
+            .replace("🔴 ", "")
+            .replace("🟠 ", "")
+            .replace("🟡 ", "")
+            .replace("🟢 ", "")
+        )
+
+    # Parsing Coverage
+    if total_log_lines is not None and raw_event_count is not None:
+        md_content.append("## Parsing Coverage\n\n")
+        md_content.append(f"- **Total log lines:** {total_log_lines}\n")
+        md_content.append(f"- **Parsed events (raw):** {raw_event_count}\n")
+        md_content.append(f"- **Usable events:** {summary.total_event_count}\n")
+        md_content.append(
+            f"- **Dropped events:** {max(0, raw_event_count - summary.total_event_count)}\n"
+        )
+        if raw_event_count > 0:
+            usable_pct = summary.total_event_count / raw_event_count * 100.0
+            md_content.append(f"- **Usable rate:** {usable_pct:.1f}%\n")
+        if unparsed_full_gc_headers is not None and unparsed_full_gc_headers > 0:
+            md_content.append(
+                f"- **Unparsed Full GC headers:** {unparsed_full_gc_headers}\n"
+            )
+        md_content.append("\n")
+
+    # Time Window
+    if events:
+        first_event = min(events, key=lambda e: e.timestamp)
+        last_event = max(events, key=lambda e: e.timestamp)
+        md_content.append("## Time Window\n\n")
+        md_content.append(f"- **First event timestamp:** {first_event.timestamp.isoformat()}\n")
+        md_content.append(f"- **Last event timestamp:** {last_event.timestamp.isoformat()}\n")
+        md_content.append(f"- **First event uptime:** {first_event.uptime_seconds:.3f}s\n")
+        md_content.append(f"- **Last event uptime:** {last_event.uptime_seconds:.3f}s\n\n")
+
+    # Data Notes (data quality or coverage limitations)
+    if summary.warnings:
+        data_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "data"]
+        if data_warnings:
+            md_content.append("## Data Notes\n\n")
+            for warning in data_warnings:
+                clean_warning = warning.removeprefix("⚠️ ").removeprefix("⚠ ")
+                md_content.append(f"- {clean_warning}\n")
+            md_content.append("\n")
 
     # JVM Heap Configuration
     if summary.jvm_heap_config:
@@ -2624,16 +2686,21 @@ def export_markdown_summary(summary: GCSummary, gc_type: str, output_path: Path)
 
         md_content.append("\n")
 
+    # Quick Diagnosis
+    md_content.append("## Quick Diagnosis\n\n")
+    md_content.append(f"{sanitize_text(determine_quick_diagnosis(summary))}\n\n")
+
+    # At-a-Glance
+    md_content.append("## At-a-Glance\n\n")
+    md_content.append(f"- **Runtime:** {summary.runtime_hours:.2f} hrs\n")
+    md_content.append(f"- **GC Events:** {summary.total_event_count}\n")
+    md_content.append(f"- **GC Overhead (pause time):** {summary.gc_overhead_pct:.2f}%\n")
+    md_content.append(f"- **P99 STW Pause:** {summary.p99_pause:.3f}s\n")
+    md_content.append(f"- **Peak Heap:** {summary.peak_heap_pct:.1f}%\n")
+    md_content.append(f"- **Full GCs/hr:** {summary.full_gc_per_hour:.2f}\n")
+    md_content.append(f"- **Leak Level:** {summary.leak_severity.severity_level}\n\n")
+
     # Overall Status
-    if summary.leak_severity.severity_level in ["High", "Critical"]:
-        status_emoji = "🔴"
-    elif summary.warnings:
-        status_emoji = "🟡"
-    else:
-        status_emoji = "🟢"
-
-    md_content.append(f"## Overall Status: {status_emoji}\n\n")
-
     # Runtime Overview
     md_content.append("## Runtime Overview\n\n")
     md_content.append(f"- **Runtime:** {summary.runtime_hours:.2f} hours\n")
@@ -2641,10 +2708,178 @@ def export_markdown_summary(summary: GCSummary, gc_type: str, output_path: Path)
     md_content.append(f"- **Young GC:** {summary.young_gc_count}\n")
     md_content.append(f"- **Full GC:** {summary.full_gc_count}\n\n")
 
+    # GC Frequency & Rate
+    md_content.append("## GC Frequency & Rate\n\n")
+    md_content.append(f"- **Young GCs per hour:** {summary.young_gc_per_hour:.1f}\n")
+    md_content.append(f"- **Full GCs per hour:** {summary.full_gc_per_hour:.2f}\n")
+    if summary.avg_full_gc_interval_min:
+        md_content.append(
+            f"- **Avg time between Full GCs:** {summary.avg_full_gc_interval_min:.1f} minutes\n"
+        )
+    md_content.append("\n")
+
+    # GC Overhead & Throughput
+    md_content.append("## GC Overhead & Throughput\n\n")
+    md_content.append(f"- **Total time in GC:** {summary.total_gc_time_sec:.1f} seconds\n")
+    md_content.append(f"- **GC overhead:** {summary.gc_overhead_pct:.2f}%\n")
+    md_content.append(f"- **Application throughput:** {summary.throughput_pct:.2f}%\n\n")
+
+    # Heap Utilization
+    md_content.append("## Heap Utilization\n\n")
+    md_content.append(f"- **Peak heap usage:** {summary.peak_heap_pct:.1f}%\n")
+    md_content.append(f"- **Average heap usage:** {summary.avg_heap_pct:.1f}%\n")
+    md_content.append(f"- **Heap headroom:** {summary.heap_headroom:.1f}%\n\n")
+
+    # Pause Time Analysis
+    md_content.append("## Pause Time Analysis\n\n")
+    md_content.append("| GC Type | Count | Avg | Median | P95 | P99 | Max |\n")
+    md_content.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
+    total_count = (
+        summary.young_gc_count
+        + summary.full_gc_count
+        + summary.mixed_gc_count
+        + summary.remark_gc_count
+        + summary.cleanup_gc_count
+    )
+    md_content.append(
+        f"| Overall (All Types) | {total_count} | n/a | {format_seconds(summary.p50_pause)} | "
+        f"{format_seconds(summary.p95_pause)} | {format_seconds(summary.p99_pause)} | n/a |\n"
+    )
+    if summary.young_gc_count > 0:
+        md_content.append(
+            f"| Young GC | {summary.young_gc_count} | {format_seconds(summary.avg_young_pause)} | "
+            f"{format_seconds(summary.median_young_pause)} | {format_seconds(summary.p95_young_pause)} | "
+            f"{format_seconds(summary.p99_young_pause)} | {format_seconds(summary.max_young_pause)} |\n"
+        )
+    if summary.full_gc_count > 0:
+        md_content.append(
+            f"| Full GC | {summary.full_gc_count} | {format_seconds(summary.avg_full_pause)} | "
+            f"{format_seconds(summary.median_full_pause)} | {format_seconds(summary.p95_full_pause)} | "
+            f"{format_seconds(summary.p99_full_pause)} | {format_seconds(summary.max_full_pause)} |\n"
+        )
+    if summary.mixed_gc_count > 0:
+        md_content.append(
+            f"| Mixed GC (G1) | {summary.mixed_gc_count} | {format_seconds(summary.avg_mixed_pause)} | "
+            f"{format_seconds(summary.median_mixed_pause)} | {format_seconds(summary.p95_mixed_pause)} | "
+            f"{format_seconds(summary.p99_mixed_pause)} | {format_seconds(summary.max_mixed_pause)} |\n"
+        )
+    if summary.remark_gc_count > 0:
+        md_content.append(
+            f"| Remark (G1) | {summary.remark_gc_count} | {format_seconds(summary.avg_remark_pause)} | "
+            f"{format_seconds(summary.median_remark_pause)} | {format_seconds(summary.p95_remark_pause)} | "
+            f"{format_seconds(summary.p99_remark_pause)} | {format_seconds(summary.max_remark_pause)} |\n"
+        )
+    if summary.cleanup_gc_count > 0:
+        md_content.append(
+            f"| Cleanup (G1) | {summary.cleanup_gc_count} | {format_seconds(summary.avg_cleanup_pause)} | "
+            f"{format_seconds(summary.median_cleanup_pause)} | {format_seconds(summary.p95_cleanup_pause)} | "
+            f"{format_seconds(summary.p99_cleanup_pause)} | {format_seconds(summary.max_cleanup_pause)} |\n"
+        )
+    md_content.append("\n")
+
+    # Top pauses (fast triage)
+    if events:
+        top_n = 5
+        top_pauses = sorted(events, key=lambda e: e.pause_time_seconds, reverse=True)[:top_n]
+        if top_pauses:
+            md_content.append(f"## Top {min(top_n, len(top_pauses))} Longest Pauses\n\n")
+            md_content.append("| Timestamp | GC | Pause | Heap after | Old gen |\n")
+            md_content.append("| --- | --- | ---: | ---: | ---: |\n")
+            for e in top_pauses:
+                heap_after_mb = e.heap_after_kb / 1024
+                heap_total_mb = e.heap_total_kb / 1024
+                heap_after_text = (
+                    f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
+                )
+                old_text = f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "n/a"
+                md_content.append(
+                    f"| {e.timestamp.isoformat()} | {e.gc_kind} | "
+                    f"{e.pause_time_seconds:.3f}s | {heap_after_text} | {old_text} |\n"
+                )
+            md_content.append("\n")
+
+    # Collector-Specific Diagnostics
+    if summary.old_start is not None and summary.old_end is not None:
+        md_content.append(f"## Collector-Specific Diagnostics: {gc_type}\n\n")
+        md_content.append("### Old Generation Analysis\n\n")
+        md_content.append(f"- **Old gen at start:** {summary.old_start:.1f}%\n")
+        md_content.append(f"- **Old gen at end:** {summary.old_end:.1f}%\n")
+        md_content.append(f"- **Net old gen growth:** {summary.old_growth:+.1f} pts\n")
+        md_content.append(f"- **Peak old gen usage:** {summary.peak_old_pct:.1f}%\n")
+        if summary.full_gc_count > 0:
+            avg_reclaimed_mb = summary.avg_reclaimed_kb / 1024
+            md_content.append(f"- **Avg reclaimed per Full GC:** {avg_reclaimed_mb:.1f} MB\n")
+            md_content.append(
+                f"- **Full GCs reducing old gen:** {summary.full_gc_reducing}/{summary.full_gc_count}\n"
+            )
+            if summary.reclamation_declining:
+                md_content.append("- **Reclamation declining over time:** yes\n")
+        md_content.append("\n")
+
+        if summary.period_stats:
+            md_content.append("### Trend (Early / Mid / Late)\n\n")
+            md_content.append("| Period | Avg old gen % | Full GC count |\n")
+            md_content.append("| --- | ---: | ---: |\n")
+            for period_name in ["early", "mid", "late"]:
+                if period_name in summary.period_stats:
+                    p = summary.period_stats[period_name]
+                    md_content.append(
+                        f"| {period_name} | {p.average_old_gen_percentage:.1f}% | "
+                        f"{p.full_gc_count} |\n"
+                    )
+            md_content.append("\n")
+
+    if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 0:
+        md_content.append("### Allocation Pressure\n\n")
+        md_content.append(f"- **Allocation rate:** {summary.allocation_rate_mb_sec:.2f} MB/sec\n")
+        if summary.avg_promotion_kb:
+            md_content.append(
+                f"- **Average promotion:** {summary.avg_promotion_kb:.0f} KB per Young GC\n"
+            )
+        md_content.append("\n")
+
+    if summary.g1_metrics:
+        g1 = summary.g1_metrics
+        md_content.append("### G1 GC Metrics\n\n")
+        md_content.append(f"- **Mixed GC count:** {g1.mixed_gc_count}\n")
+        md_content.append(f"- **Mixed GCs per hour:** {g1.mixed_gc_frequency_per_hour:.2f}\n")
+        md_content.append(f"- **Humongous activity (events):** {g1.humongous_allocation_count}\n")
+        md_content.append(f"- **Evacuation failures:** {g1.evacuation_failure_count}\n")
+        md_content.append(f"- **To-space exhaustion events:** {g1.to_space_exhausted_count}\n\n")
+
+    if summary.cms_metrics:
+        cms = summary.cms_metrics
+        md_content.append("### CMS GC Metrics\n\n")
+        md_content.append(f"- **CMS cycles per hour:** {cms.cms_cycle_frequency_per_hour:.2f}\n")
+        md_content.append(
+            f"- **Average concurrent pause:** {cms.average_concurrent_pause_seconds:.4f}s\n"
+        )
+        md_content.append(f"- **Concurrent mode failures:** {cms.concurrent_mode_failures}\n")
+        if cms.concurrent_mode_failures > 0:
+            md_content.append(
+                "- **Failures indicate old gen filled before cycle completed:** yes\n"
+            )
+        md_content.append("\n")
+
+    # Metaspace Analysis
+    if summary.metaspace_analysis:
+        meta = summary.metaspace_analysis
+        md_content.append("## Metaspace Analysis\n\n")
+        md_content.append(
+            f"- **Peak metaspace usage:** {meta.peak_metaspace_used_percentage:.1f}%\n"
+        )
+        md_content.append(f"- **Metaspace growth:** {meta.metaspace_growth_kb // 1024}MB\n\n")
+
     # Leak Assessment
     md_content.append("## Memory Leak Assessment\n\n")
     md_content.append(f"- **Severity Score:** {summary.leak_severity.score:.1f}/100\n")
     md_content.append(f"- **Level:** {summary.leak_severity.severity_level}\n\n")
+
+    if any(
+        "Insufficient old-gen data" in indicator
+        for indicator in summary.leak_severity.indicators
+    ):
+        md_content.append("**Note:** Score not computed without old-gen data.\n\n")
 
     if summary.leak_severity.indicators:
         md_content.append("**Indicators:**\n\n")
@@ -2654,7 +2889,7 @@ def export_markdown_summary(summary: GCSummary, gc_type: str, output_path: Path)
     # Warnings
     if summary.warnings:
         md_content.append("## Warnings\n\n")
-        md_content.extend(f"- ⚠️ {warning}\n" for warning in summary.warnings)
+        md_content.extend(f"- {sanitize_text(warning)}\n" for warning in summary.warnings)
         md_content.append("\n")
 
     # Evidence-based Recommendations
@@ -2663,6 +2898,28 @@ def export_markdown_summary(summary: GCSummary, gc_type: str, output_path: Path)
         md_content.append("## Evidence-Based Recommendations\n\n")
         md_content.extend(f"- {rec}\n" for rec in recommendations)
         md_content.append("\n")
+
+    # Health Warnings (health only)
+    if summary.warnings:
+        health_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "health"]
+        if health_warnings:
+            md_content.append("## Health Warnings\n\n")
+            md_content.extend(f"- {sanitize_text(warning)}\n" for warning in health_warnings)
+            md_content.append("\n")
+
+    # Overall Status
+    critical_count = sum(1 for w in summary.warnings if "CRITICAL" in w)
+    warning_count = sum(1 for w in summary.warnings if "WARNING" in w)
+    if critical_count >= 3:
+        status = "CRITICAL - IMMEDIATE ACTION REQUIRED"
+    elif critical_count > 0:
+        status = "UNSTABLE - INTERVENTION REQUIRED"
+    elif warning_count > 0:
+        status = "DEGRADED - MONITORING REQUIRED"
+    else:
+        status = "STABLE"
+    md_content.append("## Overall Status\n\n")
+    md_content.append(f"{status}\n\n")
 
     # Recommendations
     md_content.append("## Recommendations\n\n")
@@ -2853,7 +3110,15 @@ def analyze(
 
         # Export if requested
         if export:
-            export_markdown_summary(summary, parser.gc_type_name, export)
+            export_markdown_summary(
+                summary,
+                parser.gc_type_name,
+                export,
+                events=events,
+                total_log_lines=len(lines),
+                raw_event_count=len(raw_events),
+                unparsed_full_gc_headers=unparsed_full_gc_headers,
+            )
             console.print(f"\n[success]✓ Summary exported to {export}[/success]")
 
         # Exit with appropriate code
