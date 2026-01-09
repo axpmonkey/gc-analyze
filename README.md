@@ -118,20 +118,6 @@ Options:
 - `--heap-critical`: peak heap % threshold for critical warnings (default `95.0`)
 - `--verbose`, `-v`: print parsing details and exception tracebacks
 
-## Producing GC logs (examples)
-
-These are common configurations; ensure your log includes timestamps and/or uptime so the analyzer can compute rates.
-
-```text
-# Java 9+ unified logging
--Xlog:gc*:file=gc.log:time,uptime,level,tags
-```
-
-```text
-# Java 8-style logging (examples; exact flags vary by JVM/vendor)
--XX:+PrintGCDetails -XX:+PrintGCDateStamps -Xloggc:gc.log
-```
-
 ## Understanding the terminal summary output
 
 The terminal report is organized into sections. Not every section appears for every log; some require collector-specific fields.
