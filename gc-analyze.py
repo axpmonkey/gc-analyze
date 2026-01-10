@@ -25,7 +25,6 @@ from typing import Annotated, Any, Literal, Protocol, TypeAlias
 import typer
 from pydantic import BaseModel, ConfigDict, Field
 from rich.console import Console
-from rich.padding import Padding
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn
 from rich.table import Table
@@ -169,7 +168,9 @@ class JVMHeapConfig(BaseModel):
     gc_time_ratio: int | None = None  # -XX:GCTimeRatio
     adaptive_size_policy_weight: int | None = None  # -XX:AdaptiveSizePolicyWeight
     use_adaptive_size_policy: bool | None = None  # -XX:+UseAdaptiveSizePolicy
-    use_adaptive_size_policy_footprint_goal: bool | None = None  # -XX:+UseAdaptiveSizePolicyFootprintGoal
+    use_adaptive_size_policy_footprint_goal: bool | None = (
+        None  # -XX:+UseAdaptiveSizePolicyFootprintGoal
+    )
 
     # G1-specific
     g1_heap_region_size_bytes: int | None = None  # -XX:G1HeapRegionSize
@@ -926,7 +927,7 @@ def detect_gc_type_and_create_parser(log_lines: list[str]) -> GCParser:
         )
 
 
-def validate_old_gen_values(  # noqa: PLR0913
+def validate_old_gen_values(
     heap_before: int,
     heap_after: int,
     heap_total: int,
@@ -1323,9 +1324,7 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
         "use_adaptive_size_policy_footprint_goal": re.compile(
             r"-XX:\+UseAdaptiveSizePolicyFootprintGoal"
         ),
-        "use_cms_initiating_occupancy_only": re.compile(
-            r"-XX:\+UseCMSInitiatingOccupancyOnly"
-        ),
+        "use_cms_initiating_occupancy_only": re.compile(r"-XX:\+UseCMSInitiatingOccupancyOnly"),
     }
 
     # Also support -Xms, -Xmx, -Xmn formats
@@ -2277,7 +2276,9 @@ def render_rich_output(
         if config.max_ram_fraction is not None:
             jvm_table.add_row("Max RAM Fraction", str(config.max_ram_fraction))
         if config.soft_max_heap_size_bytes:
-            jvm_table.add_row("Soft Max Heap Size", config.format_size(config.soft_max_heap_size_bytes))
+            jvm_table.add_row(
+                "Soft Max Heap Size", config.format_size(config.soft_max_heap_size_bytes)
+            )
         if config.always_pre_touch is True:
             jvm_table.add_row("Always Pre Touch", "enabled")
         if config.thread_stack_size_kb is not None:
@@ -2323,7 +2324,9 @@ def render_rich_output(
         if config.gc_time_ratio is not None:
             jvm_table.add_row("GC Time Ratio", str(config.gc_time_ratio))
         if config.adaptive_size_policy_weight is not None:
-            jvm_table.add_row("Adaptive Size Policy Weight", str(config.adaptive_size_policy_weight))
+            jvm_table.add_row(
+                "Adaptive Size Policy Weight", str(config.adaptive_size_policy_weight)
+            )
         if config.use_adaptive_size_policy is True:
             jvm_table.add_row("Adaptive Size Policy", "enabled")
         if config.use_adaptive_size_policy_footprint_goal is True:
@@ -2461,8 +2464,12 @@ def render_rich_output(
             for e in top_pauses:
                 heap_after_mb = e.heap_after_kb / 1024
                 heap_total_mb = e.heap_total_kb / 1024
-                heap_after_text = f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
-                old_text = f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "—"
+                heap_after_text = (
+                    f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
+                )
+                old_text = (
+                    f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "—"
+                )
                 top_table.add_row(
                     e.timestamp.isoformat(),
                     e.gc_kind,
@@ -2562,7 +2569,9 @@ def render_rich_output(
         collector_blocks.append(cms_table)
 
     if collector_blocks:
-        console.print(Panel(f"Collector-Specific Diagnostics: {gc_type}", style="header", expand=True))
+        console.print(
+            Panel(f"Collector-Specific Diagnostics: {gc_type}", style="header", expand=True)
+        )
         console.print()
         for table in collector_blocks:
             console.print(table)
@@ -2596,7 +2605,9 @@ def render_rich_output(
 
     # Warning banner (health only)
     if summary.warnings:
-        health_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "health"]
+        health_warnings = [
+            w for w in summary.warnings if classify_warning_for_health(w) == "health"
+        ]
         if health_warnings:
             console.print(render_warning_banner(health_warnings))
             console.print()
@@ -2671,9 +2682,7 @@ def export_markdown_summary(
             usable_pct = summary.total_event_count / raw_event_count * 100.0
             md_content.append(f"- **Usable rate:** {usable_pct:.1f}%\n")
         if unparsed_full_gc_headers is not None and unparsed_full_gc_headers > 0:
-            md_content.append(
-                f"- **Unparsed Full GC headers:** {unparsed_full_gc_headers}\n"
-            )
+            md_content.append(f"- **Unparsed Full GC headers:** {unparsed_full_gc_headers}\n")
         md_content.append("\n")
 
     # Time Window
@@ -2832,8 +2841,7 @@ def export_markdown_summary(
             md_content.append("- **Use CMS Initiating Occupancy Only**: enabled\n")
         if config.cms_full_gcs_before_compaction is not None:
             md_content.append(
-                f"- **CMS Full GCs Before Compaction**: "
-                f"{config.cms_full_gcs_before_compaction}\n"
+                f"- **CMS Full GCs Before Compaction**: {config.cms_full_gcs_before_compaction}\n"
             )
         if config.cms_wait_duration is not None:
             md_content.append(f"- **CMS Wait Duration**: {config.cms_wait_duration}ms\n")
@@ -2901,33 +2909,48 @@ def export_markdown_summary(
     )
     if summary.young_gc_count > 0:
         md_content.append(
-            f"| Young GC | {summary.young_gc_count} | {format_seconds(summary.avg_young_pause)} | "
-            f"{format_seconds(summary.median_young_pause)} | {format_seconds(summary.p95_young_pause)} | "
-            f"{format_seconds(summary.p99_young_pause)} | {format_seconds(summary.max_young_pause)} |\n"
+            f"| Young GC | {summary.young_gc_count} | "
+            f"{format_seconds(summary.avg_young_pause)} | "
+            f"{format_seconds(summary.median_young_pause)} | "
+            f"{format_seconds(summary.p95_young_pause)} | "
+            f"{format_seconds(summary.p99_young_pause)} | "
+            f"{format_seconds(summary.max_young_pause)} |\n"
         )
     if summary.full_gc_count > 0:
         md_content.append(
-            f"| Full GC | {summary.full_gc_count} | {format_seconds(summary.avg_full_pause)} | "
-            f"{format_seconds(summary.median_full_pause)} | {format_seconds(summary.p95_full_pause)} | "
-            f"{format_seconds(summary.p99_full_pause)} | {format_seconds(summary.max_full_pause)} |\n"
+            f"| Full GC | {summary.full_gc_count} | "
+            f"{format_seconds(summary.avg_full_pause)} | "
+            f"{format_seconds(summary.median_full_pause)} | "
+            f"{format_seconds(summary.p95_full_pause)} | "
+            f"{format_seconds(summary.p99_full_pause)} | "
+            f"{format_seconds(summary.max_full_pause)} |\n"
         )
     if summary.mixed_gc_count > 0:
         md_content.append(
-            f"| Mixed GC (G1) | {summary.mixed_gc_count} | {format_seconds(summary.avg_mixed_pause)} | "
-            f"{format_seconds(summary.median_mixed_pause)} | {format_seconds(summary.p95_mixed_pause)} | "
-            f"{format_seconds(summary.p99_mixed_pause)} | {format_seconds(summary.max_mixed_pause)} |\n"
+            f"| Mixed GC (G1) | {summary.mixed_gc_count} | "
+            f"{format_seconds(summary.avg_mixed_pause)} | "
+            f"{format_seconds(summary.median_mixed_pause)} | "
+            f"{format_seconds(summary.p95_mixed_pause)} | "
+            f"{format_seconds(summary.p99_mixed_pause)} | "
+            f"{format_seconds(summary.max_mixed_pause)} |\n"
         )
     if summary.remark_gc_count > 0:
         md_content.append(
-            f"| Remark (G1) | {summary.remark_gc_count} | {format_seconds(summary.avg_remark_pause)} | "
-            f"{format_seconds(summary.median_remark_pause)} | {format_seconds(summary.p95_remark_pause)} | "
-            f"{format_seconds(summary.p99_remark_pause)} | {format_seconds(summary.max_remark_pause)} |\n"
+            f"| Remark (G1) | {summary.remark_gc_count} | "
+            f"{format_seconds(summary.avg_remark_pause)} | "
+            f"{format_seconds(summary.median_remark_pause)} | "
+            f"{format_seconds(summary.p95_remark_pause)} | "
+            f"{format_seconds(summary.p99_remark_pause)} | "
+            f"{format_seconds(summary.max_remark_pause)} |\n"
         )
     if summary.cleanup_gc_count > 0:
         md_content.append(
-            f"| Cleanup (G1) | {summary.cleanup_gc_count} | {format_seconds(summary.avg_cleanup_pause)} | "
-            f"{format_seconds(summary.median_cleanup_pause)} | {format_seconds(summary.p95_cleanup_pause)} | "
-            f"{format_seconds(summary.p99_cleanup_pause)} | {format_seconds(summary.max_cleanup_pause)} |\n"
+            f"| Cleanup (G1) | {summary.cleanup_gc_count} | "
+            f"{format_seconds(summary.avg_cleanup_pause)} | "
+            f"{format_seconds(summary.median_cleanup_pause)} | "
+            f"{format_seconds(summary.p95_cleanup_pause)} | "
+            f"{format_seconds(summary.p99_cleanup_pause)} | "
+            f"{format_seconds(summary.max_cleanup_pause)} |\n"
         )
     md_content.append("\n")
 
@@ -2945,7 +2968,9 @@ def export_markdown_summary(
                 heap_after_text = (
                     f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
                 )
-                old_text = f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "n/a"
+                old_text = (
+                    f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "n/a"
+                )
                 md_content.append(
                     f"| {e.timestamp.isoformat()} | {e.gc_kind} | "
                     f"{e.pause_time_seconds:.3f}s | {heap_after_text} | {old_text} |\n"
@@ -2964,7 +2989,8 @@ def export_markdown_summary(
             avg_reclaimed_mb = summary.avg_reclaimed_kb / 1024
             md_content.append(f"- **Avg reclaimed per Full GC:** {avg_reclaimed_mb:.1f} MB\n")
             md_content.append(
-                f"- **Full GCs reducing old gen:** {summary.full_gc_reducing}/{summary.full_gc_count}\n"
+                f"- **Full GCs reducing old gen:** "
+                f"{summary.full_gc_reducing}/{summary.full_gc_count}\n"
             )
             if summary.reclamation_declining:
                 md_content.append("- **Reclamation declining over time:** yes\n")
@@ -3030,8 +3056,7 @@ def export_markdown_summary(
     md_content.append(f"- **Level:** {summary.leak_severity.severity_level}\n\n")
 
     if any(
-        "Insufficient old-gen data" in indicator
-        for indicator in summary.leak_severity.indicators
+        "Insufficient old-gen data" in indicator for indicator in summary.leak_severity.indicators
     ):
         md_content.append("**Note:** Score not computed without old-gen data.\n\n")
 
@@ -3055,7 +3080,9 @@ def export_markdown_summary(
 
     # Health Warnings (health only)
     if summary.warnings:
-        health_warnings = [w for w in summary.warnings if classify_warning_for_health(w) == "health"]
+        health_warnings = [
+            w for w in summary.warnings if classify_warning_for_health(w) == "health"
+        ]
         if health_warnings:
             md_content.append("## Health Warnings\n\n")
             md_content.extend(f"- {sanitize_text(warning)}\n" for warning in health_warnings)

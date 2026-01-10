@@ -18,6 +18,7 @@ select = ["E", "F", "I", "UP", "B", "SIM", "PERF", "PTH", "PL", "PIE", "RUF", "Q
 ignore = [
     "PLR0911",  # Too many return statements (acceptable for guard clauses)
     "PLR0912",  # Too many branches (acceptable for complex diagnostic logic)
+    "PLR0913",  # Too many arguments (render/export functions need diagnostic context)
     "PLR0915",  # Too many statements (render function is necessarily large)
     "PLR2004",  # Magic values (meaningful in GC analysis context: 90%, 60s, etc.)
     "B904",     # Exception chaining (Typer.Exit doesn't need chaining)
