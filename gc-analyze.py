@@ -15,9 +15,12 @@ Modern, type-safe GC log analyzer supporting:
 
 from __future__ import annotations
 
+import cProfile
+import pstats
 import re
 import sys
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
 from statistics import mean, median
 from typing import Annotated, Any, Literal, Protocol, TypeAlias
@@ -394,17 +397,24 @@ class ParallelGCParser:
         events: list[dict[str, Any]] = []
 
         for line in log_lines:
-            if match := self.FULL_GC_PATTERN.search(line):
+            # Substring guard: only run regex if "Full GC" present
+            if "Full GC" in line and (match := self.FULL_GC_PATTERN.search(line)):
                 event = self._extract_full_gc_event(match)
-                # Check for metaspace/permgen
-                if meta_match := self.METASPACE_PATTERN.search(line):
+                # Check for metaspace/permgen with substring guard
+                if ("Metaspace" in line or "PSPermGen" in line) and (
+                    meta_match := self.METASPACE_PATTERN.search(line)
+                ):
                     event["metaspace_before"] = int(meta_match.group("before"))
                     event["metaspace_after"] = int(meta_match.group("after"))
                     event["metaspace_total"] = int(meta_match.group("total"))
                 events.append(event)
-            elif match := self.YOUNG_GC_PATTERN.search(line):
+            # Substring guard: only run regex if "PSYoungGen" present
+            elif "PSYoungGen" in line and (match := self.YOUNG_GC_PATTERN.search(line)):
                 event = self._extract_young_gc_event(match)
-                if meta_match := self.METASPACE_PATTERN.search(line):
+                # Check for metaspace/permgen with substring guard
+                if ("Metaspace" in line or "PSPermGen" in line) and (
+                    meta_match := self.METASPACE_PATTERN.search(line)
+                ):
                     event["metaspace_before"] = int(meta_match.group("before"))
                     event["metaspace_after"] = int(meta_match.group("after"))
                     event["metaspace_total"] = int(meta_match.group("total"))
@@ -521,19 +531,25 @@ class G1GCParser:
         region_size_kb: int | None = None
 
         for line in log_lines:
-            # Try unified logging first
-            if match := self.UNIFIED_PAUSE_PATTERN.search(line):
-                event = self._extract_unified_pause(match, line)
-                events.append(event)
-                current_event = event
-                events_by_id[event["gc_id"]] = event
+            # Try unified logging first (substring guard: "Pause")
+            if "Pause" in line:
+                if match := self.UNIFIED_PAUSE_PATTERN.search(line):
+                    event = self._extract_unified_pause(match, line)
+                    events.append(event)
+                    current_event = event
+                    events_by_id[event["gc_id"]] = event
 
-            # Try legacy format
-            elif match := self.LEGACY_PAUSE_PATTERN.search(line):
-                current_event = self._extract_legacy_pause(match)
+            # Try legacy format (substring guard: "GC pause")
+            elif "GC pause" in line:
+                if match := self.LEGACY_PAUSE_PATTERN.search(line):
+                    current_event = self._extract_legacy_pause(match)
 
-            # Check for heap info in legacy format (appears on next line)
-            elif current_event and (match := self.LEGACY_HEAP_PATTERN.search(line)):
+            # Check for heap info in legacy format (substring guard: "Heap:")
+            elif (
+                current_event
+                and "Heap:" in line
+                and (match := self.LEGACY_HEAP_PATTERN.search(line))
+            ):
                 current_event["heap_before"] = int(float(match.group("heap_before")) * 1024)
                 current_event["heap_after"] = int(float(match.group("heap_after")) * 1024)
                 current_event["heap_total"] = int(float(match.group("heap_total")) * 1024)
@@ -541,34 +557,41 @@ class G1GCParser:
                 events.append(current_event)
                 current_event = None
 
-            # Legacy Eden/Survivor details (may be on same line as Heap)
-            if current_event:
-                if eden_match := self.LEGACY_EDEN_PATTERN.search(line):
-                    current_event["eden_before_kb"] = parse_size_to_kb(eden_match.group("before"))
-                    current_event["eden_after_kb"] = parse_size_to_kb(eden_match.group("after"))
-                    current_event["eden_total_kb"] = parse_size_to_kb(eden_match.group("total"))
-                if survivor_match := self.LEGACY_SURVIVOR_PATTERN.search(line):
-                    current_event["survivor_before_kb"] = parse_size_to_kb(
-                        survivor_match.group("before")
+            # Legacy Eden/Survivor details (substring guards)
+            if (
+                current_event
+                and "Eden:" in line
+                and (eden_match := self.LEGACY_EDEN_PATTERN.search(line))
+            ):
+                current_event["eden_before_kb"] = parse_size_to_kb(eden_match.group("before"))
+                current_event["eden_after_kb"] = parse_size_to_kb(eden_match.group("after"))
+                current_event["eden_total_kb"] = parse_size_to_kb(eden_match.group("total"))
+            if (
+                current_event
+                and "Survivors:" in line
+                and (survivor_match := self.LEGACY_SURVIVOR_PATTERN.search(line))
+            ):
+                current_event["survivor_before_kb"] = parse_size_to_kb(
+                    survivor_match.group("before")
+                )
+                current_event["survivor_after_kb"] = parse_size_to_kb(survivor_match.group("after"))
+                if survivor_match.group("total"):
+                    current_event["survivor_total_kb"] = parse_size_to_kb(
+                        survivor_match.group("total")
                     )
-                    current_event["survivor_after_kb"] = parse_size_to_kb(
-                        survivor_match.group("after")
-                    )
-                    if survivor_match.group("total"):
-                        current_event["survivor_total_kb"] = parse_size_to_kb(
-                            survivor_match.group("total")
-                        )
 
-            # Unified region size (used to compute young/old sizes)
-            if region_match := self.UNIFIED_REGION_SIZE.search(line):
+            # Unified region size (substring guard: "Heap region size:")
+            if "Heap region size:" in line and (
+                region_match := self.UNIFIED_REGION_SIZE.search(line)
+            ):
                 region_size_kb = int(region_match.group("size")) * 1024
                 target = events_by_id.get(int(region_match.group("gc_id")))
                 if target:
                     target["region_size_kb"] = region_size_kb
                     self._apply_region_counts(target, region_size_kb)
 
-            # Unified region counts (Eden/Survivor/Old/Humongous)
-            if region_counts := self.UNIFIED_REGION_COUNTS.search(line):
+            # Unified region counts (substring guard: " regions:")
+            if " regions:" in line and (region_counts := self.UNIFIED_REGION_COUNTS.search(line)):
                 target = events_by_id.get(int(region_counts.group("gc_id")))
                 if target:
                     region_name = region_counts.group("region").lower()
@@ -579,20 +602,21 @@ class G1GCParser:
                     if region_size_kb:
                         self._apply_region_counts(target, region_size_kb)
 
-            # Check for G1-specific events
+            # Check for G1-specific events (substring guards)
             if current_event or (events and len(events) > 0):
                 target = current_event if current_event else events[-1]
 
-                if self.UNIFIED_TO_SPACE_EXHAUSTED.search(
-                    line
-                ) or self.LEGACY_TO_SPACE_EXHAUSTED.search(line):
+                if ("exhausted" in line or "overflow" in line) and (
+                    self.UNIFIED_TO_SPACE_EXHAUSTED.search(line)
+                    or self.LEGACY_TO_SPACE_EXHAUSTED.search(line)
+                ):
                     target["to_space_exhausted"] = True
                     target["evacuation_failed"] = True
 
-                if self.UNIFIED_HUMONGOUS.search(line):
+                if "Humongous" in line and self.UNIFIED_HUMONGOUS.search(line):
                     target["humongous_detected"] = True
 
-                if match := self.UNIFIED_METASPACE.search(line):
+                if "Metaspace:" in line and (match := self.UNIFIED_METASPACE.search(line)):
                     target["metaspace_before"] = int(match.group("before"))
                     target["metaspace_after"] = int(match.group("after"))
                     target["metaspace_total"] = int(match.group("total"))
@@ -769,29 +793,33 @@ class CMSGCParser:
         events: list[dict[str, Any]] = []
 
         for line in log_lines:
-            # Try ParNew (Young GC)
-            match = self.PARNEW_PATTERN.search(line)
-            if match:
-                events.append(self._extract_parnew_event(match))
-                continue
+            # Try ParNew (Young GC) - substring guard: "ParNew"
+            if "ParNew" in line:
+                match = self.PARNEW_PATTERN.search(line)
+                if match:
+                    events.append(self._extract_parnew_event(match))
+                    continue
 
-            # Try Initial Mark
-            match = self.INITIAL_MARK_PATTERN.search(line)
-            if match:
-                events.append(self._extract_initial_mark_event(match))
-                continue
+            # Try Initial Mark - substring guard: "CMS Initial Mark"
+            if "CMS Initial Mark" in line:
+                match = self.INITIAL_MARK_PATTERN.search(line)
+                if match:
+                    events.append(self._extract_initial_mark_event(match))
+                    continue
 
-            # Try Remark
-            match = self.REMARK_PATTERN.search(line)
-            if match:
-                events.append(self._extract_remark_event(match))
-                continue
+            # Try Remark - substring guard: "CMS Final Remark"
+            if "CMS Final Remark" in line:
+                match = self.REMARK_PATTERN.search(line)
+                if match:
+                    events.append(self._extract_remark_event(match))
+                    continue
 
-            # Try Full GC
-            match = self.FULL_GC_PATTERN.search(line)
-            if match:
-                events.append(self._extract_full_gc_event(match))
-                continue
+            # Try Full GC - substring guard: "Full GC"
+            if "Full GC" in line:
+                match = self.FULL_GC_PATTERN.search(line)
+                if match:
+                    events.append(self._extract_full_gc_event(match))
+                    continue
 
             # Concurrent phases are non-STW, skip for now
             # (they don't contribute to pause time analysis)
@@ -3190,6 +3218,22 @@ def analyze(
             help="Enable verbose output with detailed parsing information",
         ),
     ] = False,
+    profile: Annotated[
+        bool,
+        typer.Option(
+            "--profile",
+            help="Enable performance profiling and display timing statistics",
+        ),
+    ] = False,
+    profile_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--profile-output",
+            help="Save detailed profiling data to file (e.g., profile.prof)",
+            file_okay=True,
+            dir_okay=False,
+        ),
+    ] = None,
 ) -> None:
     """Analyze JVM GC log files and generate comprehensive diagnostic reports.
 
@@ -3229,7 +3273,17 @@ def analyze(
 
       # Verbose mode for debugging
       [dim]$[/dim] gc-analyze analyze gc.log --verbose
+
+      # Profile performance
+      [dim]$[/dim] gc-analyze analyze gc.log --profile
+      [dim]$[/dim] gc-analyze analyze gc.log --profile --profile-output profile.prof
     """
+    # Initialize profiler if requested
+    profiler = None
+    if profile:
+        profiler = cProfile.Profile()
+        profiler.enable()
+
     try:
         # Read log file
         with log_file.open() as f:
@@ -3301,6 +3355,28 @@ def analyze(
                 unparsed_full_gc_headers=unparsed_full_gc_headers,
             )
             console.print(f"\n[success]✓ Summary exported to {export}[/success]")
+
+        # Finalize profiler and display stats
+        if profiler:
+            profiler.disable()
+
+            # Save to file if requested
+            if profile_output:
+                profiler.dump_stats(str(profile_output))
+                console.print(f"\n[info]Profiling data saved to {profile_output}[/info]")
+
+            # Display top 20 functions by cumulative time
+            console.print(
+                "\n[bold cyan]═══ Performance Profile (Top 20 Functions) ═══[/bold cyan]\n"
+            )
+            # Capture stats output
+            output = StringIO()
+            stats = pstats.Stats(profiler, stream=output)
+            stats.strip_dirs()
+            stats.sort_stats("cumulative")
+            stats.print_stats(20)
+
+            console.print(output.getvalue())
 
         # Exit with appropriate code
         if summary.leak_severity.severity_level in ["High", "Critical"]:
