@@ -25,17 +25,11 @@ Given a GC log file, the tool:
 uv run gc-analyze analyze path/to/gc.log
 ```
 
-## Setup
+## Installation
 
-### Requirements
+### Prerequisites
 
-- Python **3.11+**
-
-The project dependencies are defined in `pyproject.toml`:
-
-- `pydantic` (event validation/modeling)
-- `typer` (CLI)
-- `rich` (terminal UI)
+- Python 3.11 or later
 
 ### Install uv
 
@@ -49,9 +43,14 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 irm https://astral.sh/uv/install.ps1 | iex
 ```
 
-### Install dependencies
+### Setup
 
 ```bash
+# Clone the repository
+git clone <repository-url>
+cd gc-analyze
+
+# Install dependencies
 uv sync
 ```
 
