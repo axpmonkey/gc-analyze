@@ -1,6 +1,6 @@
 # gc-analyze
 
-`gc-analyze.py` is a command-line utility that parses JVM garbage-collection (GC) logs and produces an operations-oriented summary: GC rate, pause distributions (P50/P95/P99), heap/old-gen pressure signals, and a memory-leak risk score with actionable recommendations.
+`gc-analyze` is a command-line utility that parses JVM garbage-collection (GC) logs and produces an operations-oriented summary: GC rate, pause distributions (P50/P95/P99), heap/old-gen pressure signals, and a memory-leak risk score with actionable recommendations.
 
 ## What it does
 
@@ -22,11 +22,7 @@ Given a GC log file, the tool:
 ## Quick start
 
 ```bash
-# uv
-uv run python gc-analyze.py analyze path/to/gc.log
-
-# standard Python (after you set up a venv + dependencies; see below)
-python gc-analyze.py analyze path/to/gc.log
+uv run gc-analyze analyze path/to/gc.log
 ```
 
 ## Setup
@@ -41,9 +37,7 @@ The project dependencies are defined in `pyproject.toml`:
 - `typer` (CLI)
 - `rich` (terminal UI)
 
-### Option A: uv (recommended)
-
-Install `uv` (see the official installer docs if these commands change):
+### Install uv
 
 ```bash
 # macOS / Linux
@@ -55,50 +49,17 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 irm https://astral.sh/uv/install.ps1 | iex
 ```
 
-Create an environment and install dependencies:
+### Install dependencies
 
 ```bash
-uv python install 3.11
-uv venv --python 3.11
-uv sync --frozen
+uv sync
 ```
 
-Run the analyzer:
+### Run the analyzer
 
 ```bash
-uv run python gc-analyze.py analyze path/to/gc.log
-uv run python gc-analyze.py analyze path/to/gc.log --output report.md
-```
-
-### Option B: Standard Python (venv + pip)
-
-Create and activate a virtual environment:
-
-```bash
-# macOS / Linux
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-```
-
-```powershell
-# Windows (PowerShell)
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-```
-
-Install dependencies from the project metadata:
-
-```bash
-python -m pip install -e .
-```
-
-Run the analyzer:
-
-```bash
-python gc-analyze.py analyze path\\to\\gc.log
-python gc-analyze.py analyze path\\to\\gc.log --output report.md
+uv run gc-analyze analyze path/to/gc.log
+uv run gc-analyze analyze path/to/gc.log --output report.md
 ```
 
 ## Usage
@@ -106,7 +67,7 @@ python gc-analyze.py analyze path\\to\\gc.log --output report.md
 ### Analyze a log
 
 ```bash
-python gc-analyze.py analyze [OPTIONS] LOG_FILE
+uv run gc-analyze analyze [OPTIONS] LOG_FILE
 ```
 
 Options:
