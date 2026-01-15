@@ -67,7 +67,7 @@ Run the analyzer:
 
 ```bash
 uv run python gc-analyze.py analyze path/to/gc.log
-uv run python gc-analyze.py analyze path/to/gc.log --export report.md
+uv run python gc-analyze.py analyze path/to/gc.log --output report.md
 ```
 
 ### Option B: Standard Python (venv + pip)
@@ -98,7 +98,7 @@ Run the analyzer:
 
 ```bash
 python gc-analyze.py analyze path\\to\\gc.log
-python gc-analyze.py analyze path\\to\\gc.log --export report.md
+python gc-analyze.py analyze path\\to\\gc.log --output report.md
 ```
 
 ## Usage
@@ -111,7 +111,7 @@ python gc-analyze.py analyze [OPTIONS] LOG_FILE
 
 Options:
 
-- `--export`, `-e`: write a Markdown report to the given path
+- `--output`, `-o`: write a Markdown report to the given path
 - `--heap-warning`: peak heap % threshold for warnings (default `80.0`)
 - `--heap-critical`: peak heap % threshold for critical warnings (default `95.0`)
 - `--verbose`, `-v`: print parsing details and exception tracebacks
@@ -247,9 +247,9 @@ A short, metric-linked recommendation list (e.g., reduce allocation hotspots, ca
 
 Warnings are emitted when thresholds are exceeded (for example: peak heap beyond `--heap-warning`/`--heap-critical`, high Full GC rate, high overhead, high P99 pause, consecutive Full GCs). The final “Overall Status” panel summarizes severity across all warnings.
 
-## Markdown export (`--export`)
+## Markdown export (`--output`)
 
-When you pass `--export report.md`, the tool writes a Markdown report containing:
+When you pass `--output report.md`, the tool writes a Markdown report containing:
 
 - GC type and generation time
 - Runtime overview and leak assessment (including indicators)

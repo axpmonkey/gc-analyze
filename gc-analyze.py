@@ -3182,11 +3182,11 @@ def analyze(
             readable=True,
         ),
     ],
-    export: Annotated[
+    output: Annotated[
         Path | None,
         typer.Option(
-            "--export",
-            "-e",
+            "--output",
+            "-o",
             help="Export analysis report to Markdown file (e.g., report.md)",
             file_okay=True,
             dir_okay=False,
@@ -3235,48 +3235,9 @@ def analyze(
         ),
     ] = None,
 ) -> None:
-    """Analyze JVM GC log files and generate comprehensive diagnostic reports.
+    """Analyze a JVM GC log file (Parallel, G1, or CMS).
 
-    [bold cyan]Supported GC Types:[/bold cyan]
-
-    • [green]Parallel GC[/green] (PSYoungGen/ParOldGen)
-    • [green]G1 GC[/green] (unified logging Java 9+ and legacy Java 8 format)
-    • [green]CMS GC[/green] (Concurrent Mark Sweep with ParNew)
-
-    [bold cyan]Analysis Features:[/bold cyan]
-
-    • Memory leak detection with severity scoring (0-100)
-    • Pause time analysis (P50, P95, P99 percentiles)
-    • GC frequency and overhead metrics
-    • Heap and old generation utilization tracking
-    • Metaspace analysis
-    • G1-specific metrics (mixed GC, humongous allocations, evacuation failures)
-    • CMS-specific metrics (concurrent cycles, concurrent mode failures)
-    • Operations-grade recommendations
-
-    [bold cyan]Exit Codes:[/bold cyan]
-
-    • [green]0[/green] - Analysis successful, no issues detected
-    • [yellow]1[/yellow] - Analysis successful, warnings detected
-    • [red]2[/red] - Analysis successful, critical issues detected (High/Critical leak severity)
-
-    [bold cyan]Examples:[/bold cyan]
-
-      # Analyze a GC log file
-      [dim]$[/dim] gc-analyze analyze gc.log
-
-      # Analyze and export to Markdown
-      [dim]$[/dim] gc-analyze analyze gc.log --export report.md
-
-      # Analyze with custom thresholds
-      [dim]$[/dim] gc-analyze analyze gc.log --heap-warning 70 --heap-critical 90
-
-      # Verbose mode for debugging
-      [dim]$[/dim] gc-analyze analyze gc.log --verbose
-
-      # Profile performance
-      [dim]$[/dim] gc-analyze analyze gc.log --profile
-      [dim]$[/dim] gc-analyze analyze gc.log --profile --profile-output profile.prof
+    Exit codes: 0 = clean, 1 = warnings, 2 = critical issues.
     """
     # Initialize profiler if requested
     profiler = None
@@ -3344,17 +3305,17 @@ def analyze(
         )
 
         # Export if requested
-        if export:
+        if output:
             export_markdown_summary(
                 summary,
                 parser.gc_type_name,
-                export,
+                output,
                 events=events,
                 total_log_lines=len(lines),
                 raw_event_count=len(raw_events),
                 unparsed_full_gc_headers=unparsed_full_gc_headers,
             )
-            console.print(f"\n[success]✓ Summary exported to {export}[/success]")
+            console.print(f"\n[success]✓ Summary exported to {output}[/success]")
 
         # Finalize profiler and display stats
         if profiler:
@@ -3397,20 +3358,8 @@ def analyze(
 
 @app.command()
 def version() -> None:
-    """Display version and feature information."""
-    console.print("\n[bold cyan]gc-analyze[/bold cyan] [bold]v3.0.0[/bold]")
-    console.print("\n[bold]Supported GC Types:[/bold]")
-    console.print("  • Parallel GC (PSYoungGen/ParOldGen)")
-    console.print("  • G1 GC (unified logging Java 9+ and legacy Java 8)")
-    console.print("  • CMS GC (Concurrent Mark Sweep with ParNew)")
-    console.print("\n[bold]Features:[/bold]")
-    console.print("  • Memory leak detection with severity scoring (0-100)")
-    console.print("  • Pause time percentile analysis (P50/P95/P99)")
-    console.print("  • GC frequency and overhead metrics")
-    console.print("  • G1 & CMS specific metrics")
-    console.print("  • Markdown report export")
-    console.print("  • Rich terminal output with color-coded warnings")
-    console.print("\n[dim]Built with Python 3.11+, Pydantic v2, Typer, and Rich[/dim]\n")
+    """Display version."""
+    console.print("gc-analyze 3.0.0")
 
 
 if __name__ == "__main__":
