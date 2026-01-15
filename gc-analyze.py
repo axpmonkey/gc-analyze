@@ -16,13 +16,14 @@ Modern, type-safe GC log analyzer supporting:
 from __future__ import annotations
 
 import cProfile
+import heapq
 import pstats
 import re
 import sys
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
-from statistics import mean, median
+from statistics import mean
 from typing import Annotated, Any, Literal, Protocol, TypeAlias
 
 import typer
@@ -499,6 +500,7 @@ class G1GCParser:
         r"GC\((?P<gc_id>\d+)\)\s+(?P<region>Eden|Survivor|Old|Humongous) regions:\s+"
         r"(?P<before>\d+)->(?P<after>\d+)(?:\((?P<total>\d+)\))?"
     )
+    UNIFIED_GC_ID: re.Pattern[str] = re.compile(r"GC\((?P<gc_id>\d+)\)")
 
     # Legacy format patterns (Java 8)
     LEGACY_PAUSE_PATTERN: re.Pattern[str] = re.compile(
@@ -603,25 +605,41 @@ class G1GCParser:
                         self._apply_region_counts(target, region_size_kb)
 
             # Check for G1-specific events (substring guards)
-            if current_event or (events and len(events) > 0):
-                target = current_event if current_event else events[-1]
+            if current_event or events:
+                target = self._resolve_unified_target(line, current_event, events_by_id, events)
+                if target:
+                    if ("exhausted" in line or "overflow" in line) and (
+                        self.UNIFIED_TO_SPACE_EXHAUSTED.search(line)
+                        or self.LEGACY_TO_SPACE_EXHAUSTED.search(line)
+                    ):
+                        target["to_space_exhausted"] = True
+                        target["evacuation_failed"] = True
 
-                if ("exhausted" in line or "overflow" in line) and (
-                    self.UNIFIED_TO_SPACE_EXHAUSTED.search(line)
-                    or self.LEGACY_TO_SPACE_EXHAUSTED.search(line)
-                ):
-                    target["to_space_exhausted"] = True
-                    target["evacuation_failed"] = True
+                    if "Humongous" in line and self.UNIFIED_HUMONGOUS.search(line):
+                        target["humongous_detected"] = True
 
-                if "Humongous" in line and self.UNIFIED_HUMONGOUS.search(line):
-                    target["humongous_detected"] = True
-
-                if "Metaspace:" in line and (match := self.UNIFIED_METASPACE.search(line)):
-                    target["metaspace_before"] = int(match.group("before"))
-                    target["metaspace_after"] = int(match.group("after"))
-                    target["metaspace_total"] = int(match.group("total"))
+                    if "Metaspace:" in line and (match := self.UNIFIED_METASPACE.search(line)):
+                        target["metaspace_before"] = int(match.group("before"))
+                        target["metaspace_after"] = int(match.group("after"))
+                        target["metaspace_total"] = int(match.group("total"))
 
         return events
+
+    def _resolve_unified_target(
+        self,
+        line: str,
+        current_event: dict[str, Any] | None,
+        events_by_id: dict[int, dict[str, Any]],
+        events: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Resolve the correct event for unified log lines using GC id when present."""
+        if match := self.UNIFIED_GC_ID.search(line):
+            gc_id = int(match.group("gc_id"))
+            if gc_id in events_by_id:
+                return events_by_id[gc_id]
+        if current_event is not None:
+            return current_event
+        return events[-1] if events else None
 
     def _extract_unified_pause(self, match: re.Match[str], line: str) -> dict[str, Any]:
         """Extract pause from unified logging format."""
@@ -1055,17 +1073,18 @@ def parse_size_to_kb(size_text: str) -> int:
     raise ValueError(f"Unsupported size unit: {unit}")
 
 
-def percentile(data: list[float], pct: float) -> float:
-    """Calculate percentile of a sorted list."""
-    if not data:
+def percentile_sorted(sorted_data: list[float], pct: float) -> float:
+    """Calculate percentile from a pre-sorted list."""
+    if not sorted_data:
         return 0.0
-    data_sorted = sorted(data)
-    k = (len(data_sorted) - 1) * (pct / 100)
+    k = (len(sorted_data) - 1) * (pct / 100)
     f = int(k)
     c = k - f
-    if f + 1 < len(data_sorted):
-        return data_sorted[f] + c * (data_sorted[f + 1] - data_sorted[f])
-    return data_sorted[f]
+    if f + 1 < len(sorted_data):
+        return sorted_data[f] + c * (sorted_data[f + 1] - sorted_data[f])
+    return sorted_data[f]
+
+
 
 
 # ============================================================
@@ -1459,6 +1478,12 @@ def build_comprehensive_summary(
     pauses_remark = [e.pause_time_seconds for e in events if e.gc_kind == "Remark"]
     pauses_cleanup = [e.pause_time_seconds for e in events if e.gc_kind == "Cleanup"]
     pauses_all = [e.pause_time_seconds for e in events if e.pause_time_seconds > 0]
+    pauses_all_sorted = sorted(pauses_all)
+    pauses_young_sorted = sorted(pauses_young)
+    pauses_full_sorted = sorted(pauses_full)
+    pauses_mixed_sorted = sorted(pauses_mixed)
+    pauses_remark_sorted = sorted(pauses_remark)
+    pauses_cleanup_sorted = sorted(pauses_cleanup)
     old = [e.old_used_percentage for e in events if e.old_used_percentage is not None]
     heap = [e.heap_used_percentage for e in events]
 
@@ -1508,24 +1533,24 @@ def build_comprehensive_summary(
     throughput_pct = max(0.0, 100 - gc_overhead_pct)  # Ensure non-negative
 
     # Pause Distribution & Percentiles
-    p50_pause = percentile(pauses_all, 50) if pauses_all else 0.0
-    p95_pause = percentile(pauses_all, 95) if pauses_all else 0.0
-    p99_pause = percentile(pauses_all, 99) if pauses_all else 0.0
+    p50_pause = percentile_sorted(pauses_all_sorted, 50)
+    p95_pause = percentile_sorted(pauses_all_sorted, 95)
+    p99_pause = percentile_sorted(pauses_all_sorted, 99)
 
-    p95_young = percentile(pauses_young, 95) if pauses_young else 0.0
-    p99_young = percentile(pauses_young, 99) if pauses_young else 0.0
+    p95_young = percentile_sorted(pauses_young_sorted, 95)
+    p99_young = percentile_sorted(pauses_young_sorted, 99)
 
-    p95_full = percentile(pauses_full, 95) if pauses_full else 0.0
-    p99_full = percentile(pauses_full, 99) if pauses_full else 0.0
+    p95_full = percentile_sorted(pauses_full_sorted, 95)
+    p99_full = percentile_sorted(pauses_full_sorted, 99)
 
-    p95_mixed = percentile(pauses_mixed, 95) if pauses_mixed else 0.0
-    p99_mixed = percentile(pauses_mixed, 99) if pauses_mixed else 0.0
+    p95_mixed = percentile_sorted(pauses_mixed_sorted, 95)
+    p99_mixed = percentile_sorted(pauses_mixed_sorted, 99)
 
-    p95_remark = percentile(pauses_remark, 95) if pauses_remark else 0.0
-    p99_remark = percentile(pauses_remark, 99) if pauses_remark else 0.0
+    p95_remark = percentile_sorted(pauses_remark_sorted, 95)
+    p99_remark = percentile_sorted(pauses_remark_sorted, 99)
 
-    p95_cleanup = percentile(pauses_cleanup, 95) if pauses_cleanup else 0.0
-    p99_cleanup = percentile(pauses_cleanup, 99) if pauses_cleanup else 0.0
+    p95_cleanup = percentile_sorted(pauses_cleanup_sorted, 95)
+    p99_cleanup = percentile_sorted(pauses_cleanup_sorted, 99)
 
     # Pause threshold violations
     pauses_over_1s = sum(1 for p in pauses_all if p > 1.0)
@@ -1760,27 +1785,27 @@ def build_comprehensive_summary(
         throughput_pct=throughput_pct,
         avg_young_pause=mean(pauses_young) if pauses_young else 0.0,
         max_young_pause=max(pauses_young) if pauses_young else 0.0,
-        median_young_pause=median(pauses_young) if pauses_young else 0.0,
+        median_young_pause=percentile_sorted(pauses_young_sorted, 50),
         p95_young_pause=p95_young,
         p99_young_pause=p99_young,
         avg_full_pause=mean(pauses_full) if pauses_full else 0.0,
         max_full_pause=max(pauses_full) if pauses_full else 0.0,
-        median_full_pause=median(pauses_full) if pauses_full else 0.0,
+        median_full_pause=percentile_sorted(pauses_full_sorted, 50),
         p95_full_pause=p95_full,
         p99_full_pause=p99_full,
         avg_mixed_pause=mean(pauses_mixed) if pauses_mixed else 0.0,
         max_mixed_pause=max(pauses_mixed) if pauses_mixed else 0.0,
-        median_mixed_pause=median(pauses_mixed) if pauses_mixed else 0.0,
+        median_mixed_pause=percentile_sorted(pauses_mixed_sorted, 50),
         p95_mixed_pause=p95_mixed,
         p99_mixed_pause=p99_mixed,
         avg_remark_pause=mean(pauses_remark) if pauses_remark else 0.0,
         max_remark_pause=max(pauses_remark) if pauses_remark else 0.0,
-        median_remark_pause=median(pauses_remark) if pauses_remark else 0.0,
+        median_remark_pause=percentile_sorted(pauses_remark_sorted, 50),
         p95_remark_pause=p95_remark,
         p99_remark_pause=p99_remark,
         avg_cleanup_pause=mean(pauses_cleanup) if pauses_cleanup else 0.0,
         max_cleanup_pause=max(pauses_cleanup) if pauses_cleanup else 0.0,
-        median_cleanup_pause=median(pauses_cleanup) if pauses_cleanup else 0.0,
+        median_cleanup_pause=percentile_sorted(pauses_cleanup_sorted, 50),
         p95_cleanup_pause=p95_cleanup,
         p99_cleanup_pause=p99_cleanup,
         p50_pause=p50_pause,
@@ -1851,6 +1876,16 @@ GC_ANALYZE_THEME = Theme(
 console = Console(theme=GC_ANALYZE_THEME)
 
 
+def create_key_value_table(title: str, rows: list[tuple[str, str]]) -> Table:
+    """Create a simple two-column key/value table."""
+    table = Table(title=title, show_header=False, box=None, padding=(0, 2))
+    table.add_column("Metric", style="label")
+    table.add_column("Value", style="metric")
+    for label, value in rows:
+        table.add_row(label, value)
+    return table
+
+
 def render_warning_banner(warnings: list[str]) -> Panel:
     """Render critical warnings in a prominent banner."""
     if not warnings:
@@ -1891,42 +1926,15 @@ def create_at_a_glance_panel(summary: GCSummary) -> Panel:
     table.add_column("Metric", style="label")
     table.add_column("Value", style="metric")
 
-    table.add_row("Runtime", f"{summary.runtime_hours:.2f} hrs")
-    table.add_row("GC Events", f"{summary.total_event_count}")
-    table.add_row("GC Overhead (pause time)", f"{summary.gc_overhead_pct:.2f}%")
-    table.add_row("P99 STW Pause", f"{summary.p99_pause:.3f}s")
-    table.add_row("Peak Heap", f"{summary.peak_heap_pct:.1f}%")
-    table.add_row("Full GCs/hr", f"{summary.full_gc_per_hour:.2f}")
-    table.add_row("Leak Level", f"{summary.leak_severity.severity_level}")
+    for label, value in build_at_a_glance_rows(summary):
+        table.add_row(label, value)
 
     return Panel(table, title="At-a-Glance", border_style="info")
 
 
 def create_runtime_overview_table(summary: GCSummary) -> Table:
     """Create runtime overview table."""
-    table = Table(title="JVM Runtime Overview", show_header=False, box=None, padding=(0, 2))
-
-    table.add_column("Metric", style="label")
-    table.add_column("Value", style="metric")
-
-    table.add_row(
-        "Observed runtime window",
-        f"{summary.runtime_hours:.2f} hours ({summary.runtime_seconds:.0f} seconds)",
-    )
-    table.add_row("Total GC events", f"{summary.total_event_count}")
-    table.add_row("Young GC events", f"{summary.young_gc_count}")
-    table.add_row("Full GC events", f"{summary.full_gc_count}")
-
-    if summary.mixed_gc_count > 0:
-        table.add_row("Mixed GC events", f"{summary.mixed_gc_count}")
-
-    if summary.remark_gc_count > 0:
-        table.add_row("Remark events (G1)", f"{summary.remark_gc_count}")
-
-    if summary.cleanup_gc_count > 0:
-        table.add_row("Cleanup events (G1)", f"{summary.cleanup_gc_count}")
-
-    return table
+    return create_key_value_table("JVM Runtime Overview", build_runtime_overview_rows(summary))
 
 
 def create_parsing_coverage_table(
@@ -1936,23 +1944,15 @@ def create_parsing_coverage_table(
     unparsed_full_gc_headers: int | None = None,
 ) -> Table:
     """Create parsing coverage table to make data quality explicit."""
-    table = Table(title="Parsing Coverage", show_header=False, box=None, padding=(0, 2))
-    table.add_column("Metric", style="label")
-    table.add_column("Value", style="metric")
-
-    table.add_row("Total log lines", str(total_log_lines))
-    table.add_row("Parsed events (raw)", str(raw_event_count))
-    table.add_row("Usable events", str(usable_event_count))
-    table.add_row("Dropped events", str(max(0, raw_event_count - usable_event_count)))
-
-    if raw_event_count > 0:
-        usable_pct = usable_event_count / raw_event_count * 100.0
-        table.add_row("Usable rate", f"{usable_pct:.1f}%")
-
-    if unparsed_full_gc_headers is not None and unparsed_full_gc_headers > 0:
-        table.add_row("Unparsed Full GC headers", str(unparsed_full_gc_headers))
-
-    return table
+    return create_key_value_table(
+        "Parsing Coverage",
+        build_parsing_coverage_rows(
+            total_log_lines=total_log_lines,
+            raw_event_count=raw_event_count,
+            usable_event_count=usable_event_count,
+            unparsed_full_gc_headers=unparsed_full_gc_headers,
+        ),
+    )
 
 
 def create_time_window_table(
@@ -1962,15 +1962,15 @@ def create_time_window_table(
     last_uptime_seconds: float,
 ) -> Table:
     """Create explicit time window table for correlation with incidents/deployments."""
-    table = Table(title="Time Window", show_header=False, box=None, padding=(0, 2))
-    table.add_column("Metric", style="label")
-    table.add_column("Value", style="metric")
-
-    table.add_row("First event timestamp", first_timestamp.isoformat())
-    table.add_row("Last event timestamp", last_timestamp.isoformat())
-    table.add_row("First event uptime", f"{first_uptime_seconds:.3f}s")
-    table.add_row("Last event uptime", f"{last_uptime_seconds:.3f}s")
-    return table
+    return create_key_value_table(
+        "Time Window",
+        build_time_window_rows(
+            first_timestamp=first_timestamp,
+            last_timestamp=last_timestamp,
+            first_uptime_seconds=first_uptime_seconds,
+            last_uptime_seconds=last_uptime_seconds,
+        ),
+    )
 
 
 def create_pause_distribution_table(summary: GCSummary) -> Table:
@@ -1985,95 +1985,31 @@ def create_pause_distribution_table(summary: GCSummary) -> Table:
     table.add_column("P99", justify="right", style="metric")
     table.add_column("Maximum", justify="right", style="metric")
 
-    def format_seconds(s: float) -> str:
-        if s > 60:
-            return f"{s:.1f}s ({s / 60:.1f}m)"
-        return f"{s:.3f}s"
-
-    # Calculate total count for Overall row
-    total_count = (
-        summary.young_gc_count
-        + summary.full_gc_count
-        + summary.mixed_gc_count
-        + summary.remark_gc_count
-        + summary.cleanup_gc_count
-    )
-
-    # Add "Overall (All Types)" row first for context
-    table.add_row(
-        "Overall (All Types)",
-        str(total_count),
-        "—",  # Average of mixed types is misleading
-        format_seconds(summary.p50_pause),
-        format_seconds(summary.p95_pause),
-        format_seconds(summary.p99_pause),
-        "—",  # Max of mixed types is misleading
-        style="bold",
-    )
-
-    # Add separator row
-    table.add_row("", "", "", "", "", "", "")
-
-    # Young GC row (always show if any events exist)
-    if summary.young_gc_count > 0:
+    rows = build_pause_distribution_rows(summary)
+    if rows:
+        overall = rows[0]
         table.add_row(
-            "Young GC",
-            str(summary.young_gc_count),
-            format_seconds(summary.avg_young_pause),
-            format_seconds(summary.median_young_pause),
-            format_seconds(summary.p95_young_pause),
-            format_seconds(summary.p99_young_pause),
-            format_seconds(summary.max_young_pause),
+            overall["type"],
+            overall["count"],
+            overall["avg"],
+            overall["median"],
+            overall["p95"],
+            overall["p99"],
+            overall["max"],
+            style=overall.get("style") or None,
         )
-
-    # Full GC row (always show if any events exist)
-    if summary.full_gc_count > 0:
-        table.add_row(
-            "Full GC",
-            str(summary.full_gc_count),
-            format_seconds(summary.avg_full_pause),
-            format_seconds(summary.median_full_pause),
-            format_seconds(summary.p95_full_pause),
-            format_seconds(summary.p99_full_pause),
-            format_seconds(summary.max_full_pause),
-            style="critical" if summary.max_full_pause > 30 else None,
-        )
-
-    # Mixed GC row (G1 only, show if any events exist)
-    if summary.mixed_gc_count > 0:
-        table.add_row(
-            "Mixed GC (G1)",
-            str(summary.mixed_gc_count),
-            format_seconds(summary.avg_mixed_pause),
-            format_seconds(summary.median_mixed_pause),
-            format_seconds(summary.p95_mixed_pause),
-            format_seconds(summary.p99_mixed_pause),
-            format_seconds(summary.max_mixed_pause),
-        )
-
-    # Remark row (G1 concurrent marking, show if any events exist)
-    if summary.remark_gc_count > 0:
-        table.add_row(
-            "Remark (G1)",
-            str(summary.remark_gc_count),
-            format_seconds(summary.avg_remark_pause),
-            format_seconds(summary.median_remark_pause),
-            format_seconds(summary.p95_remark_pause),
-            format_seconds(summary.p99_remark_pause),
-            format_seconds(summary.max_remark_pause),
-        )
-
-    # Cleanup row (G1 concurrent marking, show if any events exist)
-    if summary.cleanup_gc_count > 0:
-        table.add_row(
-            "Cleanup (G1)",
-            str(summary.cleanup_gc_count),
-            format_seconds(summary.avg_cleanup_pause),
-            format_seconds(summary.median_cleanup_pause),
-            format_seconds(summary.p95_cleanup_pause),
-            format_seconds(summary.p99_cleanup_pause),
-            format_seconds(summary.max_cleanup_pause),
-        )
+        table.add_row("", "", "", "", "", "", "")
+        for row in rows[1:]:
+            table.add_row(
+                row["type"],
+                row["count"],
+                row["avg"],
+                row["median"],
+                row["p95"],
+                row["p99"],
+                row["max"],
+                style=row.get("style") or None,
+            )
 
     return table
 
@@ -2208,6 +2144,472 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
     return recommendations
 
 
+def format_seconds(seconds: float) -> str:
+    """Format seconds for human-readable output."""
+    if seconds > 60:
+        return f"{seconds:.1f}s ({seconds / 60:.1f}m)"
+    return f"{seconds:.3f}s"
+
+
+def sanitize_text(text: str) -> str:
+    """Strip emoji markers for Markdown output."""
+    return (
+        text.replace("⚠️ ", "")
+        .replace("⚠ ", "")
+        .replace("🔴 ", "")
+        .replace("🟠 ", "")
+        .replace("🟡 ", "")
+        .replace("🟢 ", "")
+        .replace("✖ ", "")
+        .replace("✓ ", "")
+    )
+
+
+def build_parsing_coverage_rows(
+    total_log_lines: int,
+    raw_event_count: int,
+    usable_event_count: int,
+    unparsed_full_gc_headers: int | None = None,
+) -> list[tuple[str, str]]:
+    """Build rows describing parsing coverage."""
+    rows = [
+        ("Total log lines", str(total_log_lines)),
+        ("Parsed events (raw)", str(raw_event_count)),
+        ("Usable events", str(usable_event_count)),
+        ("Dropped events", str(max(0, raw_event_count - usable_event_count))),
+    ]
+    if raw_event_count > 0:
+        usable_pct = usable_event_count / raw_event_count * 100.0
+        rows.append(("Usable rate", f"{usable_pct:.1f}%"))
+    if unparsed_full_gc_headers is not None and unparsed_full_gc_headers > 0:
+        rows.append(("Unparsed Full GC headers", str(unparsed_full_gc_headers)))
+    return rows
+
+
+def build_time_window_rows(
+    first_timestamp: datetime,
+    last_timestamp: datetime,
+    first_uptime_seconds: float,
+    last_uptime_seconds: float,
+) -> list[tuple[str, str]]:
+    """Build rows describing the time window."""
+    return [
+        ("First event timestamp", first_timestamp.isoformat()),
+        ("Last event timestamp", last_timestamp.isoformat()),
+        ("First event uptime", f"{first_uptime_seconds:.3f}s"),
+        ("Last event uptime", f"{last_uptime_seconds:.3f}s"),
+    ]
+
+
+def build_at_a_glance_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build compact high-level summary rows."""
+    return [
+        ("Runtime", f"{summary.runtime_hours:.2f} hrs"),
+        ("GC Events", f"{summary.total_event_count}"),
+        ("GC Overhead (pause time)", f"{summary.gc_overhead_pct:.2f}%"),
+        ("P99 STW Pause", f"{summary.p99_pause:.3f}s"),
+        ("Peak Heap", f"{summary.peak_heap_pct:.1f}%"),
+        ("Full GCs/hr", f"{summary.full_gc_per_hour:.2f}"),
+        ("Leak Level", f"{summary.leak_severity.severity_level}"),
+    ]
+
+
+def build_jvm_config_rows(config: JVMHeapConfig) -> list[tuple[str, str]]:
+    """Build JVM heap and GC configuration rows."""
+    rows: list[tuple[str, str]] = []
+
+    # Heap Sizing
+    if config.initial_heap_size_bytes:
+        rows.append(("Initial Heap Size (-Xms)", config.format_size(config.initial_heap_size_bytes)))
+    if config.max_heap_size_bytes:
+        rows.append(("Maximum Heap Size (-Xmx)", config.format_size(config.max_heap_size_bytes)))
+    if config.new_size_bytes:
+        rows.append(("New Generation Size (-Xmn)", config.format_size(config.new_size_bytes)))
+    if config.max_new_size_bytes:
+        rows.append(("Max New Generation Size", config.format_size(config.max_new_size_bytes)))
+    if config.old_size_bytes:
+        rows.append(("Old Generation Size", config.format_size(config.old_size_bytes)))
+    if config.max_ram_bytes:
+        rows.append(("Max RAM", config.format_size(config.max_ram_bytes)))
+    if config.initial_ram_percentage is not None:
+        rows.append(("Initial RAM %", f"{config.initial_ram_percentage}%"))
+    if config.min_ram_percentage is not None:
+        rows.append(("Min RAM %", f"{config.min_ram_percentage}%"))
+    if config.max_ram_percentage is not None:
+        rows.append(("Max RAM %", f"{config.max_ram_percentage}%"))
+    if config.max_ram_fraction is not None:
+        rows.append(("Max RAM Fraction", str(config.max_ram_fraction)))
+    if config.soft_max_heap_size_bytes:
+        rows.append(("Soft Max Heap Size", config.format_size(config.soft_max_heap_size_bytes)))
+    if config.always_pre_touch is True:
+        rows.append(("Always Pre Touch", "enabled"))
+    if config.thread_stack_size_kb is not None:
+        rows.append(("Thread Stack Size", f"{config.thread_stack_size_kb}K"))
+
+    # Ratios and Thresholds
+    if config.new_ratio is not None:
+        rows.append(("New Ratio (Old/New)", str(config.new_ratio)))
+    if config.survivor_ratio is not None:
+        rows.append(("Survivor Ratio (Eden/Survivor)", str(config.survivor_ratio)))
+    if config.initial_survivor_ratio is not None:
+        rows.append(("Initial Survivor Ratio", str(config.initial_survivor_ratio)))
+    if config.target_survivor_ratio is not None:
+        rows.append(("Target Survivor Ratio", f"{config.target_survivor_ratio}%"))
+    if config.max_tenuring_threshold is not None:
+        rows.append(("Max Tenuring Threshold", str(config.max_tenuring_threshold)))
+    if config.min_heap_free_ratio is not None:
+        rows.append(("Min Heap Free Ratio", f"{config.min_heap_free_ratio}%"))
+    if config.max_heap_free_ratio is not None:
+        rows.append(("Max Heap Free Ratio", f"{config.max_heap_free_ratio}%"))
+
+    # Metaspace
+    if config.metaspace_size_bytes:
+        rows.append(("Metaspace Size", config.format_size(config.metaspace_size_bytes)))
+    if config.max_metaspace_size_bytes:
+        rows.append(("Max Metaspace Size", config.format_size(config.max_metaspace_size_bytes)))
+    if config.max_direct_memory_size_bytes:
+        rows.append(
+            ("Max Direct Memory Size", config.format_size(config.max_direct_memory_size_bytes))
+        )
+
+    # GC Threading
+    if config.parallel_gc_threads is not None:
+        rows.append(("Parallel GC Threads", str(config.parallel_gc_threads)))
+    if config.conc_gc_threads is not None:
+        rows.append(("Concurrent GC Threads", str(config.conc_gc_threads)))
+
+    # GC Behavior Tuning
+    if config.max_gc_pause_millis is not None:
+        rows.append(("Max GC Pause Target", f"{config.max_gc_pause_millis}ms"))
+    if config.gc_time_ratio is not None:
+        rows.append(("GC Time Ratio", str(config.gc_time_ratio)))
+    if config.adaptive_size_policy_weight is not None:
+        rows.append(("Adaptive Size Policy Weight", str(config.adaptive_size_policy_weight)))
+    if config.use_adaptive_size_policy is True:
+        rows.append(("Adaptive Size Policy", "enabled"))
+    if config.use_adaptive_size_policy_footprint_goal is True:
+        rows.append(("Adaptive Size Policy Footprint Goal", "enabled"))
+
+    # G1-Specific
+    if config.g1_heap_region_size_bytes:
+        rows.append(("G1 Heap Region Size", config.format_size(config.g1_heap_region_size_bytes)))
+    if config.initiating_heap_occupancy_percent is not None:
+        rows.append(
+            ("Initiating Heap Occupancy %", f"{config.initiating_heap_occupancy_percent}%")
+        )
+    if config.g1_reserve_percent is not None:
+        rows.append(("G1 Reserve Percent", f"{config.g1_reserve_percent}%"))
+    if config.g1_new_size_percent is not None:
+        rows.append(("G1 New Size Percent", f"{config.g1_new_size_percent}%"))
+    if config.g1_max_new_size_percent is not None:
+        rows.append(("G1 Max New Size Percent", f"{config.g1_max_new_size_percent}%"))
+    if config.g1_mixed_gc_count_target is not None:
+        rows.append(("G1 Mixed GC Count Target", str(config.g1_mixed_gc_count_target)))
+    if config.g1_heap_waste_percent is not None:
+        rows.append(("G1 Heap Waste Percent", f"{config.g1_heap_waste_percent}%"))
+    if config.g1_mixed_gc_live_threshold_percent is not None:
+        rows.append(
+            (
+                "G1 Mixed GC Live Threshold Percent",
+                f"{config.g1_mixed_gc_live_threshold_percent}%",
+            )
+        )
+    if config.g1_rset_updating_pause_time_percent is not None:
+        rows.append(
+            (
+                "G1 RSet Updating Pause Time Percent",
+                f"{config.g1_rset_updating_pause_time_percent}%",
+            )
+        )
+    if config.g1_old_cset_region_threshold_percent is not None:
+        rows.append(
+            (
+                "G1 Old CSet Region Threshold Percent",
+                f"{config.g1_old_cset_region_threshold_percent}%",
+            )
+        )
+
+    # CMS-Specific
+    if config.cms_initiating_occupancy_fraction is not None:
+        rows.append(
+            (
+                "CMS Initiating Occupancy Fraction",
+                f"{config.cms_initiating_occupancy_fraction}%",
+            )
+        )
+    if config.use_cms_initiating_occupancy_only is True:
+        rows.append(("Use CMS Initiating Occupancy Only", "enabled"))
+    if config.cms_full_gcs_before_compaction is not None:
+        rows.append(
+            ("CMS Full GCs Before Compaction", str(config.cms_full_gcs_before_compaction))
+        )
+    if config.cms_wait_duration is not None:
+        rows.append(("CMS Wait Duration", f"{config.cms_wait_duration}ms"))
+
+    return rows
+
+
+def build_runtime_overview_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build runtime overview rows."""
+    rows = [
+        (
+            "Observed runtime window",
+            f"{summary.runtime_hours:.2f} hours ({summary.runtime_seconds:.0f} seconds)",
+        ),
+        ("Total GC events", f"{summary.total_event_count}"),
+        ("Young GC events", f"{summary.young_gc_count}"),
+        ("Full GC events", f"{summary.full_gc_count}"),
+    ]
+    if summary.mixed_gc_count > 0:
+        rows.append(("Mixed GC events", f"{summary.mixed_gc_count}"))
+    if summary.remark_gc_count > 0:
+        rows.append(("Remark events (G1)", f"{summary.remark_gc_count}"))
+    if summary.cleanup_gc_count > 0:
+        rows.append(("Cleanup events (G1)", f"{summary.cleanup_gc_count}"))
+    return rows
+
+
+def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build GC frequency rows."""
+    rows = [
+        ("Young GCs per hour", f"{summary.young_gc_per_hour:.1f}"),
+        ("Full GCs per hour", f"{summary.full_gc_per_hour:.2f}"),
+    ]
+    if summary.avg_full_gc_interval_min:
+        rows.append(("Avg time between Full GCs", f"{summary.avg_full_gc_interval_min:.1f} minutes"))
+    return rows
+
+
+def build_overhead_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build GC overhead rows."""
+    return [
+        ("Total time in GC", f"{summary.total_gc_time_sec:.1f} seconds"),
+        ("GC overhead", f"{summary.gc_overhead_pct:.2f}%"),
+        ("Application throughput", f"{summary.throughput_pct:.2f}%"),
+    ]
+
+
+def build_heap_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build heap utilization rows."""
+    return [
+        ("Peak heap usage", f"{summary.peak_heap_pct:.1f}%"),
+        ("Average heap usage", f"{summary.avg_heap_pct:.1f}%"),
+        ("Heap headroom", f"{summary.heap_headroom:.1f}%"),
+    ]
+
+
+def build_pause_distribution_rows(summary: GCSummary) -> list[dict[str, str]]:
+    """Build pause distribution rows for output rendering."""
+    rows: list[dict[str, str]] = []
+    total_count = (
+        summary.young_gc_count
+        + summary.full_gc_count
+        + summary.mixed_gc_count
+        + summary.remark_gc_count
+        + summary.cleanup_gc_count
+    )
+    rows.append(
+        {
+            "type": "Overall (All Types)",
+            "count": str(total_count),
+            "avg": "—",
+            "median": format_seconds(summary.p50_pause),
+            "p95": format_seconds(summary.p95_pause),
+            "p99": format_seconds(summary.p99_pause),
+            "max": "—",
+            "style": "bold",
+        }
+    )
+    if summary.young_gc_count > 0:
+        rows.append(
+            {
+                "type": "Young GC",
+                "count": str(summary.young_gc_count),
+                "avg": format_seconds(summary.avg_young_pause),
+                "median": format_seconds(summary.median_young_pause),
+                "p95": format_seconds(summary.p95_young_pause),
+                "p99": format_seconds(summary.p99_young_pause),
+                "max": format_seconds(summary.max_young_pause),
+                "style": "",
+            }
+        )
+    if summary.full_gc_count > 0:
+        rows.append(
+            {
+                "type": "Full GC",
+                "count": str(summary.full_gc_count),
+                "avg": format_seconds(summary.avg_full_pause),
+                "median": format_seconds(summary.median_full_pause),
+                "p95": format_seconds(summary.p95_full_pause),
+                "p99": format_seconds(summary.p99_full_pause),
+                "max": format_seconds(summary.max_full_pause),
+                "style": "critical" if summary.max_full_pause > 30 else "",
+            }
+        )
+    if summary.mixed_gc_count > 0:
+        rows.append(
+            {
+                "type": "Mixed GC (G1)",
+                "count": str(summary.mixed_gc_count),
+                "avg": format_seconds(summary.avg_mixed_pause),
+                "median": format_seconds(summary.median_mixed_pause),
+                "p95": format_seconds(summary.p95_mixed_pause),
+                "p99": format_seconds(summary.p99_mixed_pause),
+                "max": format_seconds(summary.max_mixed_pause),
+                "style": "",
+            }
+        )
+    if summary.remark_gc_count > 0:
+        rows.append(
+            {
+                "type": "Remark (G1)",
+                "count": str(summary.remark_gc_count),
+                "avg": format_seconds(summary.avg_remark_pause),
+                "median": format_seconds(summary.median_remark_pause),
+                "p95": format_seconds(summary.p95_remark_pause),
+                "p99": format_seconds(summary.p99_remark_pause),
+                "max": format_seconds(summary.max_remark_pause),
+                "style": "",
+            }
+        )
+    if summary.cleanup_gc_count > 0:
+        rows.append(
+            {
+                "type": "Cleanup (G1)",
+                "count": str(summary.cleanup_gc_count),
+                "avg": format_seconds(summary.avg_cleanup_pause),
+                "median": format_seconds(summary.median_cleanup_pause),
+                "p95": format_seconds(summary.p95_cleanup_pause),
+                "p99": format_seconds(summary.p99_cleanup_pause),
+                "max": format_seconds(summary.max_cleanup_pause),
+                "style": "",
+            }
+        )
+    return rows
+
+
+def build_top_pauses_rows(events: list[GCEvent], top_n: int) -> list[dict[str, str]]:
+    """Build top pause rows."""
+    rows: list[dict[str, str]] = []
+    top_pauses = heapq.nlargest(top_n, events, key=lambda e: e.pause_time_seconds)
+    for event in top_pauses:
+        heap_after_mb = event.heap_after_kb / 1024
+        heap_total_mb = event.heap_total_kb / 1024
+        heap_after_text = (
+            f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({event.heap_used_percentage:.1f}%)"
+        )
+        old_text = (
+            f"{event.old_used_percentage:.1f}%"
+            if event.old_used_percentage is not None
+            else "—"
+        )
+        rows.append(
+            {
+                "timestamp": event.timestamp.isoformat(),
+                "gc_kind": event.gc_kind,
+                "pause": f"{event.pause_time_seconds:.3f}s",
+                "heap_after": heap_after_text,
+                "old_gen": old_text,
+            }
+        )
+    return rows
+
+
+def build_old_gen_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build old generation analysis rows."""
+    rows = [
+        ("Old gen at start", f"{summary.old_start:.1f}%"),
+        ("Old gen at end", f"{summary.old_end:.1f}%"),
+        ("Net old gen growth", f"{summary.old_growth:+.1f} pts"),
+        ("Peak old gen usage", f"{summary.peak_old_pct:.1f}%"),
+    ]
+    if summary.full_gc_count > 0:
+        avg_reclaimed_mb = summary.avg_reclaimed_kb / 1024
+        rows.append(("Avg reclaimed per Full GC", f"{avg_reclaimed_mb:.1f} MB"))
+        rows.append(
+            ("Full GCs reducing old gen", f"{summary.full_gc_reducing}/{summary.full_gc_count}")
+        )
+        if summary.reclamation_declining:
+            rows.append(("⚠ Reclamation declining over time", ""))
+    return rows
+
+
+def build_trend_rows(summary: GCSummary) -> list[tuple[str, str, str]]:
+    """Build trend rows for early/mid/late buckets."""
+    rows: list[tuple[str, str, str]] = []
+    for period_name in ["early", "mid", "late"]:
+        if period_name in summary.period_stats:
+            period = summary.period_stats[period_name]
+            rows.append(
+                (
+                    period_name,
+                    f"{period.average_old_gen_percentage:.1f}%",
+                    str(period.full_gc_count),
+                )
+            )
+    return rows
+
+
+def build_allocation_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build allocation pressure rows."""
+    rows = [("Allocation rate", f"{summary.allocation_rate_mb_sec:.2f} MB/sec")]
+    if summary.avg_promotion_kb:
+        rows.append(("Average promotion", f"{summary.avg_promotion_kb:.0f} KB per Young GC"))
+    return rows
+
+
+def build_g1_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build G1 GC metrics rows."""
+    g1 = summary.g1_metrics
+    if not g1:
+        return []
+    return [
+        ("Mixed GC count", f"{g1.mixed_gc_count}"),
+        ("Mixed GCs per hour", f"{g1.mixed_gc_frequency_per_hour:.2f}"),
+        ("Humongous activity (events)", f"{g1.humongous_allocation_count}"),
+        ("Evacuation failures", f"{g1.evacuation_failure_count}"),
+        ("To-space exhaustion events", f"{g1.to_space_exhausted_count}"),
+    ]
+
+
+def build_cms_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build CMS GC metrics rows."""
+    cms = summary.cms_metrics
+    if not cms:
+        return []
+    rows = [
+        ("CMS cycles per hour", f"{cms.cms_cycle_frequency_per_hour:.2f}"),
+        ("Average concurrent pause", f"{cms.average_concurrent_pause_seconds:.4f}s"),
+        ("Concurrent mode failures", f"{cms.concurrent_mode_failures}"),
+    ]
+    if cms.concurrent_mode_failures > 0:
+        rows.append(("⚠ Failures indicate old gen filled before cycle completed", ""))
+    return rows
+
+
+def build_metaspace_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build metaspace analysis rows."""
+    meta = summary.metaspace_analysis
+    if not meta:
+        return []
+    return [
+        ("Peak metaspace usage", f"{meta.peak_metaspace_used_percentage:.1f}%"),
+        ("Metaspace growth", f"{meta.metaspace_growth_kb // 1024}MB"),
+    ]
+
+
+def determine_overall_status(summary: GCSummary) -> tuple[str, str]:
+    """Determine overall status text and style token."""
+    critical_count = sum(1 for w in summary.warnings if "CRITICAL" in w)
+    warning_count = sum(1 for w in summary.warnings if "WARNING" in w)
+    if critical_count >= 3:
+        return "✖ CRITICAL - IMMEDIATE ACTION REQUIRED", "critical"
+    if critical_count > 0:
+        return "✖ UNSTABLE - INTERVENTION REQUIRED", "critical"
+    if warning_count > 0:
+        return "⚠ DEGRADED - MONITORING REQUIRED", "warning"
+    return "✓ STABLE", "success"
+
 def render_rich_output(
     summary: GCSummary,
     gc_type: str,
@@ -2264,154 +2666,12 @@ def render_rich_output(
 
     # JVM Heap Configuration (if available)
     if summary.jvm_heap_config:
-        config = summary.jvm_heap_config
-        jvm_table = Table(
-            title="JVM Heap & GC Tuning Configuration",
-            show_header=False,
-            box=None,
-            padding=(0, 2),
+        console.print(
+            create_key_value_table(
+                "JVM Heap & GC Tuning Configuration",
+                build_jvm_config_rows(summary.jvm_heap_config),
+            )
         )
-        jvm_table.add_column("Metric", style="label")
-        jvm_table.add_column("Value", style="metric")
-
-        # Heap Sizing
-        if config.initial_heap_size_bytes:
-            jvm_table.add_row(
-                "Initial Heap Size (-Xms)", config.format_size(config.initial_heap_size_bytes)
-            )
-        if config.max_heap_size_bytes:
-            jvm_table.add_row(
-                "Maximum Heap Size (-Xmx)", config.format_size(config.max_heap_size_bytes)
-            )
-        if config.new_size_bytes:
-            jvm_table.add_row(
-                "New Generation Size (-Xmn)", config.format_size(config.new_size_bytes)
-            )
-        if config.max_new_size_bytes:
-            jvm_table.add_row(
-                "Max New Generation Size", config.format_size(config.max_new_size_bytes)
-            )
-        if config.old_size_bytes:
-            jvm_table.add_row("Old Generation Size", config.format_size(config.old_size_bytes))
-        if config.max_ram_bytes:
-            jvm_table.add_row("Max RAM", config.format_size(config.max_ram_bytes))
-        if config.initial_ram_percentage is not None:
-            jvm_table.add_row("Initial RAM %", f"{config.initial_ram_percentage}%")
-        if config.min_ram_percentage is not None:
-            jvm_table.add_row("Min RAM %", f"{config.min_ram_percentage}%")
-        if config.max_ram_percentage is not None:
-            jvm_table.add_row("Max RAM %", f"{config.max_ram_percentage}%")
-        if config.max_ram_fraction is not None:
-            jvm_table.add_row("Max RAM Fraction", str(config.max_ram_fraction))
-        if config.soft_max_heap_size_bytes:
-            jvm_table.add_row(
-                "Soft Max Heap Size", config.format_size(config.soft_max_heap_size_bytes)
-            )
-        if config.always_pre_touch is True:
-            jvm_table.add_row("Always Pre Touch", "enabled")
-        if config.thread_stack_size_kb is not None:
-            jvm_table.add_row("Thread Stack Size", f"{config.thread_stack_size_kb}K")
-
-        # Ratios and Thresholds
-        if config.new_ratio is not None:
-            jvm_table.add_row("New Ratio (Old/New)", str(config.new_ratio))
-        if config.survivor_ratio is not None:
-            jvm_table.add_row("Survivor Ratio (Eden/Survivor)", str(config.survivor_ratio))
-        if config.initial_survivor_ratio is not None:
-            jvm_table.add_row("Initial Survivor Ratio", str(config.initial_survivor_ratio))
-        if config.target_survivor_ratio is not None:
-            jvm_table.add_row("Target Survivor Ratio", f"{config.target_survivor_ratio}%")
-        if config.max_tenuring_threshold is not None:
-            jvm_table.add_row("Max Tenuring Threshold", str(config.max_tenuring_threshold))
-        if config.min_heap_free_ratio is not None:
-            jvm_table.add_row("Min Heap Free Ratio", f"{config.min_heap_free_ratio}%")
-        if config.max_heap_free_ratio is not None:
-            jvm_table.add_row("Max Heap Free Ratio", f"{config.max_heap_free_ratio}%")
-
-        # Metaspace
-        if config.metaspace_size_bytes:
-            jvm_table.add_row("Metaspace Size", config.format_size(config.metaspace_size_bytes))
-        if config.max_metaspace_size_bytes:
-            jvm_table.add_row(
-                "Max Metaspace Size", config.format_size(config.max_metaspace_size_bytes)
-            )
-        if config.max_direct_memory_size_bytes:
-            jvm_table.add_row(
-                "Max Direct Memory Size", config.format_size(config.max_direct_memory_size_bytes)
-            )
-
-        # GC Threading
-        if config.parallel_gc_threads is not None:
-            jvm_table.add_row("Parallel GC Threads", str(config.parallel_gc_threads))
-        if config.conc_gc_threads is not None:
-            jvm_table.add_row("Concurrent GC Threads", str(config.conc_gc_threads))
-
-        # GC Behavior Tuning
-        if config.max_gc_pause_millis is not None:
-            jvm_table.add_row("Max GC Pause Target", f"{config.max_gc_pause_millis}ms")
-        if config.gc_time_ratio is not None:
-            jvm_table.add_row("GC Time Ratio", str(config.gc_time_ratio))
-        if config.adaptive_size_policy_weight is not None:
-            jvm_table.add_row(
-                "Adaptive Size Policy Weight", str(config.adaptive_size_policy_weight)
-            )
-        if config.use_adaptive_size_policy is True:
-            jvm_table.add_row("Adaptive Size Policy", "enabled")
-        if config.use_adaptive_size_policy_footprint_goal is True:
-            jvm_table.add_row("Adaptive Size Policy Footprint Goal", "enabled")
-
-        # G1-Specific
-        if config.g1_heap_region_size_bytes:
-            jvm_table.add_row(
-                "G1 Heap Region Size", config.format_size(config.g1_heap_region_size_bytes)
-            )
-        if config.initiating_heap_occupancy_percent is not None:
-            jvm_table.add_row(
-                "Initiating Heap Occupancy %", f"{config.initiating_heap_occupancy_percent}%"
-            )
-        if config.g1_reserve_percent is not None:
-            jvm_table.add_row("G1 Reserve Percent", f"{config.g1_reserve_percent}%")
-        if config.g1_new_size_percent is not None:
-            jvm_table.add_row("G1 New Size Percent", f"{config.g1_new_size_percent}%")
-        if config.g1_max_new_size_percent is not None:
-            jvm_table.add_row("G1 Max New Size Percent", f"{config.g1_max_new_size_percent}%")
-        if config.g1_mixed_gc_count_target is not None:
-            jvm_table.add_row("G1 Mixed GC Count Target", str(config.g1_mixed_gc_count_target))
-        if config.g1_heap_waste_percent is not None:
-            jvm_table.add_row("G1 Heap Waste Percent", f"{config.g1_heap_waste_percent}%")
-        if config.g1_mixed_gc_live_threshold_percent is not None:
-            jvm_table.add_row(
-                "G1 Mixed GC Live Threshold Percent",
-                f"{config.g1_mixed_gc_live_threshold_percent}%",
-            )
-        if config.g1_rset_updating_pause_time_percent is not None:
-            jvm_table.add_row(
-                "G1 RSet Updating Pause Time Percent",
-                f"{config.g1_rset_updating_pause_time_percent}%",
-            )
-        if config.g1_old_cset_region_threshold_percent is not None:
-            jvm_table.add_row(
-                "G1 Old CSet Region Threshold Percent",
-                f"{config.g1_old_cset_region_threshold_percent}%",
-            )
-
-        # CMS-Specific
-        if config.cms_initiating_occupancy_fraction is not None:
-            jvm_table.add_row(
-                "CMS Initiating Occupancy Fraction",
-                f"{config.cms_initiating_occupancy_fraction}%",
-            )
-        if config.use_cms_initiating_occupancy_only is True:
-            jvm_table.add_row("Use CMS Initiating Occupancy Only", "enabled")
-        if config.cms_full_gcs_before_compaction is not None:
-            jvm_table.add_row(
-                "CMS Full GCs Before Compaction",
-                str(config.cms_full_gcs_before_compaction),
-            )
-        if config.cms_wait_duration is not None:
-            jvm_table.add_row("CMS Wait Duration", f"{config.cms_wait_duration}ms")
-
-        console.print(jvm_table)
         console.print()
 
     # Quick Diagnosis
@@ -2435,38 +2695,15 @@ def render_rich_output(
     console.print()
 
     # GC Frequency
-    freq_table = Table(title="GC Frequency & Rate", show_header=False, box=None, padding=(0, 2))
-    freq_table.add_column("Metric", style="label")
-    freq_table.add_column("Value", style="metric")
-    freq_table.add_row("Young GCs per hour", f"{summary.young_gc_per_hour:.1f}")
-    freq_table.add_row("Full GCs per hour", f"{summary.full_gc_per_hour:.2f}")
-    if summary.avg_full_gc_interval_min:
-        freq_table.add_row(
-            "Avg time between Full GCs", f"{summary.avg_full_gc_interval_min:.1f} minutes"
-        )
-    console.print(freq_table)
+    console.print(create_key_value_table("GC Frequency & Rate", build_frequency_rows(summary)))
     console.print()
 
     # GC Overhead
-    overhead_table = Table(
-        title="GC Overhead & Throughput", show_header=False, box=None, padding=(0, 2)
-    )
-    overhead_table.add_column("Metric", style="label")
-    overhead_table.add_column("Value", style="metric")
-    overhead_table.add_row("Total time in GC", f"{summary.total_gc_time_sec:.1f} seconds")
-    overhead_table.add_row("GC overhead", f"{summary.gc_overhead_pct:.2f}%")
-    overhead_table.add_row("Application throughput", f"{summary.throughput_pct:.2f}%")
-    console.print(overhead_table)
+    console.print(create_key_value_table("GC Overhead & Throughput", build_overhead_rows(summary)))
     console.print()
 
     # Heap Utilization
-    heap_table = Table(title="Heap Utilization", show_header=False, box=None, padding=(0, 2))
-    heap_table.add_column("Metric", style="label")
-    heap_table.add_column("Value", style="metric")
-    heap_table.add_row("Peak heap usage", f"{summary.peak_heap_pct:.1f}%")
-    heap_table.add_row("Average heap usage", f"{summary.avg_heap_pct:.1f}%")
-    heap_table.add_row("Heap headroom", f"{summary.heap_headroom:.1f}%")
-    console.print(heap_table)
+    console.print(create_key_value_table("Heap Utilization", build_heap_rows(summary)))
     console.print()
 
     # Pause Time Analysis
@@ -2476,10 +2713,10 @@ def render_rich_output(
     # Top pauses (fast triage)
     if events:
         top_n = 5
-        top_pauses = sorted(events, key=lambda e: e.pause_time_seconds, reverse=True)[:top_n]
-        if top_pauses:
+        top_rows = build_top_pauses_rows(events, top_n)
+        if top_rows:
             top_table = Table(
-                title=f"Top {min(top_n, len(top_pauses))} Longest Pauses",
+                title=f"Top {min(top_n, len(top_rows))} Longest Pauses",
                 show_header=True,
                 header_style="header",
             )
@@ -2489,21 +2726,13 @@ def render_rich_output(
             top_table.add_column("Heap after", justify="right", style="metric")
             top_table.add_column("Old gen", justify="right", style="metric")
 
-            for e in top_pauses:
-                heap_after_mb = e.heap_after_kb / 1024
-                heap_total_mb = e.heap_total_kb / 1024
-                heap_after_text = (
-                    f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
-                )
-                old_text = (
-                    f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "—"
-                )
+            for row in top_rows:
                 top_table.add_row(
-                    e.timestamp.isoformat(),
-                    e.gc_kind,
-                    f"{e.pause_time_seconds:.3f}s",
-                    heap_after_text,
-                    old_text,
+                    row["timestamp"],
+                    row["gc_kind"],
+                    row["pause"],
+                    row["heap_after"],
+                    row["old_gen"],
                 )
 
             console.print(top_table)
@@ -2518,19 +2747,11 @@ def render_rich_output(
         )
         old_table.add_column("Metric", style="label")
         old_table.add_column("Value", style="metric")
-        old_table.add_row("Old gen at start", f"{summary.old_start:.1f}%")
-        old_table.add_row("Old gen at end", f"{summary.old_end:.1f}%")
-        old_table.add_row("Net old gen growth", f"{summary.old_growth:+.1f} pts")
-        old_table.add_row("Peak old gen usage", f"{summary.peak_old_pct:.1f}%")
-
-        if summary.full_gc_count > 0:
-            avg_reclaimed_mb = summary.avg_reclaimed_kb / 1024
-            old_table.add_row("Avg reclaimed per Full GC", f"{avg_reclaimed_mb:.1f} MB")
-            old_table.add_row(
-                "Full GCs reducing old gen", f"{summary.full_gc_reducing}/{summary.full_gc_count}"
-            )
-            if summary.reclamation_declining:
-                old_table.add_row("  [warning]⚠ Reclamation declining over time[/warning]", "")
+        for label, value in build_old_gen_rows(summary):
+            if label.startswith("⚠"):
+                old_table.add_row(label, value, style="warning")
+            else:
+                old_table.add_row(label, value)
 
         collector_blocks.append(old_table)
 
@@ -2545,55 +2766,28 @@ def render_rich_output(
             trend_table.add_column("Period", style="info")
             trend_table.add_column("Avg old gen %", justify="right", style="metric")
             trend_table.add_column("Full GC count", justify="right", style="metric")
-            for period_name in ["early", "mid", "late"]:
-                if period_name in summary.period_stats:
-                    p = summary.period_stats[period_name]
-                    trend_table.add_row(
-                        period_name,
-                        f"{p.average_old_gen_percentage:.1f}%",
-                        str(p.full_gc_count),
-                    )
+            for period_name, avg_old, full_gc_count in build_trend_rows(summary):
+                trend_table.add_row(period_name, avg_old, full_gc_count)
             collector_blocks.append(trend_table)
 
     if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 0:
-        alloc_table = Table(
-            title="Allocation Pressure", show_header=False, box=None, padding=(0, 2)
+        collector_blocks.append(
+            create_key_value_table("Allocation Pressure", build_allocation_rows(summary))
         )
-        alloc_table.add_column("Metric", style="label")
-        alloc_table.add_column("Value", style="metric")
-        alloc_table.add_row("Allocation rate", f"{summary.allocation_rate_mb_sec:.2f} MB/sec")
-        if summary.avg_promotion_kb:
-            alloc_table.add_row(
-                "Average promotion", f"{summary.avg_promotion_kb:.0f} KB per Young GC"
-            )
-        collector_blocks.append(alloc_table)
 
     if summary.g1_metrics:
-        g1 = summary.g1_metrics
-        g1_table = Table(title="G1 GC Metrics", show_header=False, box=None, padding=(0, 2))
-        g1_table.add_column("Metric", style="label")
-        g1_table.add_column("Value", style="metric")
-        g1_table.add_row("Mixed GC count", f"{g1.mixed_gc_count}")
-        g1_table.add_row("Mixed GCs per hour", f"{g1.mixed_gc_frequency_per_hour:.2f}")
-        g1_table.add_row("Humongous activity (events)", f"{g1.humongous_allocation_count}")
-        g1_table.add_row("Evacuation failures", f"{g1.evacuation_failure_count}")
-        g1_table.add_row("To-space exhaustion events", f"{g1.to_space_exhausted_count}")
-        collector_blocks.append(g1_table)
+        collector_blocks.append(create_key_value_table("G1 GC Metrics", build_g1_rows(summary)))
 
     if summary.cms_metrics:
-        cms = summary.cms_metrics
+        cms_rows = build_cms_rows(summary)
         cms_table = Table(title="CMS GC Metrics", show_header=False, box=None, padding=(0, 2))
         cms_table.add_column("Metric", style="label")
         cms_table.add_column("Value", style="metric")
-        cms_table.add_row("CMS cycles per hour", f"{cms.cms_cycle_frequency_per_hour:.2f}")
-        cms_table.add_row(
-            "Average concurrent pause", f"{cms.average_concurrent_pause_seconds:.4f}s"
-        )
-        cms_table.add_row("Concurrent mode failures", f"{cms.concurrent_mode_failures}")
-        if cms.concurrent_mode_failures > 0:
-            cms_table.add_row(
-                "  [warning]⚠ Failures indicate old gen filled before cycle completed[/warning]", ""
-            )
+        for label, value in cms_rows:
+            if label.startswith("⚠"):
+                cms_table.add_row(label, value, style="warning")
+            else:
+                cms_table.add_row(label, value)
         collector_blocks.append(cms_table)
 
     if collector_blocks:
@@ -2607,13 +2801,7 @@ def render_rich_output(
 
     # Metaspace Analysis
     if summary.metaspace_analysis:
-        meta = summary.metaspace_analysis
-        meta_table = Table(title="Metaspace Analysis", show_header=False, box=None, padding=(0, 2))
-        meta_table.add_column("Metric", style="label")
-        meta_table.add_column("Value", style="metric")
-        meta_table.add_row("Peak metaspace usage", f"{meta.peak_metaspace_used_percentage:.1f}%")
-        meta_table.add_row("Metaspace growth", f"{meta.metaspace_growth_kb // 1024}MB")
-        console.print(meta_table)
+        console.print(create_key_value_table("Metaspace Analysis", build_metaspace_rows(summary)))
         console.print()
 
     # Memory Leak Assessment
@@ -2641,22 +2829,7 @@ def render_rich_output(
             console.print()
 
     # Overall Status
-    critical_count = sum(1 for w in summary.warnings if "CRITICAL" in w)
-    warning_count = sum(1 for w in summary.warnings if "WARNING" in w)
-
-    if critical_count >= 3:
-        status = "✖ CRITICAL - IMMEDIATE ACTION REQUIRED"
-        status_color = "critical"
-    elif critical_count > 0:
-        status = "✖ UNSTABLE - INTERVENTION REQUIRED"
-        status_color = "critical"
-    elif warning_count > 0:
-        status = "⚠ DEGRADED - MONITORING REQUIRED"
-        status_color = "warning"
-    else:
-        status = "✓ STABLE"
-        status_color = "success"
-
+    status, status_color = determine_overall_status(summary)
     console.print(Panel(status, title="Overall Status", border_style=status_color))
 
 
@@ -2682,35 +2855,16 @@ def export_markdown_summary(
     md_content.append(f"**Generated:** {datetime.now().isoformat()}\n\n")
     md_content.append(f"**GC Type:** {gc_type}\n\n")
 
-    def format_seconds(seconds: float) -> str:
-        if seconds > 60:
-            return f"{seconds:.1f}s ({seconds / 60:.1f}m)"
-        return f"{seconds:.3f}s"
-
-    def sanitize_text(text: str) -> str:
-        return (
-            text.replace("⚠️ ", "")
-            .replace("⚠ ", "")
-            .replace("🔴 ", "")
-            .replace("🟠 ", "")
-            .replace("🟡 ", "")
-            .replace("🟢 ", "")
-        )
-
     # Parsing Coverage
     if total_log_lines is not None and raw_event_count is not None:
         md_content.append("## Parsing Coverage\n\n")
-        md_content.append(f"- **Total log lines:** {total_log_lines}\n")
-        md_content.append(f"- **Parsed events (raw):** {raw_event_count}\n")
-        md_content.append(f"- **Usable events:** {summary.total_event_count}\n")
-        md_content.append(
-            f"- **Dropped events:** {max(0, raw_event_count - summary.total_event_count)}\n"
-        )
-        if raw_event_count > 0:
-            usable_pct = summary.total_event_count / raw_event_count * 100.0
-            md_content.append(f"- **Usable rate:** {usable_pct:.1f}%\n")
-        if unparsed_full_gc_headers is not None and unparsed_full_gc_headers > 0:
-            md_content.append(f"- **Unparsed Full GC headers:** {unparsed_full_gc_headers}\n")
+        for label, value in build_parsing_coverage_rows(
+            total_log_lines=total_log_lines,
+            raw_event_count=raw_event_count,
+            usable_event_count=summary.total_event_count,
+            unparsed_full_gc_headers=unparsed_full_gc_headers,
+        ):
+            md_content.append(f"- **{label}:** {value}\n")
         md_content.append("\n")
 
     # Time Window
@@ -2718,10 +2872,14 @@ def export_markdown_summary(
         first_event = min(events, key=lambda e: e.timestamp)
         last_event = max(events, key=lambda e: e.timestamp)
         md_content.append("## Time Window\n\n")
-        md_content.append(f"- **First event timestamp:** {first_event.timestamp.isoformat()}\n")
-        md_content.append(f"- **Last event timestamp:** {last_event.timestamp.isoformat()}\n")
-        md_content.append(f"- **First event uptime:** {first_event.uptime_seconds:.3f}s\n")
-        md_content.append(f"- **Last event uptime:** {last_event.uptime_seconds:.3f}s\n\n")
+        for label, value in build_time_window_rows(
+            first_timestamp=first_event.timestamp,
+            last_timestamp=last_event.timestamp,
+            first_uptime_seconds=first_event.uptime_seconds,
+            last_uptime_seconds=last_event.uptime_seconds,
+        ):
+            md_content.append(f"- **{label}:** {value}\n")
+        md_content.append("\n")
 
     # Data Notes (data quality or coverage limitations)
     if summary.warnings:
@@ -2735,145 +2893,9 @@ def export_markdown_summary(
 
     # JVM Heap Configuration
     if summary.jvm_heap_config:
-        config = summary.jvm_heap_config
         md_content.append("## JVM Heap & GC Tuning Configuration\n\n")
-
-        # Heap Sizing
-        if config.initial_heap_size_bytes:
-            size = config.format_size(config.initial_heap_size_bytes)
-            md_content.append(f"- **Initial Heap Size (-Xms)**: {size}\n")
-        if config.max_heap_size_bytes:
-            size = config.format_size(config.max_heap_size_bytes)
-            md_content.append(f"- **Maximum Heap Size (-Xmx)**: {size}\n")
-        if config.new_size_bytes:
-            md_content.append(
-                f"- **New Generation Size (-Xmn)**: {config.format_size(config.new_size_bytes)}\n"
-            )
-        if config.max_new_size_bytes:
-            md_content.append(
-                f"- **Max New Generation Size**: {config.format_size(config.max_new_size_bytes)}\n"
-            )
-        if config.old_size_bytes:
-            md_content.append(
-                f"- **Old Generation Size**: {config.format_size(config.old_size_bytes)}\n"
-            )
-        if config.max_ram_bytes:
-            md_content.append(f"- **Max RAM**: {config.format_size(config.max_ram_bytes)}\n")
-        if config.initial_ram_percentage is not None:
-            md_content.append(f"- **Initial RAM %**: {config.initial_ram_percentage}%\n")
-        if config.min_ram_percentage is not None:
-            md_content.append(f"- **Min RAM %**: {config.min_ram_percentage}%\n")
-        if config.max_ram_percentage is not None:
-            md_content.append(f"- **Max RAM %**: {config.max_ram_percentage}%\n")
-        if config.max_ram_fraction is not None:
-            md_content.append(f"- **Max RAM Fraction**: {config.max_ram_fraction}\n")
-        if config.soft_max_heap_size_bytes:
-            md_content.append(
-                f"- **Soft Max Heap Size**: {config.format_size(config.soft_max_heap_size_bytes)}\n"
-            )
-        if config.always_pre_touch is True:
-            md_content.append("- **Always Pre Touch**: enabled\n")
-        if config.thread_stack_size_kb is not None:
-            md_content.append(f"- **Thread Stack Size**: {config.thread_stack_size_kb}K\n")
-
-        # Ratios
-        if config.new_ratio is not None:
-            md_content.append(f"- **New Ratio**: {config.new_ratio}\n")
-        if config.survivor_ratio is not None:
-            md_content.append(f"- **Survivor Ratio**: {config.survivor_ratio}\n")
-        if config.initial_survivor_ratio is not None:
-            md_content.append(f"- **Initial Survivor Ratio**: {config.initial_survivor_ratio}\n")
-        if config.target_survivor_ratio is not None:
-            md_content.append(f"- **Target Survivor Ratio**: {config.target_survivor_ratio}%\n")
-        if config.max_tenuring_threshold is not None:
-            md_content.append(f"- **Max Tenuring Threshold**: {config.max_tenuring_threshold}\n")
-        if config.min_heap_free_ratio is not None:
-            md_content.append(f"- **Min Heap Free Ratio**: {config.min_heap_free_ratio}%\n")
-        if config.max_heap_free_ratio is not None:
-            md_content.append(f"- **Max Heap Free Ratio**: {config.max_heap_free_ratio}%\n")
-
-        # Metaspace
-        if config.metaspace_size_bytes:
-            md_content.append(
-                f"- **Metaspace Size**: {config.format_size(config.metaspace_size_bytes)}\n"
-            )
-        if config.max_metaspace_size_bytes:
-            md_content.append(
-                f"- **Max Metaspace Size**: {config.format_size(config.max_metaspace_size_bytes)}\n"
-            )
-        if config.max_direct_memory_size_bytes:
-            size = config.format_size(config.max_direct_memory_size_bytes)
-            md_content.append(f"- **Max Direct Memory**: {size}\n")
-
-        # GC Threading
-        if config.parallel_gc_threads is not None:
-            md_content.append(f"- **Parallel GC Threads**: {config.parallel_gc_threads}\n")
-        if config.conc_gc_threads is not None:
-            md_content.append(f"- **Concurrent GC Threads**: {config.conc_gc_threads}\n")
-
-        # GC Behavior
-        if config.max_gc_pause_millis is not None:
-            md_content.append(f"- **Max GC Pause Target**: {config.max_gc_pause_millis}ms\n")
-        if config.gc_time_ratio is not None:
-            md_content.append(f"- **GC Time Ratio**: {config.gc_time_ratio}\n")
-        if config.adaptive_size_policy_weight is not None:
-            md_content.append(
-                f"- **Adaptive Size Policy Weight**: {config.adaptive_size_policy_weight}\n"
-            )
-        if config.use_adaptive_size_policy is True:
-            md_content.append("- **Adaptive Size Policy**: enabled\n")
-        if config.use_adaptive_size_policy_footprint_goal is True:
-            md_content.append("- **Adaptive Size Policy Footprint Goal**: enabled\n")
-
-        # G1-Specific
-        if config.g1_heap_region_size_bytes:
-            size = config.format_size(config.g1_heap_region_size_bytes)
-            md_content.append(f"- **G1 Heap Region Size**: {size}\n")
-        if config.initiating_heap_occupancy_percent is not None:
-            md_content.append(
-                f"- **Initiating Heap Occupancy**: {config.initiating_heap_occupancy_percent}%\n"
-            )
-        if config.g1_reserve_percent is not None:
-            md_content.append(f"- **G1 Reserve Percent**: {config.g1_reserve_percent}%\n")
-        if config.g1_new_size_percent is not None:
-            md_content.append(f"- **G1 New Size Percent**: {config.g1_new_size_percent}%\n")
-        if config.g1_max_new_size_percent is not None:
-            md_content.append(f"- **G1 Max New Size Percent**: {config.g1_max_new_size_percent}%\n")
-        if config.g1_mixed_gc_count_target is not None:
-            md_content.append(
-                f"- **G1 Mixed GC Count Target**: {config.g1_mixed_gc_count_target}\n"
-            )
-        if config.g1_heap_waste_percent is not None:
-            md_content.append(f"- **G1 Heap Waste Percent**: {config.g1_heap_waste_percent}%\n")
-        if config.g1_mixed_gc_live_threshold_percent is not None:
-            md_content.append(
-                f"- **G1 Mixed GC Live Threshold Percent**: "
-                f"{config.g1_mixed_gc_live_threshold_percent}%\n"
-            )
-        if config.g1_rset_updating_pause_time_percent is not None:
-            md_content.append(
-                f"- **G1 RSet Updating Pause Time Percent**: "
-                f"{config.g1_rset_updating_pause_time_percent}%\n"
-            )
-        if config.g1_old_cset_region_threshold_percent is not None:
-            md_content.append(
-                f"- **G1 Old CSet Region Threshold Percent**: "
-                f"{config.g1_old_cset_region_threshold_percent}%\n"
-            )
-
-        # CMS-Specific
-        if config.cms_initiating_occupancy_fraction is not None:
-            frac = config.cms_initiating_occupancy_fraction
-            md_content.append(f"- **CMS Initiating Occupancy Fraction**: {frac}%\n")
-        if config.use_cms_initiating_occupancy_only is True:
-            md_content.append("- **Use CMS Initiating Occupancy Only**: enabled\n")
-        if config.cms_full_gcs_before_compaction is not None:
-            md_content.append(
-                f"- **CMS Full GCs Before Compaction**: {config.cms_full_gcs_before_compaction}\n"
-            )
-        if config.cms_wait_duration is not None:
-            md_content.append(f"- **CMS Wait Duration**: {config.cms_wait_duration}ms\n")
-
+        for label, value in build_jvm_config_rows(summary.jvm_heap_config):
+            md_content.append(f"- **{label}**: {value}\n")
         md_content.append("\n")
 
     # Quick Diagnosis
@@ -2882,126 +2904,58 @@ def export_markdown_summary(
 
     # At-a-Glance
     md_content.append("## At-a-Glance\n\n")
-    md_content.append(f"- **Runtime:** {summary.runtime_hours:.2f} hrs\n")
-    md_content.append(f"- **GC Events:** {summary.total_event_count}\n")
-    md_content.append(f"- **GC Overhead (pause time):** {summary.gc_overhead_pct:.2f}%\n")
-    md_content.append(f"- **P99 STW Pause:** {summary.p99_pause:.3f}s\n")
-    md_content.append(f"- **Peak Heap:** {summary.peak_heap_pct:.1f}%\n")
-    md_content.append(f"- **Full GCs/hr:** {summary.full_gc_per_hour:.2f}\n")
-    md_content.append(f"- **Leak Level:** {summary.leak_severity.severity_level}\n\n")
+    for label, value in build_at_a_glance_rows(summary):
+        md_content.append(f"- **{label}:** {value}\n")
+    md_content.append("\n")
 
     # Overall Status
     # Runtime Overview
     md_content.append("## Runtime Overview\n\n")
-    md_content.append(f"- **Runtime:** {summary.runtime_hours:.2f} hours\n")
-    md_content.append(f"- **Total GC Events:** {summary.total_event_count}\n")
-    md_content.append(f"- **Young GC:** {summary.young_gc_count}\n")
-    md_content.append(f"- **Full GC:** {summary.full_gc_count}\n\n")
+    for label, value in build_runtime_overview_rows(summary):
+        md_content.append(f"- **{label}:** {value}\n")
+    md_content.append("\n")
 
     # GC Frequency & Rate
     md_content.append("## GC Frequency & Rate\n\n")
-    md_content.append(f"- **Young GCs per hour:** {summary.young_gc_per_hour:.1f}\n")
-    md_content.append(f"- **Full GCs per hour:** {summary.full_gc_per_hour:.2f}\n")
-    if summary.avg_full_gc_interval_min:
-        md_content.append(
-            f"- **Avg time between Full GCs:** {summary.avg_full_gc_interval_min:.1f} minutes\n"
-        )
+    for label, value in build_frequency_rows(summary):
+        md_content.append(f"- **{label}:** {value}\n")
     md_content.append("\n")
 
     # GC Overhead & Throughput
     md_content.append("## GC Overhead & Throughput\n\n")
-    md_content.append(f"- **Total time in GC:** {summary.total_gc_time_sec:.1f} seconds\n")
-    md_content.append(f"- **GC overhead:** {summary.gc_overhead_pct:.2f}%\n")
-    md_content.append(f"- **Application throughput:** {summary.throughput_pct:.2f}%\n\n")
+    for label, value in build_overhead_rows(summary):
+        md_content.append(f"- **{label}:** {value}\n")
+    md_content.append("\n")
 
     # Heap Utilization
     md_content.append("## Heap Utilization\n\n")
-    md_content.append(f"- **Peak heap usage:** {summary.peak_heap_pct:.1f}%\n")
-    md_content.append(f"- **Average heap usage:** {summary.avg_heap_pct:.1f}%\n")
-    md_content.append(f"- **Heap headroom:** {summary.heap_headroom:.1f}%\n\n")
+    for label, value in build_heap_rows(summary):
+        md_content.append(f"- **{label}:** {value}\n")
+    md_content.append("\n")
 
     # Pause Time Analysis
     md_content.append("## Pause Time Analysis\n\n")
     md_content.append("| GC Type | Count | Avg | Median | P95 | P99 | Max |\n")
     md_content.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |\n")
-    total_count = (
-        summary.young_gc_count
-        + summary.full_gc_count
-        + summary.mixed_gc_count
-        + summary.remark_gc_count
-        + summary.cleanup_gc_count
-    )
-    md_content.append(
-        f"| Overall (All Types) | {total_count} | n/a | {format_seconds(summary.p50_pause)} | "
-        f"{format_seconds(summary.p95_pause)} | {format_seconds(summary.p99_pause)} | n/a |\n"
-    )
-    if summary.young_gc_count > 0:
+    for row in build_pause_distribution_rows(summary):
         md_content.append(
-            f"| Young GC | {summary.young_gc_count} | "
-            f"{format_seconds(summary.avg_young_pause)} | "
-            f"{format_seconds(summary.median_young_pause)} | "
-            f"{format_seconds(summary.p95_young_pause)} | "
-            f"{format_seconds(summary.p99_young_pause)} | "
-            f"{format_seconds(summary.max_young_pause)} |\n"
-        )
-    if summary.full_gc_count > 0:
-        md_content.append(
-            f"| Full GC | {summary.full_gc_count} | "
-            f"{format_seconds(summary.avg_full_pause)} | "
-            f"{format_seconds(summary.median_full_pause)} | "
-            f"{format_seconds(summary.p95_full_pause)} | "
-            f"{format_seconds(summary.p99_full_pause)} | "
-            f"{format_seconds(summary.max_full_pause)} |\n"
-        )
-    if summary.mixed_gc_count > 0:
-        md_content.append(
-            f"| Mixed GC (G1) | {summary.mixed_gc_count} | "
-            f"{format_seconds(summary.avg_mixed_pause)} | "
-            f"{format_seconds(summary.median_mixed_pause)} | "
-            f"{format_seconds(summary.p95_mixed_pause)} | "
-            f"{format_seconds(summary.p99_mixed_pause)} | "
-            f"{format_seconds(summary.max_mixed_pause)} |\n"
-        )
-    if summary.remark_gc_count > 0:
-        md_content.append(
-            f"| Remark (G1) | {summary.remark_gc_count} | "
-            f"{format_seconds(summary.avg_remark_pause)} | "
-            f"{format_seconds(summary.median_remark_pause)} | "
-            f"{format_seconds(summary.p95_remark_pause)} | "
-            f"{format_seconds(summary.p99_remark_pause)} | "
-            f"{format_seconds(summary.max_remark_pause)} |\n"
-        )
-    if summary.cleanup_gc_count > 0:
-        md_content.append(
-            f"| Cleanup (G1) | {summary.cleanup_gc_count} | "
-            f"{format_seconds(summary.avg_cleanup_pause)} | "
-            f"{format_seconds(summary.median_cleanup_pause)} | "
-            f"{format_seconds(summary.p95_cleanup_pause)} | "
-            f"{format_seconds(summary.p99_cleanup_pause)} | "
-            f"{format_seconds(summary.max_cleanup_pause)} |\n"
+            f"| {row['type']} | {row['count']} | {row['avg']} | "
+            f"{row['median']} | {row['p95']} | {row['p99']} | {row['max']} |\n"
         )
     md_content.append("\n")
 
     # Top pauses (fast triage)
     if events:
         top_n = 5
-        top_pauses = sorted(events, key=lambda e: e.pause_time_seconds, reverse=True)[:top_n]
-        if top_pauses:
-            md_content.append(f"## Top {min(top_n, len(top_pauses))} Longest Pauses\n\n")
+        top_rows = build_top_pauses_rows(events, top_n)
+        if top_rows:
+            md_content.append(f"## Top {min(top_n, len(top_rows))} Longest Pauses\n\n")
             md_content.append("| Timestamp | GC | Pause | Heap after | Old gen |\n")
             md_content.append("| --- | --- | ---: | ---: | ---: |\n")
-            for e in top_pauses:
-                heap_after_mb = e.heap_after_kb / 1024
-                heap_total_mb = e.heap_total_kb / 1024
-                heap_after_text = (
-                    f"{heap_after_mb:.0f}M/{heap_total_mb:.0f}M ({e.heap_used_percentage:.1f}%)"
-                )
-                old_text = (
-                    f"{e.old_used_percentage:.1f}%" if e.old_used_percentage is not None else "n/a"
-                )
+            for row in top_rows:
                 md_content.append(
-                    f"| {e.timestamp.isoformat()} | {e.gc_kind} | "
-                    f"{e.pause_time_seconds:.3f}s | {heap_after_text} | {old_text} |\n"
+                    f"| {row['timestamp']} | {row['gc_kind']} | {row['pause']} | "
+                    f"{row['heap_after']} | {row['old_gen']} |\n"
                 )
             md_content.append("\n")
 
@@ -3009,74 +2963,48 @@ def export_markdown_summary(
     if summary.old_start is not None and summary.old_end is not None:
         md_content.append(f"## Collector-Specific Diagnostics: {gc_type}\n\n")
         md_content.append("### Old Generation Analysis\n\n")
-        md_content.append(f"- **Old gen at start:** {summary.old_start:.1f}%\n")
-        md_content.append(f"- **Old gen at end:** {summary.old_end:.1f}%\n")
-        md_content.append(f"- **Net old gen growth:** {summary.old_growth:+.1f} pts\n")
-        md_content.append(f"- **Peak old gen usage:** {summary.peak_old_pct:.1f}%\n")
-        if summary.full_gc_count > 0:
-            avg_reclaimed_mb = summary.avg_reclaimed_kb / 1024
-            md_content.append(f"- **Avg reclaimed per Full GC:** {avg_reclaimed_mb:.1f} MB\n")
-            md_content.append(
-                f"- **Full GCs reducing old gen:** "
-                f"{summary.full_gc_reducing}/{summary.full_gc_count}\n"
-            )
-            if summary.reclamation_declining:
-                md_content.append("- **Reclamation declining over time:** yes\n")
+        for label, value in build_old_gen_rows(summary):
+            if value:
+                md_content.append(f"- **{label}:** {value}\n")
+            else:
+                md_content.append(f"- **{label}:** yes\n")
         md_content.append("\n")
 
         if summary.period_stats:
             md_content.append("### Trend (Early / Mid / Late)\n\n")
             md_content.append("| Period | Avg old gen % | Full GC count |\n")
             md_content.append("| --- | ---: | ---: |\n")
-            for period_name in ["early", "mid", "late"]:
-                if period_name in summary.period_stats:
-                    p = summary.period_stats[period_name]
-                    md_content.append(
-                        f"| {period_name} | {p.average_old_gen_percentage:.1f}% | "
-                        f"{p.full_gc_count} |\n"
-                    )
+            for period_name, avg_old, full_gc_count in build_trend_rows(summary):
+                md_content.append(f"| {period_name} | {avg_old} | {full_gc_count} |\n")
             md_content.append("\n")
 
     if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 0:
         md_content.append("### Allocation Pressure\n\n")
-        md_content.append(f"- **Allocation rate:** {summary.allocation_rate_mb_sec:.2f} MB/sec\n")
-        if summary.avg_promotion_kb:
-            md_content.append(
-                f"- **Average promotion:** {summary.avg_promotion_kb:.0f} KB per Young GC\n"
-            )
+        for label, value in build_allocation_rows(summary):
+            md_content.append(f"- **{label}:** {value}\n")
         md_content.append("\n")
 
     if summary.g1_metrics:
-        g1 = summary.g1_metrics
         md_content.append("### G1 GC Metrics\n\n")
-        md_content.append(f"- **Mixed GC count:** {g1.mixed_gc_count}\n")
-        md_content.append(f"- **Mixed GCs per hour:** {g1.mixed_gc_frequency_per_hour:.2f}\n")
-        md_content.append(f"- **Humongous activity (events):** {g1.humongous_allocation_count}\n")
-        md_content.append(f"- **Evacuation failures:** {g1.evacuation_failure_count}\n")
-        md_content.append(f"- **To-space exhaustion events:** {g1.to_space_exhausted_count}\n\n")
+        for label, value in build_g1_rows(summary):
+            md_content.append(f"- **{label}:** {value}\n")
+        md_content.append("\n")
 
     if summary.cms_metrics:
-        cms = summary.cms_metrics
         md_content.append("### CMS GC Metrics\n\n")
-        md_content.append(f"- **CMS cycles per hour:** {cms.cms_cycle_frequency_per_hour:.2f}\n")
-        md_content.append(
-            f"- **Average concurrent pause:** {cms.average_concurrent_pause_seconds:.4f}s\n"
-        )
-        md_content.append(f"- **Concurrent mode failures:** {cms.concurrent_mode_failures}\n")
-        if cms.concurrent_mode_failures > 0:
-            md_content.append(
-                "- **Failures indicate old gen filled before cycle completed:** yes\n"
-            )
+        for label, value in build_cms_rows(summary):
+            if value:
+                md_content.append(f"- **{label}:** {value}\n")
+            else:
+                md_content.append(f"- **{label}:** yes\n")
         md_content.append("\n")
 
     # Metaspace Analysis
     if summary.metaspace_analysis:
-        meta = summary.metaspace_analysis
         md_content.append("## Metaspace Analysis\n\n")
-        md_content.append(
-            f"- **Peak metaspace usage:** {meta.peak_metaspace_used_percentage:.1f}%\n"
-        )
-        md_content.append(f"- **Metaspace growth:** {meta.metaspace_growth_kb // 1024}MB\n\n")
+        for label, value in build_metaspace_rows(summary):
+            md_content.append(f"- **{label}:** {value}\n")
+        md_content.append("\n")
 
     # Leak Assessment
     md_content.append("## Memory Leak Assessment\n\n")
@@ -3117,16 +3045,8 @@ def export_markdown_summary(
             md_content.append("\n")
 
     # Overall Status
-    critical_count = sum(1 for w in summary.warnings if "CRITICAL" in w)
-    warning_count = sum(1 for w in summary.warnings if "WARNING" in w)
-    if critical_count >= 3:
-        status = "CRITICAL - IMMEDIATE ACTION REQUIRED"
-    elif critical_count > 0:
-        status = "UNSTABLE - INTERVENTION REQUIRED"
-    elif warning_count > 0:
-        status = "DEGRADED - MONITORING REQUIRED"
-    else:
-        status = "STABLE"
+    status, _status_style = determine_overall_status(summary)
+    status = sanitize_text(status)
     md_content.append("## Overall Status\n\n")
     md_content.append(f"{status}\n\n")
 
@@ -3270,12 +3190,17 @@ def analyze(
             progress.update(parse_task, completed=100)
 
         # Normalize events
-        normalized: list[GCEvent | None] = [normalize_event(raw) for raw in raw_events]
-        events: list[GCEvent] = [e for e in normalized if e is not None]
+        events: list[GCEvent] = []
+        for raw_event in raw_events:
+            normalized_event = normalize_event(raw_event)
+            if normalized_event is not None:
+                events.append(normalized_event)
 
         if not events:
             console.print("[critical]ERROR: No usable GC events found in log file[/critical]")
             sys.exit(1)
+
+        events.sort(key=lambda event: event.timestamp)
 
         if verbose:
             console.print(f"[info]Successfully parsed {len(events)} GC events[/info]")
