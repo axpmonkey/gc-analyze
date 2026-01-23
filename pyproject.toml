@@ -41,6 +41,13 @@ reportUnknownVariableType = "error"
 reportMissingTypeArgument = "error"
 reportUnnecessaryTypeIgnoreComment = "error"
 
+[dependency-groups]
+dev = [
+    "pip-audit>=2.10.0",
+    "pytest>=9.0.2",
+    "pytest-cov>=7.0.0",
+]
+
 [project.optional-dependencies]
 dev = [
     "ruff>=0.14.0",
