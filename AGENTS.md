@@ -2,7 +2,16 @@
 
 Guardrails for coding/auditing agents (Claude Code, OpenAI Codex, and similar). Self-contained and normative.
 
-**Project**: Python package template and agent configuration files for consistent, high-quality Python development.
+**Project**: `gc-analyze` is a command-line utility that parses JVM garbage-collection (GC) logs and produces an operations-oriented summary: GC rate, pause distributions (P50/P95/P99), heap/old-gen pressure signals, and a memory-leak risk score with actionable recommendations.
+
+## What it does
+
+Given a GC log file, the tool:
+
+- Detects the collector format from the beginning of the log (Parallel, G1, or CMS).
+- Parses GC events and normalizes them into a common event model.
+- Computes runtime-window statistics (rates, percentiles, utilization, trends).
+- Emits a rich terminal report and (optionally) a Markdown report for sharing.
 
 ---
 
