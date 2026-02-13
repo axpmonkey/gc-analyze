@@ -2131,26 +2131,47 @@ def determine_quick_diagnosis(summary: GCSummary) -> str:
 
 
 def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
-    """Build evidence-based recommendations tied to observed log metrics."""
-    recommendations: list[str] = []
+    """Build evidence-based recommendations tied to observed log metrics.
 
+    When JVM heap config is available, recommendations reference specific
+    JVM flags and their current values for actionable tuning guidance.
+    """
+    recommendations: list[str] = []
+    config = summary.jvm_heap_config
+
+    # Post-Full-GC old gen retention
     if summary.full_gc_count > 0 and summary.avg_post_full_gc_pct is not None:
         if summary.avg_post_full_gc_pct > 90:
-            recommendations.append(
+            rec = (
                 "Old gen remains >90% after Full GC; capture heap dump to identify retained objects"
             )
+            if config and config.max_heap_size_bytes:
+                current_xmx = _format_bytes_human(config.max_heap_size_bytes)
+                rec += (
+                    f". Current -Xmx is {current_xmx};"
+                    " consider increasing after root cause analysis"
+                )
+            recommendations.append(rec)
         elif summary.avg_post_full_gc_pct > 80:
-            recommendations.append(
-                "Old gen remains >80% after Full GC; review retained objects and GC ergonomics"
-            )
+            rec = "Old gen remains >80% after Full GC; review retained objects and GC ergonomics"
+            if config and config.max_heap_size_bytes:
+                current_xmx = _format_bytes_human(config.max_heap_size_bytes)
+                rec += f". Current -Xmx is {current_xmx}; may need increase"
+            recommendations.append(rec)
 
+    # GC overhead
     if summary.gc_overhead_pct > 20:
-        recommendations.append(
-            "GC overhead >20%; reduce allocation rate or tune GC to improve throughput"
-        )
+        rec = "GC overhead >20%; reduce allocation rate or tune GC to improve throughput"
+        if config and config.gc_time_ratio is not None:
+            rec += f". Current -XX:GCTimeRatio={config.gc_time_ratio}"
+        recommendations.append(rec)
     elif summary.gc_overhead_pct > 10:
-        recommendations.append("GC overhead >10%; investigate allocation hotspots and GC tuning")
+        rec = "GC overhead >10%; investigate allocation hotspots and GC tuning"
+        if config and config.gc_time_ratio is not None:
+            rec += f". Current -XX:GCTimeRatio={config.gc_time_ratio}"
+        recommendations.append(rec)
 
+    # Pause time
     if summary.p99_pause > 10:
         recommendations.append(
             "P99 GC pause >10s; review pause sources and consider heap/GC tuning"
@@ -2160,14 +2181,49 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
             "P99 GC pause >5s; consider reducing pause times with tuning or allocation changes"
         )
 
+    # Consecutive Full GCs
     if summary.consecutive_full_gcs > 1:
         recommendations.append(
             "Consecutive Full GCs within 5 minutes; investigate memory thrashing and retained heap"
         )
 
+    # Frequent Full GCs
     if summary.full_gc_per_hour > 1:
-        recommendations.append("Frequent Full GCs; review old-gen pressure and allocation patterns")
+        rec = "Frequent Full GCs; review old-gen pressure and allocation patterns"
+        if config and config.initiating_heap_occupancy_percent is not None:
+            rec += (
+                f". Current -XX:InitiatingHeapOccupancyPercent="
+                f"{config.initiating_heap_occupancy_percent};"
+                " try lowering to trigger concurrent GC earlier"
+            )
+        recommendations.append(rec)
 
+    # G1-specific: humongous allocations
+    if summary.g1_metrics and summary.g1_metrics.humongous_allocation_count > 0:
+        humongous_count = summary.g1_metrics.humongous_allocation_count
+        rec = (
+            f"G1 humongous allocations detected ({humongous_count} events); "
+            "objects larger than half a G1 region bypass normal allocation"
+        )
+        if config and config.g1_heap_region_size_bytes:
+            region_size = _format_bytes_human(config.g1_heap_region_size_bytes)
+            rec += (
+                f". Current -XX:G1HeapRegionSize={region_size}; "
+                "consider increasing to reduce humongous allocations"
+            )
+        recommendations.append(rec)
+
+    # Heap headroom
+    if summary.heap_headroom < 10:
+        rec = f"Low heap headroom ({summary.heap_headroom:.1f}%); risk of GC thrashing and OOM"
+        if config and config.max_heap_size_bytes:
+            current_xmx = _format_bytes_human(config.max_heap_size_bytes)
+            suggested_bytes = int(config.max_heap_size_bytes * 1.25)
+            suggested_xmx = _format_bytes_human(suggested_bytes)
+            rec += f". Current -Xmx={current_xmx}; consider increasing to {suggested_xmx}"
+        recommendations.append(rec)
+
+    # Metaspace
     if summary.metaspace_analysis:
         if summary.metaspace_analysis.peak_metaspace_used_percentage > 90:
             recommendations.append(
@@ -2176,8 +2232,12 @@ def build_evidence_based_recommendations(summary: GCSummary) -> list[str]:
         if summary.metaspace_analysis.metaspace_growth_kb > 50 * 1024:
             recommendations.append("Metaspace grew >50MB; investigate classloading churn")
 
-    if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 0:
-        recommendations.append("High allocation rate observed; review allocation-heavy code paths")
+    # Allocation rate
+    if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 500:
+        recommendations.append(
+            f"High allocation rate ({summary.allocation_rate_mb_sec:.0f} MB/sec); "
+            "review allocation-heavy code paths and consider object pooling"
+        )
 
     return recommendations
 
@@ -2239,15 +2299,68 @@ def build_time_window_rows(
     ]
 
 
+def _interpret_gc_overhead(overhead_pct: float) -> str:
+    """Return threshold-based interpretation for GC overhead."""
+    if overhead_pct > 20:
+        return "critical, application severely impacted; target <5%"
+    if overhead_pct > 10:
+        return "elevated, investigate allocation hotspots; target <5%"
+    if overhead_pct > 5:
+        return "moderate; target <5%"
+    return "healthy"
+
+
+def _interpret_p99_pause(p99_seconds: float) -> str:
+    """Return threshold-based interpretation for P99 STW pause."""
+    if p99_seconds > 10:
+        return "1-in-100 pauses this long; severe impact on latency"
+    if p99_seconds > 5:
+        return "1-in-100 pauses this long; may impact latency-sensitive workloads"
+    if p99_seconds > 1:
+        return "1-in-100 pauses this long; monitor for latency impact"
+    return "1-in-100 pauses this long; within normal range"
+
+
+def _interpret_peak_heap(peak_pct: float) -> str:
+    """Return threshold-based interpretation for peak heap usage."""
+    headroom = 100.0 - peak_pct
+    if peak_pct > 95:
+        return f"only {headroom:.0f}% headroom; OOM risk is imminent"
+    if peak_pct > 90:
+        return f"only {headroom:.0f}% headroom before OOM pressure"
+    if peak_pct > 80:
+        return f"{headroom:.0f}% headroom; approaching pressure zone"
+    return f"{headroom:.0f}% headroom; comfortable"
+
+
+def _interpret_full_gc_rate(full_gc_per_hour: float) -> str:
+    """Return threshold-based interpretation for Full GC rate."""
+    if full_gc_per_hour > 10:
+        return "each Full GC stops the entire JVM; critical frequency"
+    if full_gc_per_hour > 1:
+        return "each Full GC stops the entire JVM; investigate cause"
+    if full_gc_per_hour > 0:
+        return "occasional; monitor for increases"
+    return "none observed"
+
+
 def build_at_a_glance_rows(summary: GCSummary) -> list[tuple[str, str]]:
-    """Build compact high-level summary rows."""
+    """Build compact high-level summary rows with threshold-based interpretations."""
+    overhead_interp = _interpret_gc_overhead(summary.gc_overhead_pct)
+    p99_interp = _interpret_p99_pause(summary.p99_pause)
+    peak_heap_interp = _interpret_peak_heap(summary.peak_heap_pct)
+    full_gc_interp = _interpret_full_gc_rate(summary.full_gc_per_hour)
+
     return [
         ("Runtime", f"{summary.runtime_hours:.2f} hrs"),
         ("GC Events", f"{summary.total_event_count}"),
-        ("GC Overhead (pause time)", f"{summary.gc_overhead_pct:.2f}%"),
-        ("P99 STW Pause", f"{summary.p99_pause:.3f}s"),
-        ("Peak Heap", f"{summary.peak_heap_pct:.1f}%"),
-        ("Full GCs/hr", f"{summary.full_gc_per_hour:.2f}"),
+        (
+            "GC Overhead (pause time)",
+            f"{summary.gc_overhead_pct:.2f}% ({overhead_interp})",
+        ),
+        ("P99 STW Pause", f"{summary.p99_pause:.3f}s ({p99_interp})"),
+        ("Peak Heap", f"{summary.peak_heap_pct:.1f}% ({peak_heap_interp})"),
+        ("Full GCs/hr", f"{summary.full_gc_per_hour:.2f} ({full_gc_interp})"),
         ("Leak Level", f"{summary.leak_severity.severity_level}"),
     ]
 
@@ -2415,6 +2528,20 @@ def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
         rows.append(
             ("Avg time between Full GCs", f"{summary.avg_full_gc_interval_min:.1f} minutes")
         )
+    if summary.min_full_gc_interval_min is not None:
+        rows.append(
+            (
+                "Min Full GC interval (worst burst)",
+                f"{summary.min_full_gc_interval_min:.1f} minutes",
+            )
+        )
+    if summary.time_to_first_full_gc_hours is not None:
+        rows.append(
+            (
+                "Time to first Full GC",
+                f"{summary.time_to_first_full_gc_hours:.2f} hours",
+            )
+        )
     return rows
 
 
@@ -2427,11 +2554,41 @@ def build_overhead_rows(summary: GCSummary) -> list[tuple[str, str]]:
     ]
 
 
+def _format_bytes_human(size_bytes: int) -> str:
+    """Format bytes to human-readable size."""
+    if size_bytes >= 1024**3:
+        return f"{size_bytes / (1024**3):.1f}G"
+    elif size_bytes >= 1024**2:
+        return f"{size_bytes / (1024**2):.1f}M"
+    elif size_bytes >= 1024:
+        return f"{size_bytes / 1024:.1f}K"
+    return f"{size_bytes}B"
+
+
+def _format_pct_with_absolute(pct: float, total_bytes: int | None) -> str:
+    """Format a percentage with optional absolute size when heap config is available."""
+    if total_bytes is not None:
+        used_bytes = int(total_bytes * pct / 100.0)
+        return (
+            f"{pct:.1f}% ({_format_bytes_human(used_bytes)} of {_format_bytes_human(total_bytes)})"
+        )
+    return f"{pct:.1f}%"
+
+
 def build_heap_rows(summary: GCSummary) -> list[tuple[str, str]]:
     """Build heap utilization rows."""
+    max_heap_bytes = (
+        summary.jvm_heap_config.max_heap_size_bytes if summary.jvm_heap_config else None
+    )
     return [
-        ("Peak heap usage", f"{summary.peak_heap_pct:.1f}%"),
-        ("Average heap usage", f"{summary.avg_heap_pct:.1f}%"),
+        (
+            "Peak heap usage",
+            _format_pct_with_absolute(summary.peak_heap_pct, max_heap_bytes),
+        ),
+        (
+            "Average heap usage",
+            _format_pct_with_absolute(summary.avg_heap_pct, max_heap_bytes),
+        ),
         ("Heap headroom", f"{summary.heap_headroom:.1f}%"),
     ]
 
@@ -2523,6 +2680,20 @@ def build_pause_distribution_rows(summary: GCSummary) -> list[dict[str, str]]:
                 "style": "",
             }
         )
+    return rows
+
+
+def build_pause_violation_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Build rows for pause threshold violations, only when violations exist."""
+    rows: list[tuple[str, str]] = []
+    if summary.pauses_over_1s > 0:
+        rows.append(("Pauses > 1s", str(summary.pauses_over_1s)))
+    if summary.pauses_over_5s > 0:
+        rows.append(("Pauses > 5s", str(summary.pauses_over_5s)))
+    if summary.pauses_over_30s > 0:
+        rows.append(("Pauses > 30s", str(summary.pauses_over_30s)))
+    if summary.pauses_over_60s > 0:
+        rows.append(("Pauses > 60s", str(summary.pauses_over_60s)))
     return rows
 
 
@@ -2634,6 +2805,60 @@ def build_metaspace_rows(summary: GCSummary) -> list[tuple[str, str]]:
     ]
 
 
+def build_executive_narrative(summary: GCSummary, gc_type: str) -> str:
+    """Build a 3-5 sentence plain-English executive summary from existing GCSummary fields."""
+    sentences: list[str] = []
+
+    # Sentence 1: JVM identity
+    heap_size_clause = ""
+    if summary.jvm_heap_config and summary.jvm_heap_config.max_heap_size_bytes:
+        heap_size_clause = (
+            f" with {_format_bytes_human(summary.jvm_heap_config.max_heap_size_bytes)} max heap"
+        )
+    sentences.append(f"This JVM is running the {gc_type} collector{heap_size_clause}.")
+
+    # Sentence 2: Event counts over observation window
+    sentences.append(
+        f"Over {summary.runtime_hours:.1f} hours, "
+        f"{summary.total_event_count} GC events were observed "
+        f"({summary.young_gc_count} young, {summary.full_gc_count} full)."
+    )
+
+    # Sentence 3: Old gen trend (if data available and growth > 5 pts)
+    if summary.old_start is not None and summary.old_end is not None and summary.old_growth > 5:
+        sentences.append(
+            f"Old generation grew {summary.old_growth:+.1f} percentage points "
+            f"(from {summary.old_start:.1f}% to {summary.old_end:.1f}%), "
+            "suggesting increasing memory pressure over the observation window."
+        )
+
+    # Sentence 4: Full GC acceleration warning
+    if summary.full_gc_accelerating:
+        sentences.append(
+            "Full GC frequency is accelerating over time, "
+            "which often precedes an out-of-memory condition."
+        )
+
+    # Sentence 5: GC overhead assessment
+    if summary.gc_overhead_pct > 20:
+        sentences.append(
+            f"GC overhead is {summary.gc_overhead_pct:.1f}%, "
+            "meaning the application is spending a critical amount of time "
+            "paused for garbage collection."
+        )
+    elif summary.gc_overhead_pct > 10:
+        sentences.append(
+            f"GC overhead is {summary.gc_overhead_pct:.1f}%, "
+            "which is elevated and warrants investigation into allocation patterns."
+        )
+    elif summary.gc_overhead_pct > 5:
+        sentences.append(f"GC overhead is {summary.gc_overhead_pct:.1f}%, which is moderate.")
+    else:
+        sentences.append(f"GC overhead is {summary.gc_overhead_pct:.1f}%, which is healthy.")
+
+    return " ".join(sentences)
+
+
 def determine_overall_status(summary: GCSummary) -> tuple[str, str]:
     """Determine overall status text and style token."""
     critical_count = sum(1 for w in summary.warnings if "CRITICAL" in w)
@@ -2660,6 +2885,11 @@ def render_rich_output(
     # Header
     console.print()
     console.print(Panel(f"GC Type: {gc_type}", style="header", expand=True))
+    console.print()
+
+    # Executive Summary
+    executive_narrative = build_executive_narrative(summary, gc_type)
+    console.print(Panel(executive_narrative, title="Executive Summary", border_style="info"))
     console.print()
 
     # Data quality / parsing coverage (if provided)
@@ -2746,6 +2976,12 @@ def render_rich_output(
     # Pause Time Analysis
     console.print(create_pause_distribution_table(summary))
     console.print()
+
+    # Pause Violations
+    pause_violation_rows = build_pause_violation_rows(summary)
+    if pause_violation_rows:
+        console.print(create_key_value_table("Pause Threshold Violations", pause_violation_rows))
+        console.print()
 
     # Top pauses (fast triage)
     if events:
@@ -2892,6 +3128,10 @@ def export_markdown_summary(
     md_content.append(f"**Generated:** {datetime.now().isoformat()}\n\n")
     md_content.append(f"**GC Type:** {gc_type}\n\n")
 
+    # Executive Summary
+    md_content.append("## Executive Summary\n\n")
+    md_content.append(f"{build_executive_narrative(summary, gc_type)}\n\n")
+
     # Parsing Coverage
     if total_log_lines is not None and raw_event_count is not None:
         md_content.append("## Parsing Coverage\n\n")
@@ -2981,6 +3221,14 @@ def export_markdown_summary(
     )
     md_content.append("\n")
 
+    # Pause Violations
+    pause_violation_rows = build_pause_violation_rows(summary)
+    if pause_violation_rows:
+        md_content.append("### Pause Threshold Violations\n\n")
+        for label, value in pause_violation_rows:
+            md_content.append(f"- **{label}:** {value}\n")
+        md_content.append("\n")
+
     # Top pauses (fast triage)
     if events:
         top_n = 5
@@ -3058,12 +3306,6 @@ def export_markdown_summary(
         md_content.extend(f"- {indicator}\n" for indicator in summary.leak_severity.indicators)
         md_content.append("\n")
 
-    # Warnings
-    if summary.warnings:
-        md_content.append("## Warnings\n\n")
-        md_content.extend(f"- {sanitize_text(warning)}\n" for warning in summary.warnings)
-        md_content.append("\n")
-
     # Evidence-based Recommendations
     recommendations = build_evidence_based_recommendations(summary)
     if recommendations:
@@ -3087,29 +3329,35 @@ def export_markdown_summary(
     md_content.append("## Overall Status\n\n")
     md_content.append(f"{status}\n\n")
 
-    # Recommendations
-    md_content.append("## Recommendations\n\n")
-    if summary.leak_severity.severity_level in ["High", "Critical"]:
-        md_content.append("### IMMEDIATE ACTION REQUIRED\n\n")
-        md_content.append("1. Capture heap dump NOW for analysis\n")
-        md_content.append("2. Use heap dump analysis tools (MAT, JProfiler)\n")
-        md_content.append("3. Identify objects with unexpected retention\n\n")
+    # Actionable Recommendations (only when there are issues)
+    has_leak_issues = summary.leak_severity.severity_level in ["High", "Critical"]
+    has_full_gc_issues = summary.full_gc_per_hour > 1
+    has_overhead_issues = summary.gc_overhead_pct > 10
+    has_any_issues = has_leak_issues or has_full_gc_issues or has_overhead_issues
 
-    if summary.full_gc_per_hour > 1:
-        md_content.append("### Full GC Issues\n\n")
-        md_content.append("- Excessive Full GC frequency detected\n")
-        md_content.append("- Capture heap dump at peak old-gen usage\n")
-        md_content.append("- Analyze retained object graphs\n\n")
+    if has_any_issues:
+        md_content.append("## Actionable Recommendations\n\n")
 
-    if summary.gc_overhead_pct > 10:
-        md_content.append("### GC Overhead\n\n")
-        md_content.append("- Review allocation hotspots\n")
-        md_content.append("- Consider object pooling for high-churn objects\n\n")
+        if has_leak_issues:
+            md_content.append("### IMMEDIATE ACTION REQUIRED\n\n")
+            md_content.append("1. Capture heap dump NOW for analysis\n")
+            md_content.append("2. Use heap dump analysis tools (MAT, JProfiler)\n")
+            md_content.append("3. Identify objects with unexpected retention\n\n")
 
-    md_content.append("### DO NOT\n\n")
-    md_content.append("- Increase heap size without root cause analysis\n")
-    md_content.append("- Ignore warning signs - issues will escalate\n")
-    md_content.append("- Deploy to production in current state\n")
+        if has_full_gc_issues:
+            md_content.append("### Full GC Issues\n\n")
+            md_content.append("- Excessive Full GC frequency detected\n")
+            md_content.append("- Capture heap dump at peak old-gen usage\n")
+            md_content.append("- Analyze retained object graphs\n\n")
+
+        if has_overhead_issues:
+            md_content.append("### GC Overhead\n\n")
+            md_content.append("- Review allocation hotspots\n")
+            md_content.append("- Consider object pooling for high-churn objects\n\n")
+
+        md_content.append("### Caution\n\n")
+        md_content.append("- Do not increase heap size without root cause analysis\n")
+        md_content.append("- Do not ignore warning signs - issues will escalate\n")
 
     # Write to file
     output_path.write_text("".join(md_content), encoding="utf-8")
