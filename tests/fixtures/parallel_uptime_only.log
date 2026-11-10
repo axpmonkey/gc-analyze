@@ -1,3 +1,0 @@
-10.000: [GC (Allocation Failure) [PSYoungGen: 65536K->10000K(76288K)] 65536K->10008K(251392K), 0.0100000 secs] [Times: user=0.01 sys=0.00, real=0.01 secs]
-70.000: [GC (Allocation Failure) [PSYoungGen: 75536K->10000K(76288K)] 75544K->20008K(251392K), 0.0100000 secs] [Times: user=0.01 sys=0.00, real=0.01 secs]
-130.000: [Full GC (System.gc()) [PSYoungGen: 10000K->0K(76288K)] [ParOldGen: 10008K->9000K(175104K)] 20008K->9000K(251392K), [Metaspace: 3000K->3000K(1056768K)], 0.0500000 secs] [Times: user=0.05 sys=0.00, real=0.05 secs]

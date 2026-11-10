@@ -1,4 +1,0 @@
-CommandLine flags: -XX:InitialHeapSize=67108864 -XX:MaxHeapSize=268435456 -XX:+PrintGC -XX:+PrintGCDetails -XX:+PrintGCTimeStamps -XX:+UseSerialGC 
-1.500: [GC (Allocation Failure) 1.500: [DefNew: 17472K->2176K(19648K), 0.0100000 secs] 17472K->5000K(63360K), 0.0110000 secs] [Times: user=0.01 sys=0.00, real=0.01 secs] 
-3.000: [GC (Allocation Failure) 3.000: [DefNew: 19648K->19648K(19648K), 0.0000200 secs]3.000: [Tenured: 40000K->30000K(43712K), 0.0800000 secs] 59648K->30000K(63360K), [Metaspace: 5000K->5000K(1056768K)], 0.0810000 secs] [Times: user=0.08 sys=0.00, real=0.08 secs] 
-4.000: [Full GC (Allocation Failure) 4.000: [Tenured: 43000K->35000K(43712K), 0.0900000 secs] 62000K->35000K(63360K), [Metaspace: 5000K->5000K(1056768K)], 0.0900000 secs] [Times: user=0.09 sys=0.00, real=0.09 secs] 

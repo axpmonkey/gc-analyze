@@ -60,7 +60,6 @@ cover/
 
 # Django stuff:
 *.log
-!tests/fixtures/*.log
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
@@ -282,3 +281,6 @@ nohup.out
 .npm
 node_modules/
 jspm_packages/
+
+# tests stay local; not distributed
+tests/

@@ -60,7 +60,7 @@ uv sync --frozen
 ruff format --check
 ruff check
 basedpyright
-pytest -q --cov=src/gc_analyze --cov-branch --cov-fail-under=90
+pytest -q --cov=src/gc_analyze --cov-branch --cov-fail-under=90  # only where tests/ exists
 pip-audit  # or osv-scanner; fail on critical vulnerabilities
 ```
 
@@ -74,7 +74,7 @@ Matrix across Python 3.11-3.15. Cache `uv` environments. Commit `uv.lock`.
 
 ```
 src/gc_analyze/        # All package code
-tests/                 # All tests (outside src/)
+tests/                 # All tests (outside src/); maintainer-local, gitignored
 pyproject.toml         # Single config file (all tool settings live here)
 uv.lock                # Committed lockfile
 ```
@@ -127,6 +127,9 @@ uv.lock                # Committed lockfile
 ---
 
 ## Testing
+
+`tests/` is kept by the maintainer and is not committed (it is in `.gitignore`). When it is
+present, the rules below apply; never `git add -f` it.
 
 - Hermetic and network-free by default.
 - Mock HTTP with `respx` or `httpx` mocking.

@@ -164,9 +164,6 @@ One JSON object per pause, following the shared `events.jsonl` format: `ts` (UTC
 
 ## Checking accuracy
 
-- `tests/fixtures/*.log` are stock-format logs, each with a hand-computed `*.expected.json`
-  (counts by kind and cause, pause count/sum/min/max, first/last time, coverage, failure flags, floors
-  and slope, max heap). `tests/test_golden.py` diffs the tool against them.
 - `scripts/crosscheck.py` tallies pauses from a log with separate, simpler logic and compares counts by
   kind, total pause time and the longest pause with the tool:
 
@@ -177,8 +174,11 @@ One JSON object per pause, following the shared `events.jsonl` format: `ts` (UTC
 ## Development
 
 ```bash
-ruff format --check && ruff check && basedpyright && pytest -q --cov=src/gc_analyze --cov-branch --cov-fail-under=90
+ruff format --check && ruff check && basedpyright
 ```
+
+The test suite (golden-file fixtures with hand-computed expected results) is kept by the
+maintainer and is not part of this repository.
 
 Modules: `parsers` (formats and detection), `events` (normalization), `coverage`, `segments`
 (restarts, multiple files, windows), `analysis` (statistics, floors, leak score), `jvm_config`,
