@@ -1,17 +1,20 @@
 # AGENTS.md
 
 Guardrails for coding/auditing agents (Claude Code, OpenAI Codex, and similar). Self-contained and normative.
+This is the single instruction file for the repo; `CLAUDE.md` only imports it.
 
 **Project**: `gc-analyze` is a command-line utility that parses JVM garbage-collection (GC) logs and produces an operations-oriented summary: GC rate, pause distributions (P50/P95/P99), heap/old-gen pressure signals, and a memory-leak risk score with actionable recommendations.
 
 ## What it does
 
-Given a GC log file, the tool:
+Given one or more GC log files, the tool:
 
-- Detects the collector format from the beginning of the log (Parallel, G1, or CMS).
-- Parses GC events and normalizes them into a common event model.
-- Computes runtime-window statistics (rates, percentiles, utilization, trends).
-- Emits a rich terminal report and (optionally) a Markdown report for sharing.
+- Detects the log format (Java 8 or JDK 9+ unified) and collector (G1, Parallel, CMS, Serial).
+- Parses every stop-the-world pause (including multi-line records) with its cause into a common
+  event model, and reports parsing coverage (lines found / parsed / not understood).
+- Splits JVM restarts into segments, orders rotated files, and supports `--start/--end` windows.
+- Computes pause statistics, heap vs max heap, Full GC causes, and the old-gen floor trend (leak signal).
+- Emits a rich terminal report, optionally Markdown (`--output`, `--brief`) and events.jsonl.
 
 ---
 
@@ -39,7 +42,7 @@ Given a GC log file, the tool:
 
 ## Toolchain
 
-- **Python**: 3.11-3.13
+- **Python**: 3.11-3.15 (development on 3.15, pinned in `.python-version`)
 - **Formatter/Linter**: `ruff format` and `ruff check --fix`
 - **Type checker**: `basedpyright` (strict)
 - **Tests**: `pytest` with branch coverage >= 90%; optional `hypothesis`
@@ -57,20 +60,20 @@ uv sync --frozen
 ruff format --check
 ruff check
 basedpyright
-pytest -q --cov=src/<package> --cov-branch --cov-fail-under=90
+pytest -q --cov=src/gc_analyze --cov-branch --cov-fail-under=90
 pip-audit  # or osv-scanner; fail on critical vulnerabilities
 ```
 
 Environment: `TZ=UTC`, `PYTHONUTF8=1`, `LC_ALL=C.UTF-8`, `PYTHONWARNINGS=error`
 
-Matrix across Python 3.11-3.13. Cache `uv` environments. Commit `uv.lock`.
+Matrix across Python 3.11-3.15. Cache `uv` environments. Commit `uv.lock`.
 
 ---
 
 ## Project Structure
 
 ```
-src/<package_name>/    # All package code
+src/gc_analyze/        # All package code
 tests/                 # All tests (outside src/)
 pyproject.toml         # Single config file (all tool settings live here)
 uv.lock                # Committed lockfile

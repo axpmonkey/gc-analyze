@@ -1,0 +1,44 @@
+{
+  "gc_type": "CMS GC",
+  "segments": 1,
+  "counts_by_kind": {
+    "Young": 1,
+    "Initial Mark": 1,
+    "Remark": 1,
+    "Full": 1
+  },
+  "full_gc_categories": {
+    "heap": 1,
+    "explicit": 0,
+    "metadata": 0
+  },
+  "pauses": {
+    "count": 4,
+    "sum": 0.214,
+    "min": 0.001,
+    "max": 0.2
+  },
+  "first": "uptime 1.000s",
+  "last": "uptime 9.000s",
+  "coverage": {
+    "candidates": 4,
+    "parsed": 4,
+    "continuation": 0
+  },
+  "flags": {
+    "evacuation_failed": 0,
+    "to_space_exhausted": 0,
+    "humongous": 0,
+    "concurrent_mode_failure": 0,
+    "promotion_failed": 0
+  },
+  "floors": {
+    "metric": "heap",
+    "mb": [
+      40.0
+    ],
+    "assessed": false,
+    "slope_mb_per_hour": null
+  },
+  "max_heap_kb": null
+}

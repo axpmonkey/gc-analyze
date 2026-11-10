@@ -1,0 +1,43 @@
+{
+  "gc_type": "CMS GC",
+  "segments": 1,
+  "counts_by_kind": {
+    "Young": 2,
+    "Initial Mark": 1,
+    "Full": 1
+  },
+  "full_gc_categories": {
+    "heap": 1,
+    "explicit": 0,
+    "metadata": 0
+  },
+  "pauses": {
+    "count": 4,
+    "sum": 3.4044615,
+    "min": 0.0001997,
+    "max": 3.2
+  },
+  "first": "2016-08-23T02:23:07.219-02:00",
+  "last": "2016-08-23T02:26:07.219-02:00",
+  "coverage": {
+    "candidates": 4,
+    "parsed": 4,
+    "continuation": 0
+  },
+  "flags": {
+    "evacuation_failed": 0,
+    "to_space_exhausted": 0,
+    "humongous": 0,
+    "concurrent_mode_failure": 0,
+    "promotion_failed": 0
+  },
+  "floors": {
+    "metric": "old",
+    "mb": [
+      8789.0625
+    ],
+    "assessed": false,
+    "slope_mb_per_hour": null
+  },
+  "max_heap_kb": null
+}

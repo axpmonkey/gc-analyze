@@ -1,0 +1,6 @@
+[0.005s][info][gc] Using Concurrent Mark Sweep
+[1.000s][info][gc] GC(0) Pause Young (Allocation Failure) 20M->5M(100M) 10.000ms
+[5.000s][info][gc] GC(1) Pause Initial Mark 50M->50M(100M) 1.000ms
+[5.500s][info][gc] GC(1) Concurrent Mark 450.000ms
+[5.600s][info][gc] GC(1) Pause Remark 55M->55M(100M) 3.000ms
+[9.000s][info][gc] GC(2) Pause Full (Allocation Failure) 95M->40M(100M) 200.000ms

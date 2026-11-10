@@ -1,0 +1,42 @@
+{
+  "gc_type": "Parallel GC",
+  "segments": 1,
+  "counts_by_kind": {
+    "Young": 2,
+    "Full": 1
+  },
+  "full_gc_categories": {
+    "heap": 0,
+    "explicit": 1,
+    "metadata": 0
+  },
+  "pauses": {
+    "count": 3,
+    "sum": 0.07,
+    "min": 0.01,
+    "max": 0.05
+  },
+  "first": "uptime 10.000s",
+  "last": "uptime 130.000s",
+  "coverage": {
+    "candidates": 3,
+    "parsed": 3,
+    "continuation": 0
+  },
+  "flags": {
+    "evacuation_failed": 0,
+    "to_space_exhausted": 0,
+    "humongous": 0,
+    "concurrent_mode_failure": 0,
+    "promotion_failed": 0
+  },
+  "floors": {
+    "metric": "old",
+    "mb": [
+      8.7890625
+    ],
+    "assessed": false,
+    "slope_mb_per_hour": null
+  },
+  "max_heap_kb": null
+}

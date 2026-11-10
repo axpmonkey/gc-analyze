@@ -1,0 +1,44 @@
+{
+  "gc_type": "Parallel GC",
+  "segments": 1,
+  "counts_by_kind": {
+    "Young": 3,
+    "Full": 3
+  },
+  "full_gc_categories": {
+    "heap": 1,
+    "explicit": 1,
+    "metadata": 1
+  },
+  "pauses": {
+    "count": 6,
+    "sum": 1.67,
+    "min": 0.008,
+    "max": 1.2
+  },
+  "first": "2020-03-01T08:00:05.000+01:00",
+  "last": "2020-03-01T10:00:31.000+01:00",
+  "coverage": {
+    "candidates": 6,
+    "parsed": 6,
+    "continuation": 2
+  },
+  "flags": {
+    "evacuation_failed": 0,
+    "to_space_exhausted": 0,
+    "humongous": 0,
+    "concurrent_mode_failure": 0,
+    "promotion_failed": 1
+  },
+  "floors": {
+    "metric": "old",
+    "mb": [
+      10.0,
+      50.0,
+      100.0
+    ],
+    "assessed": true,
+    "slope_mb_per_hour": 44.99398
+  },
+  "max_heap_kb": 1048576
+}

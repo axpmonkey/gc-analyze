@@ -1,0 +1,43 @@
+{
+  "gc_type": "Serial GC",
+  "segments": 1,
+  "counts_by_kind": {
+    "Young": 1,
+    "Full": 2
+  },
+  "full_gc_categories": {
+    "heap": 2,
+    "explicit": 0,
+    "metadata": 0
+  },
+  "pauses": {
+    "count": 3,
+    "sum": 0.182,
+    "min": 0.011,
+    "max": 0.09
+  },
+  "first": "uptime 1.500s",
+  "last": "uptime 4.000s",
+  "coverage": {
+    "candidates": 3,
+    "parsed": 3,
+    "continuation": 0
+  },
+  "flags": {
+    "evacuation_failed": 0,
+    "to_space_exhausted": 0,
+    "humongous": 0,
+    "concurrent_mode_failure": 0,
+    "promotion_failed": 0
+  },
+  "floors": {
+    "metric": "old",
+    "mb": [
+      29.296875,
+      34.1796875
+    ],
+    "assessed": false,
+    "slope_mb_per_hour": null
+  },
+  "max_heap_kb": 262144
+}

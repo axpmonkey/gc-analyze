@@ -1,0 +1,4 @@
+[0.010s][info][gc] Using G1
+[10.000s][info][gc] GC(0) Pause Young (Normal) (G1 Evacuation Pause) 100M->20M(1024M) 20.000ms
+[70.000s][info][gc] GC(1) Pause Young (Normal) (G1 Evacuation Pause) 120M->30M(1024M) 25.000ms
+[130.000s][info][gc] GC(2) Pause Full (G1 Compaction Pause) 1000M->500M(1024M) 3000.000ms
