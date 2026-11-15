@@ -26,6 +26,7 @@ from datetime import UTC, datetime
 from typing import Any, Protocol
 
 from .events import parse_size_to_kb
+from .models import SideRecord
 
 RawEvent = dict[str, Any]
 
@@ -107,6 +108,69 @@ LEGACY_NOISE: tuple[re.Pattern[str], ...] = (
     re.compile(r"\s*\[Times:[^\]]*\]"),
 )
 MAX_CONTINUATION_LINES = 40
+LEGACY_TIMES_RE: re.Pattern[str] = re.compile(
+    r"\[Times: user=(?P<user>[\d.]+) sys=(?P<sys>[\d.]+),? real=(?P<real>[\d.]+) secs\]"
+)
+# Concurrent phases carry their own [Times: ...]; they are not the pause's CPU time
+_CONCURRENT_WITH_TIMES = re.compile(r"\[CMS-concurrent-[^\]]*\]\s*\[Times:[^\]]*\]")
+MAX_TIMES_LOOKAHEAD_LINES = 80
+
+
+# -XX:+PrintHeapAtGC block printed after each collection:
+#   "Heap after GC invocations=7 (full 1):" ... "  from space 30720K, 99% used [...]" ... "}"
+_HEAP_AFTER_GC = "Heap after GC"
+_FROM_SPACE_RE = re.compile(r"^\s*from space (?P<capacity>\d+)K,\s*(?P<used>\d+)% used")
+MAX_HEAP_AFTER_GC_LINES = 16
+
+
+def legacy_survivor_after_gc(log_lines: list[str], end: int) -> dict[str, float]:
+    """Survivor ("from space") capacity and occupancy after the record ending on line ``end``.
+
+    Only read from the "Heap after GC" block that directly follows the record.
+    """
+    in_block = False
+    for line in log_lines[end + 1 : end + 1 + MAX_HEAP_AFTER_GC_LINES]:
+        if not in_block:
+            if line.startswith(_HEAP_AFTER_GC):
+                in_block = True
+            elif line.strip() and not line[:1].isspace():
+                break  # another record or block came first
+            continue
+        if line.startswith("}"):
+            break
+        if match := _FROM_SPACE_RE.match(line):
+            return {
+                "survivor_capacity": int(match.group("capacity")),
+                "survivor_used_pct": float(match.group("used")),
+            }
+    return {}
+
+
+def legacy_cpu_times(log_lines: list[str], start: int, end: int) -> dict[str, float]:
+    """user/sys/real of the record on lines ``start``..``end`` (0-based), if it logs them.
+
+    The figure normally closes the record's own line. Java 8 G1 with PrintGCDetails prints it
+    on an indented line after the detail lines, so indented lines after ``end`` are searched
+    too.
+    """
+    found: re.Match[str] | None = None
+    last = min(len(log_lines), end + 1 + MAX_TIMES_LOOKAHEAD_LINES)
+    for index in range(start, last):
+        line = log_lines[index]
+        if index > end and not line[:1].isspace():
+            break
+        matches = list(LEGACY_TIMES_RE.finditer(_CONCURRENT_WITH_TIMES.sub("", line)))
+        if matches:
+            found = matches[-1]
+            if index > end:
+                break
+    if found is None:
+        return {}
+    return {
+        "cpu_user": float(found.group("user")),
+        "cpu_sys": float(found.group("sys")),
+        "cpu_real": float(found.group("real")),
+    }
 
 
 def clean_legacy_record(text: str) -> str:
@@ -177,6 +241,8 @@ class _LegacyParserBase:
             if event is None:
                 continue
             event.update(timestamp=timestamp, uptime=uptime, line_index=start, line_end=end)
+            event.update(legacy_cpu_times(log_lines, start, end))
+            event.update(legacy_survivor_after_gc(log_lines, end))
             events.append(event)
         return events
 
@@ -386,6 +452,7 @@ class G1LegacyGCParser:
                 event = self._parse_record(text)
                 if event is not None:
                     event.update(line_index=index, line_end=end)
+                    event.update(legacy_cpu_times(log_lines, index, end))
                     events.append(event)
                     pending = event
                 continue
@@ -466,6 +533,14 @@ _NS_RE = re.compile(r"^(\d+)ns$")
 # epoch milliseconds (timemillis) vs. uptime milliseconds (uptimemillis): a JVM up for more
 # than ~3 years is not plausible, so values above this are wall-clock
 _EPOCH_MS_FLOOR = 10**11
+# Messages accepted from lines written without the tags decorator (-Xlog:gc*:file=x:time)
+_UNDECORATED_GC_MESSAGE = re.compile(
+    r"^(?:GC\(\d+\) |Using (?:G1|Parallel|Serial|Concurrent Mark Sweep|The Z Garbage Collector"
+    r"|Shenandoah|Epsilon)\b|Heap [Rr]egion [Ss]ize:|Heap Max Capacity:|Heap address:)"
+)
+# Lines from different threads can be written a few ms out of order; a real restart goes back
+# to (nearly) zero
+_UPTIME_RESTART_TOLERANCE_SECONDS = 1.0
 
 
 class UnifiedPrefix:
@@ -493,7 +568,9 @@ def parse_unified_prefix(line: str) -> UnifiedPrefix | None:
 
     Handles any decorator set: time/utctime (ISO), uptime ("10.000s"), uptimemillis /
     timemillis ("123ms"), uptimenanos/timenanos ("123ns"), pid/tid, level (padded or not).
-    Returns None for lines that are not gc-tagged unified log lines.
+    The level and tags decorators are optional: a line with a time decorator and a GC message
+    ("GC(n) ...", "Using G1", heap sizing) is accepted without them.
+    Returns None for lines that are not GC unified log lines.
     """
     position = 0
     timestamp: str | None = None
@@ -527,9 +604,30 @@ def parse_unified_prefix(line: str) -> UnifiedPrefix | None:
         elif value.startswith("gc"):
             tags = value
             break  # tags are the last decorator before the message
-    if tags is None or level is None:
-        return None
-    return UnifiedPrefix(timestamp, uptime, level, tags, line[position:].strip())
+    message = line[position:].strip()
+    if tags is None:
+        if (timestamp is None and uptime is None) or not _UNDECORATED_GC_MESSAGE.match(message):
+            return None
+        tags = ""
+    return UnifiedPrefix(timestamp, uptime, level, tags, message)
+
+
+def parse_unified_prefix_times(line: str) -> tuple[str | None, float | None]:
+    """(datestamp, uptime seconds) from the leading decorators of any unified line."""
+    timestamp: str | None = None
+    uptime: float | None = None
+    position = 0
+    while position < len(line) and line[position] == "[":
+        match = _DECORATOR_RE.match(line, position)
+        if match is None:
+            break
+        value = match.group(1).strip()
+        position = match.end()
+        if _ISO_DECORATOR_RE.match(value):
+            timestamp = value
+        elif m := _UPTIME_S_RE.match(value):
+            uptime = float(m.group(1).replace(",", "."))
+    return timestamp, uptime
 
 
 UNIFIED_PAUSE_RE: re.Pattern[str] = re.compile(
@@ -557,6 +655,9 @@ UNIFIED_METASPACE_RE: re.Pattern[str] = re.compile(
     r"^GC\((?P<gc_id>\d+)\)\s+Metaspace:\s+(?P<mb>\d+)K(?:\(\d+K\))?->(?P<ma>\d+)K\((?P<mt>\d+)K\)"
 )
 UNIFIED_TO_SPACE_RE: re.Pattern[str] = re.compile(r"^GC\((?P<gc_id>\d+)\)\s+To-space exhausted")
+UNIFIED_CPU_RE: re.Pattern[str] = re.compile(
+    r"^GC\((?P<gc_id>\d+)\)\s+User=(?P<user>[\d.]+)s Sys=(?P<sys>[\d.]+)s Real=(?P<real>[\d.]+)s"
+)
 YOUNG_GENERATIONS: frozenset[str] = frozenset({"PSYoungGen", "DefNew", "ParNew"})
 
 
@@ -579,14 +680,28 @@ class UnifiedGCParser:
         by_id: dict[int, RawEvent] = {}
         details: dict[int, dict[str, Any]] = {}  # detail lines seen before their pause line
         region_size_kb: int | None = None
+        last_uptime: float | None = None
 
         for index, line in enumerate(log_lines):
-            if "[gc" not in line:
+            if not line.startswith("["):
                 continue
-            prefix = parse_unified_prefix(line)
+            prefix = parse_unified_prefix(line.rstrip("\r\n"))
             if prefix is None:
                 continue
             message = prefix.message
+            # GC ids restart at 0 with every JVM run: details of a new run must not attach to
+            # (or be taken from) the previous run's events.
+            restarted = UNIFIED_COLLECTOR_LINE.search(message) is not None
+            if prefix.uptime is not None:
+                if (
+                    last_uptime is not None
+                    and prefix.uptime < last_uptime - _UPTIME_RESTART_TOLERANCE_SECONDS
+                ):
+                    restarted = True
+                last_uptime = prefix.uptime
+            if restarted:
+                by_id.clear()
+                details.clear()
             if not message.startswith("GC("):
                 if region_match := UNIFIED_REGION_SIZE_RE.search(message):
                     region_size_kb = parse_size_to_kb(
@@ -633,6 +748,15 @@ class UnifiedGCParser:
             elif m := UNIFIED_TO_SPACE_RE.match(message):
                 gc_id = int(m.group("gc_id"))
                 update = {"to_space_exhausted": True, "evacuation_failed": True}
+            elif m := UNIFIED_CPU_RE.match(message):
+                gc_id = int(m.group("gc_id"))
+                if gc_id not in by_id:
+                    continue  # CPU times follow their pause line; never hold them for a later one
+                update = {
+                    "cpu_user": float(m.group("user")),
+                    "cpu_sys": float(m.group("sys")),
+                    "cpu_real": float(m.group("real")),
+                }
 
             if gc_id is None or not update:
                 continue
@@ -679,6 +803,7 @@ class UnifiedGCParser:
             humongous_detected=cause is not None and "Humongous" in cause,
             evacuation_failed=evacuation_failed,
             to_space_exhausted=False,
+            stamp_at_pause_end=True,  # the pause line is written when the pause finishes
         )
 
 
@@ -703,6 +828,74 @@ def apply_region_counts(event: RawEvent) -> None:
     if "old_after" in event and event.get("heap_total"):
         # G1 has no fixed old-gen size; the committed heap is the capacity old can grow into
         event["old_total"] = event["heap_total"]
+
+
+# ============================================================
+# NON-PAUSE RECORDS: concurrent work and safepoints
+# ============================================================
+
+# JDK 11: "GC(1) Concurrent Cycle 250.000ms"; JDK 17+: "GC(4) Concurrent Mark Cycle 80.1ms"
+UNIFIED_CONCURRENT_CYCLE_RE: re.Pattern[str] = re.compile(
+    r"\bGC\(\d+\) Concurrent (?:Mark |Undo )?Cycle (?P<ms>[\d.]+)ms\s*$"
+)
+LEGACY_G1_CONCURRENT_MARK_RE: re.Pattern[str] = re.compile(
+    r"\[GC concurrent-mark-end, (?P<seconds>[\d.]+) secs\]"
+)
+# "[CMS-concurrent-mark: 0.100/0.200 secs]": CPU time / elapsed time
+LEGACY_CMS_CONCURRENT_RE: re.Pattern[str] = re.compile(
+    r"\[CMS-concurrent-(?:mark|sweep): [\d.]+/(?P<seconds>[\d.]+) secs\]"
+)
+# -XX:+PrintGCApplicationStoppedTime (Java 8) and -Xlog:safepoint (JDK 9-12)
+STOPPED_TIME_RE: re.Pattern[str] = re.compile(
+    r"Total time for which application threads were stopped: (?P<stopped>[\d.]+) seconds"
+    r"(?:, Stopping threads took: (?P<stopping>[\d.]+) seconds)?"
+)
+
+
+def _line_time(line: str) -> str:
+    """Time of a log line as written: datestamp if present, else uptime."""
+    if line.startswith("["):
+        prefix = parse_unified_prefix_times(line)
+        if prefix[0]:
+            return prefix[0]
+        return f"uptime {prefix[1]:.3f}s" if prefix[1] is not None else ""
+    timestamp, uptime, _ = _legacy_stamp(line)
+    if timestamp:
+        return timestamp
+    return f"uptime {uptime:.3f}s" if uptime is not None else ""
+
+
+def scan_side_records(log_lines: list[str]) -> list[SideRecord]:
+    """Concurrent-work durations and application-stopped times, in line order."""
+    records: list[SideRecord] = []
+    for index, line in enumerate(log_lines):
+        if "oncurrent" in line:
+            if match := UNIFIED_CONCURRENT_CYCLE_RE.search(line):
+                seconds, label = float(match.group("ms")) / 1000, "G1 concurrent cycles"
+            elif match := LEGACY_G1_CONCURRENT_MARK_RE.search(line):
+                seconds, label = float(match.group("seconds")), "G1 concurrent marking phases"
+            elif match := LEGACY_CMS_CONCURRENT_RE.search(line):
+                seconds, label = (
+                    float(match.group("seconds")),
+                    "CMS concurrent mark and sweep phases",
+                )
+            else:
+                continue
+            records.append(
+                SideRecord(kind="concurrent", line_number=index + 1, seconds=seconds, label=label)
+            )
+        elif "application threads were stopped" in line and (match := STOPPED_TIME_RE.search(line)):
+            stopping = match.group("stopping")
+            records.append(
+                SideRecord(
+                    kind="safepoint",
+                    line_number=index + 1,
+                    seconds=float(match.group("stopped")),
+                    stopping_seconds=float(stopping) if stopping else None,
+                    when=_line_time(line),
+                )
+            )
+    return records
 
 
 # ============================================================

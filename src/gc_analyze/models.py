@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Literal, TypeAlias
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -34,6 +34,8 @@ class GCEvent(BaseModel):
     timestamp_raw: str | None = None
     tz_source: str | None = None
     pause_time_seconds: SecondsValue
+    # Unified logging (JDK 9+) stamps the line when the pause ENDS; Java 8 logs stamp its start.
+    stamp_at_pause_end: bool = False
     # GC cause as logged, e.g. "Allocation Failure", "System.gc()", "G1 Evacuation Pause"
     cause: str | None = None
 
@@ -67,10 +69,33 @@ class GCEvent(BaseModel):
     metaspace_after_kb: KilobytesValue | None = None
     metaspace_total_kb: KilobytesValue | None = None
 
+    # CPU time of the collection ("[Times: user= sys= real=]", unified gc,cpu), when logged
+    cpu_user_seconds: float | None = None
+    cpu_sys_seconds: float | None = None
+    cpu_real_seconds: float | None = None
+
+    # Survivor space after the collection, from -XX:+PrintHeapAtGC ("from space NK, P% used")
+    survivor_capacity_kb: KilobytesValue | None = None
+    survivor_used_percentage: PercentageValue | None = None
+
     # Provenance
     source_file: str | None = None
     line_number: int | None = None  # 1-based, first line of the record
     segment: int = 1  # JVM run within the input (1-based); see segments.py
+
+    @property
+    def pause_start(self) -> datetime:
+        """When the pause began, whichever end of the pause the log stamped."""
+        if self.stamp_at_pause_end:
+            return self.timestamp - timedelta(seconds=self.pause_time_seconds)
+        return self.timestamp
+
+    @property
+    def pause_end(self) -> datetime:
+        """When the pause finished, whichever end of the pause the log stamped."""
+        if self.stamp_at_pause_end:
+            return self.timestamp
+        return self.timestamp + timedelta(seconds=self.pause_time_seconds)
 
 
 class DiagnosticThresholds(BaseModel):
@@ -104,6 +129,23 @@ class DiagnosticThresholds(BaseModel):
     # A floor slope only counts as a leak signal when the line fits reasonably
     min_floor_r_squared: float = 0.5
 
+    # Share of wall-clock time paused inside the worst 5-minute stretch
+    pause_share_critical_percentage: float = 50.0
+    pause_share_warning_percentage: float = 25.0
+    # A heap-pressure Full GC that frees less than this share of the heap achieved little
+    ineffective_full_gc_reclaim_percentage: float = 20.0
+    # JVM start-up (class loading, cache fill) is left out of growth figures
+    warmup_seconds: float = 600.0
+    # A floor this many times the median of the floors before it, and higher by at least
+    # this share of capacity, is a step change in the live set
+    floor_step_factor: float = 2.0
+    # Young collections leaving the survivor space this full count as overflowing it
+    survivor_full_percentage: float = 99.0
+    survivor_overflow_min_count: int = 3
+    # Concurrent collector work above this share of the window is near-continuous marking
+    concurrent_share_warning_percentage: float = 25.0
+    floor_step_min_capacity_percentage: float = 10.0
+
 
 class LeakSeverity(BaseModel):
     """Memory leak severity assessment (no time-to-OOM extrapolation)."""
@@ -124,6 +166,16 @@ class MetaspaceAnalysis(BaseModel):
     metaspace_growing: bool
     metadata_full_gc_count: int = 0
     metaspace_warnings: list[str] = Field(default_factory=list)
+    # Used sizes as logged. The percentages above are of -XX:MaxMetaspaceSize and are only
+    # meaningful when limit_known: the bracketed figure in the log is reserved/committed
+    # space, not a limit.
+    first_used_kb: int = 0
+    peak_used_kb: int = 0
+    last_used_kb: int = 0
+    max_metaspace_kb: int | None = None
+    limit_known: bool = False
+    # False when the log has no samples after warm-up, so growth could not be measured
+    growth_measured: bool = False
 
 
 class JVMHeapConfig(BaseModel):
@@ -237,6 +289,8 @@ class CandidateCoverage(BaseModel):
     parsed_candidate_lines: int
     unparsed_samples: list[str] = Field(default_factory=list)
     total_lines: int = 0
+    # "L2172: <text>" when the log stops in the middle of a GC record (not counted as unparsed)
+    truncated_final_record: str | None = None
     # Physical lines folded into a multi-line record (tenuring tables, interleaved phases)
     continuation_lines: int = 0
 
@@ -275,6 +329,137 @@ class PauseStats(BaseModel):
     maximum: float = 0.0
 
 
+class PauseShareWindow(BaseModel):
+    """The stretch of the given length with the most time spent paused."""
+
+    window_seconds: float
+    paused_seconds: float
+    share_percentage: float
+    window_start: datetime
+    wall_clock: bool = True
+    uptime_seconds: float | None = None  # of window_start, when the log has uptime
+
+
+class SideRecord(BaseModel):
+    """A log line that is not a GC pause but matters for diagnosis."""
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["concurrent", "safepoint"]
+    line_number: int  # 1-based
+    seconds: float  # concurrent work duration, or total time the application was stopped
+    stopping_seconds: float | None = None  # safepoint: time to bring the threads to a stop
+    label: str = ""  # concurrent: what the duration covers
+    when: str = ""  # time as written in the log
+
+
+class ConcurrentStats(BaseModel):
+    """Concurrent collector work (runs alongside the application; not pause time)."""
+
+    label: str
+    cycles: int
+    total_seconds: float
+    share_percentage: float | None  # of the window; None for a window without elapsed time
+    average_seconds: float
+    longest_seconds: float
+
+
+class SafepointStats(BaseModel):
+    """Application-stopped time from safepoint logging (includes non-GC safepoints)."""
+
+    count: int
+    total_stopped_seconds: float
+    longest_stopped_seconds: float
+    longest_stopped_when: str
+    # Safepoints where bringing the threads to a stop took a second or more
+    slow_to_stop_count: int = 0
+    longest_stopping_seconds: float = 0.0
+    longest_stopping_when: str = ""
+
+
+class CpuStats(BaseModel):
+    """CPU time of pauses. Only pauses with real >= 0.1 s are judged (log resolution is 10 ms)."""
+
+    pauses_with_cpu_times: int
+    judged_pauses: int
+    # sys > 20% of user: time went to the kernel (memory management), not to collecting
+    high_sys_count: int = 0
+    worst_high_sys: str = ""  # "user=2.00 sys=5.00 real=1.00 at <time>"
+    # real > 1.5 x (user + sys): the collector was waiting, not running
+    off_cpu_count: int = 0
+    worst_off_cpu: str = ""
+
+
+class JVMEnvironment(BaseModel):
+    """JVM and host facts printed at the top of the log."""
+
+    jvm_version: str | None = None
+    cpus_total: int | None = None
+    cpus_available: int | None = None
+    physical_memory_kb: int | None = None
+    free_memory_kb: int | None = None
+    swap_total_kb: int | None = None
+    swap_free_kb: int | None = None
+    large_pages: str | None = None
+    pre_touch: str | None = None
+
+
+class HealthWarning(BaseModel):
+    """One health warning. ``code`` identifies the condition; ``text`` is for people."""
+
+    model_config = ConfigDict(frozen=True)
+
+    code: str
+    level: Literal["CRITICAL", "WARNING"]
+    text: str
+
+    @property
+    def line(self) -> str:
+        """'CRITICAL: ...' / 'WARNING: ...', as listed in ``GCSummary.warnings``."""
+        return f"{self.level}: {self.text}"
+
+
+class SurvivorOverflow(BaseModel):
+    """Young collections that left the survivor space full and promoted the excess."""
+
+    count: int
+    young_gc_count: int  # young collections that logged survivor occupancy
+    first_when: str
+    last_when: str
+    survivor_capacity_kb: int
+    promoted_kb: int  # old-generation growth across those collections
+
+
+class Finding(BaseModel):
+    """One ranked conclusion of the report: what, when, on what evidence, and what to do."""
+
+    severity: Literal["critical", "warning", "info"]
+    title: str
+    when: str = ""
+    evidence: list[str] = Field(default_factory=list)
+    # high: read straight off the log; medium: an interpretation of it; low: thin data
+    confidence: Literal["high", "medium", "low"] = "high"
+    action: str = ""
+    source: str = ""  # documentation the action restates
+
+
+class TimelineBucket(BaseModel):
+    """One slice of the analysis window: what GC did in it."""
+
+    start: datetime
+    wall_clock: bool = True
+    uptime_seconds: float | None = None
+    length_seconds: float
+    pause_count: int = 0
+    paused_seconds: float = 0.0
+    paused_percentage: float = 0.0
+    longest_pause_seconds: float = 0.0
+    full_gc_count: int = 0
+    # After the last collecting pause (Young/Mixed/Full) in the slice; None when there was none
+    heap_after_kb: int | None = None
+    heap_after_percentage: float | None = None
+
+
 class FullGCCause(BaseModel):
     """Full GC count for one cause."""
 
@@ -294,6 +479,15 @@ class FloorPoint(BaseModel):
     value_kb: int
     pct_of_capacity: float | None
     source: str  # "Full GC (Allocation Failure)", "end of mixed cycle", "Remark"
+    # Taken during JVM start-up (class loading, cache fill): listed, but not part of the trend
+    warmup: bool = False
+
+
+class FloorStep(BaseModel):
+    """A jump between two consecutive floors: sudden retention, not gradual growth."""
+
+    before: FloorPoint
+    after: FloorPoint
 
 
 class FloorTrend(BaseModel):
@@ -311,6 +505,12 @@ class FloorTrend(BaseModel):
     r_squared: float | None = None
     first_mb: float | None = None
     last_mb: float | None = None
+    step_change: FloorStep | None = None
+
+    @property
+    def trend_floors(self) -> list[FloorPoint]:
+        """Floors the trend is computed from (start-up floors left out)."""
+        return [f for f in self.floors if not f.warmup]
 
 
 class HeapStats(BaseModel):
@@ -329,6 +529,10 @@ class HeapStats(BaseModel):
     peak_after_gc_pct: float = 0.0
     avg_after_gc_pct: float = 0.0
     headroom_pct: float = 100.0  # 100 - peak_after_gc_pct
+    # "After GC" figures only use pauses that collect (Young, Mixed, Full)
+    collecting_events_with_heap_data: int = 0
+    # Occupancy above the stated max heap: the max heap value is wrong for this log
+    exceeds_max_heap: bool = False
 
 
 class PeriodStatistics(BaseModel):
@@ -385,12 +589,20 @@ class GCSummary(BaseModel):
     min_full_gc_interval_min: float | None = None
     time_to_first_full_gc_hours: float | None = None
     full_gc_accelerating: bool = False
-    max_full_gc_streak: int = 0  # most heap-pressure Full GCs inside the streak window
+    # Most heap-pressure Full GCs with the last starting within the streak window of the
+    # first one finishing
+    max_full_gc_streak: int = 0
 
-    # Overhead
+    # Overhead (pause time inside the window / window length)
     total_gc_time_sec: float = 0.0
     gc_overhead_pct: float = 0.0
     throughput_pct: float = 100.0
+    # False when the window is a single pause: there is no elapsed time to divide by
+    overhead_measured: bool = True
+    worst_pause_shares: list[PauseShareWindow] = Field(default_factory=list)
+    # The window cut into equal slices, so the reader can see when behaviour changed
+    timeline: list[TimelineBucket] = Field(default_factory=list)
+    timeline_bucket_seconds: float = 0.0
 
     # Pauses
     overall_pauses: PauseStats = Field(default_factory=PauseStats)
@@ -403,9 +615,11 @@ class GCSummary(BaseModel):
     # Heap (P1.3, P1.5)
     heap: HeapStats = Field(default_factory=HeapStats)
 
-    # Old gen
+    # Old gen. old_pct_basis names the denominator of every old-gen percentage
     peak_old_pct: float | None = None
     avg_old_pct: float | None = None
+    old_pct_basis: str = "old generation capacity"
+    old_pct_capacity_kb: int | None = None  # fixed denominator (G1 with a known max heap)
     floor_trend: FloorTrend = Field(default_factory=lambda: FloorTrend(assessed=False))
 
     # Full GC effectiveness (all Full GCs: each is a measurement of the live set)
@@ -414,9 +628,16 @@ class GCSummary(BaseModel):
     avg_post_full_gc_pct: float | None = None
     avg_reclaimed_kb: float = 0.0
     reclamation_declining: bool = False
+    # Whole-heap reclaim (heap before - heap after) as % of heap before
+    avg_full_gc_reclaimed_pct: float | None = None
+    # Heap-pressure Full GCs only, in time order
+    heap_full_gc_reclaimed_pcts: list[float] = Field(default_factory=list)
+    ineffective_full_gc_count: int = 0
 
     # Allocation (P1.8)
     avg_promotion_kb: float = 0.0
+    total_promoted_kb: int = 0
+    promotion_rate_mb_sec: float | None = None
     allocation_rate_mb_sec: float | None = None
     allocation_basis: str | None = None  # "young generation" or "whole heap"
 
@@ -427,7 +648,21 @@ class GCSummary(BaseModel):
     g1_metrics: G1Metrics | None = None
     cms_metrics: CMSMetrics | None = None
     jvm_heap_config: JVMHeapConfig | None = None
+    cpu_stats: CpuStats | None = None
+    survivor_overflow: SurvivorOverflow | None = None
+    # True when young collections logged survivor occupancy (so overflow could be assessed)
+    survivor_occupancy_logged: bool = False
+    unified_log: bool = False
+    has_uptime: bool = True
+    is_g1: bool = False
+    # JVM runs (segments) in the window; downtime between runs is not part of the window
+    jvm_run_count: int = 1
+    concurrent_stats: ConcurrentStats | None = None
+    safepoint_stats: SafepointStats | None = None
+    environment: JVMEnvironment | None = None
 
-    # Health warnings ("WARNING:"/"CRITICAL:" prefixed) and data-quality notes, kept apart
+    # Health warnings and data-quality notes, kept apart. ``warnings`` holds the same
+    # warnings as ``health_warnings`` as "WARNING: ..."/"CRITICAL: ..." lines.
+    health_warnings: list[HealthWarning] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     data_notes: list[str] = Field(default_factory=list)

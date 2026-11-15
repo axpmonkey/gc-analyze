@@ -18,15 +18,25 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
-from .analysis import format_duration, max_events_in_window
+from .analysis import (
+    cleaned_floors,
+    describe_floor_step,
+    format_duration,
+    format_mb_per_hour,
+    format_time,
+    max_events_in_window,
+)
 from .coverage import build_unparsed_warning
+from .findings import build_findings
 from .models import (
     GC_KINDS,
     CandidateCoverage,
     FileCoverage,
+    Finding,
     GCEvent,
     GCSummary,
     JVMHeapConfig,
+    PauseShareWindow,
     SegmentInfo,
 )
 
@@ -43,7 +53,7 @@ GC_ANALYZE_THEME = Theme(
 )
 console = Console(theme=GC_ANALYZE_THEME)
 
-SectionKind = Literal["kv", "table", "text", "bullets"]
+SectionKind = Literal["kv", "table", "text", "bullets", "findings"]
 Style = Literal["", "info", "warning", "critical", "success", "header"]
 
 
@@ -59,6 +69,7 @@ class Section:
     table_rows: list[list[str]] = field(default_factory=list[list[str]])
     text: str = ""
     items: list[str] = field(default_factory=list[str])
+    findings: list[Finding] = field(default_factory=list[Finding])
     style: Style = ""
 
 
@@ -97,24 +108,6 @@ def format_kb(kb: float) -> str:
     if mb >= 1024:
         return f"{mb / 1024:.2f} GB"
     return f"{mb:.0f} MB"
-
-
-def _format_bytes_human(size_bytes: int) -> str:
-    """Bytes as '3.0G' (JVM flag style)."""
-    if size_bytes >= 1024**3:
-        return f"{size_bytes / (1024**3):.1f}G"
-    if size_bytes >= 1024**2:
-        return f"{size_bytes / (1024**2):.1f}M"
-    if size_bytes >= 1024:
-        return f"{size_bytes / 1024:.1f}K"
-    return f"{size_bytes}B"
-
-
-def format_time(timestamp: datetime, wall_clock: bool, uptime: float | None) -> str:
-    """Wall-clock ISO time, or JVM uptime when the log has no wall clock."""
-    if wall_clock:
-        return timestamp.isoformat(timespec="milliseconds")
-    return f"uptime {uptime:.3f}s" if uptime is not None else "n/a"
 
 
 def event_time(event: GCEvent) -> str:
@@ -164,6 +157,8 @@ def build_parsing_coverage_rows(
         ("Pause events", str(usable_events)),
         ("Pauses without heap sizes", str(events_without_heap)),
     ]
+    if coverage.truncated_final_record:
+        rows.append(("Unfinished final record (log ends here)", coverage.truncated_final_record))
     rows.extend(("Unparsed sample", sample) for sample in coverage.unparsed_samples)
     return rows
 
@@ -239,63 +234,76 @@ def _interpret_p99_pause(p99_seconds: float) -> str:
     return "1-in-100 pauses this long; within normal range"
 
 
-def build_at_a_glance_rows(summary: GCSummary) -> list[tuple[str, str]]:
-    """Compact headline metrics."""
-    heap = summary.heap
-    basis = "max heap" if heap.max_heap_known else "committed heap"
+def format_pause_share(window: PauseShareWindow) -> str:
+    """'98.7% paused (296 s of 300 s) from 2026-01-07T10:04:55.428+02:00'."""
+    return (
+        f"{window.share_percentage:.1f}% paused ({window.paused_seconds:.1f} s of "
+        f"{window.window_seconds:.0f} s) from "
+        f"{format_time(window.window_start, window.wall_clock, window.uptime_seconds)}"
+    )
+
+
+def _window_name(seconds: float) -> str:
+    return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
+
+
+def _overhead_text(summary: GCSummary) -> str:
+    if not summary.overhead_measured:
+        return "n/a (single pause: no elapsed time to measure against)"
+    return f"{summary.gc_overhead_pct:.2f}% ({_interpret_gc_overhead(summary.gc_overhead_pct)})"
+
+
+def _fullest_cleaned_floor(summary: GCSummary) -> str | None:
+    """Highest occupancy right after a collection that cleans the old generation."""
     trend = summary.floor_trend
-    if trend.assessed and trend.slope_mb_per_hour is not None:
-        floor_text = f"{trend.slope_mb_per_hour:+.1f} MB/h over {trend.span_hours:.1f} h"
+    cleaned = cleaned_floors(trend)
+    if not cleaned:
+        return None
+    fullest = max(cleaned, key=lambda f: f.pct_of_capacity or 0.0)
+    what = "old gen" if trend.metric == "old" else "heap"
+    if trend.capacity_source == "old generation capacity":
+        of = "old generation capacity"
     else:
-        floor_text = f"not assessed: {trend.reason}"
-    return [
-        ("Window", format_duration(summary.runtime_seconds)),
-        ("GC pauses", str(summary.total_event_count)),
-        (
-            "GC overhead (pause time)",
-            f"{summary.gc_overhead_pct:.2f}% ({_interpret_gc_overhead(summary.gc_overhead_pct)})",
-        ),
-        (
-            "P99 STW pause",
-            (
-                f"{summary.overall_pauses.p99:.3f}s "
-                f"({_interpret_p99_pause(summary.overall_pauses.p99)})"
-            ),
-        ),
-        ("Longest pause", format_seconds(summary.overall_pauses.maximum)),
-        (
-            "Heap after GC (peak)",
-            f"{heap.peak_after_gc_pct:.1f}% of {basis}" if heap.events_with_heap_data else "n/a",
-        ),
-        (
-            "Heap-pressure Full GCs",
-            _rate_or_count(summary.heap_full_gc_count, summary.full_gc_per_hour, summary),
-        ),
-        ("Old-gen floor trend", floor_text),
-        (
-            "Leak level",
-            summary.leak_severity.severity_level
-            if summary.leak_severity.assessed
-            else "not assessed",
-        ),
-    ]
+        of = "max heap" if summary.heap.max_heap_known else "committed heap"
+    return (
+        f"{format_kb(fullest.value_kb)} {what} ({fullest.pct_of_capacity:.1f}% of {of}) after "
+        f"{fullest.source} at "
+        f"{format_time(fullest.timestamp, fullest.wall_clock, fullest.uptime_seconds)}"
+    )
 
 
-def build_runtime_overview_rows(summary: GCSummary) -> list[tuple[str, str]]:
-    """Window and pause counts by kind."""
-    rows = [
-        (
-            "Observed window",
-            f"{format_duration(summary.runtime_seconds)} ({summary.runtime_seconds:.0f} seconds)",
-        ),
-        ("Total pauses", str(summary.total_event_count)),
+def build_timeline_table(summary: GCSummary) -> tuple[list[str], list[list[str]]]:
+    """The window in equal slices: where the pauses, Full GCs and heap growth happened."""
+    basis = "max heap" if summary.heap.max_heap_known else "committed heap"
+    headers = [
+        "From",
+        "Pauses",
+        "Time paused",
+        "Longest pause",
+        "Full GCs",
+        f"Heap after last GC (% of {basis})",
     ]
-    rows += [
-        (f"{kind} pauses", str(summary.counts_by_kind[kind]))
-        for kind in GC_KINDS
-        if kind in summary.counts_by_kind
-    ]
-    return rows
+    rows: list[list[str]] = []
+    for bucket in summary.timeline:
+        if bucket.heap_after_kb is None:
+            heap_text = "—"
+        elif bucket.heap_after_percentage is None:
+            heap_text = format_kb(bucket.heap_after_kb)
+        else:
+            heap_text = f"{format_kb(bucket.heap_after_kb)} ({bucket.heap_after_percentage:.1f}%)"
+        rows.append(
+            [
+                format_time(bucket.start, bucket.wall_clock, bucket.uptime_seconds),
+                str(bucket.pause_count),
+                f"{bucket.paused_percentage:.1f}% ({bucket.paused_seconds:.1f} s)"
+                if bucket.paused_seconds
+                else "—",
+                format_seconds(bucket.longest_pause_seconds) if bucket.pause_count else "—",
+                str(bucket.full_gc_count) if bucket.full_gc_count else "—",
+                heap_text,
+            ]
+        )
+    return headers, rows
 
 
 def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
@@ -330,7 +338,12 @@ def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
             ("Time to first heap Full GC", f"{summary.time_to_first_full_gc_hours:.2f} hours")
         )
     if summary.max_full_gc_streak > 1:
-        rows.append(("Most heap Full GCs within 5 min", str(summary.max_full_gc_streak)))
+        rows.append(
+            (
+                "Back-to-back heap Full GCs (next starts within 5 min of the first ending)",
+                str(summary.max_full_gc_streak),
+            )
+        )
     return rows
 
 
@@ -367,11 +380,17 @@ def build_cause_rows(summary: GCSummary) -> tuple[list[str], list[list[str]]]:
 
 def build_overhead_rows(summary: GCSummary) -> list[tuple[str, str]]:
     """Time in GC."""
-    return [
-        ("Total time in GC pauses", f"{summary.total_gc_time_sec:.1f} seconds"),
-        ("GC overhead", f"{summary.gc_overhead_pct:.2f}%"),
-        ("Application throughput", f"{summary.throughput_pct:.2f}%"),
+    rows = [("Total time in GC pauses", f"{summary.total_gc_time_sec:.1f} seconds")]
+    if summary.overhead_measured:
+        rows.append(("GC overhead (whole window)", f"{summary.gc_overhead_pct:.2f}%"))
+        rows.append(("Application throughput (whole window)", f"{summary.throughput_pct:.2f}%"))
+    else:
+        rows.append(("GC overhead", "n/a (single pause: no elapsed time to measure against)"))
+    rows += [
+        (f"Worst {_window_name(w.window_seconds)}", format_pause_share(w))
+        for w in summary.worst_pause_shares
     ]
+    return rows
 
 
 def build_heap_rows(summary: GCSummary) -> list[tuple[str, str]]:
@@ -381,7 +400,7 @@ def build_heap_rows(summary: GCSummary) -> list[tuple[str, str]]:
         return [("Heap data", "not in log")]
     basis = "max heap" if heap.max_heap_known else "committed heap"
     max_text = format_kb(heap.max_heap_kb) if heap.max_heap_kb else "unknown"
-    return [
+    rows = [
         (
             "Max heap",
             f"{max_text} (from {heap.max_heap_source})"
@@ -393,16 +412,19 @@ def build_heap_rows(summary: GCSummary) -> list[tuple[str, str]]:
             f"{format_kb(heap.peak_before_gc_kb)} ({heap.peak_before_gc_pct:.1f}% of {basis})",
         ),
         (
-            "Peak after GC (live set upper bound)",
+            "Peak after GC (any Young/Mixed/Full; still includes old-gen garbage)",
             f"{format_kb(heap.peak_after_gc_kb)} ({heap.peak_after_gc_pct:.1f}% of {basis})",
         ),
         (
-            "Average after GC",
+            "Average after GC (Young/Mixed/Full)",
             f"{format_kb(heap.avg_after_gc_kb)} ({heap.avg_after_gc_pct:.1f}% of {basis})",
         ),
-        ("Headroom after GC", f"{heap.headroom_pct:.1f}%"),
-        ("Pauses with heap sizes", str(heap.events_with_heap_data)),
+        ("Headroom above peak after GC", f"{heap.headroom_pct:.1f}% of {basis}"),
     ]
+    if fullest := _fullest_cleaned_floor(summary):
+        rows.append(("Fullest after old-gen cleanup (live data)", fullest))
+    rows.append(("Pauses with heap sizes", str(heap.events_with_heap_data)))
+    return rows
 
 
 def build_pause_distribution_table(summary: GCSummary) -> tuple[list[str], list[list[str]]]:
@@ -441,9 +463,29 @@ def build_pause_violation_rows(summary: GCSummary) -> list[tuple[str, str]]:
     return rows
 
 
-def build_top_pauses_table(events: list[GCEvent], top_n: int) -> tuple[list[str], list[list[str]]]:
-    """Longest pauses with time, kind, cause and heap."""
-    headers = ["Time", "Pause", "Kind (cause)", "Heap before → after", "Old gen after"]
+def build_top_pauses_table(
+    events: list[GCEvent],
+    top_n: int,
+    old_pct_basis: str = "old generation capacity",
+    old_pct_capacity_kb: int | None = None,
+) -> tuple[list[str], list[list[str]]]:
+    """Longest pauses with time, kind, cause and heap.
+
+    ``old_pct_capacity_kb`` is the fixed old-gen denominator (G1 with a known max heap);
+    without it each event's own old-generation size is used.
+    """
+    # Unified logging stamps a pause when it ends, Java 8 logs when it starts
+    time_header = "Time (pause end)" if any(e.stamp_at_pause_end for e in events) else "Time"
+    headers = [
+        time_header,
+        "Pause",
+        "Kind (cause)",
+        "Heap before → after",
+        f"Old gen after (% of {old_pct_basis})",
+    ]
+    with_cpu = any(e.cpu_real_seconds is not None for e in events)
+    if with_cpu:
+        headers.append("CPU user / sys / real (s)")
     rows: list[list[str]] = []
     for event in heapq.nlargest(top_n, events, key=lambda e: e.pause_time_seconds):
         heap_text = (
@@ -452,18 +494,28 @@ def build_top_pauses_table(events: list[GCEvent], top_n: int) -> tuple[list[str]
             if event.has_heap_data
             else "—"
         )
-        old_text = (
-            f"{event.old_used_percentage:.1f}%" if event.old_used_percentage is not None else "—"
-        )
-        rows.append(
-            [
-                event_time(event),
-                format_seconds(event.pause_time_seconds),
-                describe_pause(event),
-                heap_text,
-                old_text,
-            ]
-        )
+        if old_pct_capacity_kb and event.old_after_kb is not None:
+            old_pct: float | None = min(100.0, event.old_after_kb / old_pct_capacity_kb * 100)
+        else:
+            old_pct = event.old_used_percentage
+        old_text = f"{old_pct:.1f}%" if old_pct is not None else "—"
+        row = [
+            event_time(event),
+            format_seconds(event.pause_time_seconds),
+            describe_pause(event),
+            heap_text,
+            old_text,
+        ]
+        if with_cpu:
+            row.append(
+                f"{event.cpu_user_seconds:.2f} / {event.cpu_sys_seconds:.2f} / "
+                f"{event.cpu_real_seconds:.2f}"
+                if event.cpu_user_seconds is not None
+                and event.cpu_sys_seconds is not None
+                and event.cpu_real_seconds is not None
+                else "—"
+            )
+        rows.append(row)
     return headers, rows
 
 
@@ -476,21 +528,32 @@ def build_floor_rows(summary: GCSummary) -> list[tuple[str, str]]:
         rows.append(
             ("Capacity used for %", f"{format_kb(trend.capacity_kb)} ({trend.capacity_source})")
         )
-    rows.append(("Floors", str(len(trend.floors))))
-    if trend.first_mb is not None and trend.last_mb is not None:
+    used = trend.trend_floors
+    skipped = len(trend.floors) - len(used)
+    rows.append(
+        (
+            "Floors",
+            f"{len(used)} in the trend, {skipped} from JVM start-up left out"
+            if skipped
+            else str(len(used)),
+        )
+    )
+    if used:
         rows.append(
             (
                 "First → last floor",
-                f"{format_kb(trend.floors[0].value_kb)} → {format_kb(trend.floors[-1].value_kb)}",
+                f"{format_kb(used[0].value_kb)} → {format_kb(used[-1].value_kb)}",
             )
         )
+    if trend.step_change is not None:
+        rows.append(("⚠ Step change", describe_floor_step(trend)))
     if trend.assessed and trend.slope_mb_per_hour is not None:
         pct = (
             f" ({trend.slope_pct_per_hour:+.2f}% of capacity/h)"
             if trend.slope_pct_per_hour is not None
             else ""
         )
-        rows.append(("Slope", f"{trend.slope_mb_per_hour:+.1f} MB/h{pct}"))
+        rows.append(("Slope", f"{format_mb_per_hour(trend.slope_mb_per_hour)}{pct}"))
         rows.append(("Fit (r²)", f"{trend.r_squared:.2f}"))
         rows.append(("Span", f"{trend.span_hours:.1f} h"))
     else:
@@ -508,7 +571,7 @@ def build_floor_table(summary: GCSummary, limit: int = 30) -> tuple[list[str], l
     rows = [
         [
             format_time(f.timestamp, f.wall_clock, f.uptime_seconds),
-            f.source,
+            f"{f.source} (start-up, not in trend)" if f.warmup else f.source,
             format_kb(f.value_kb),
             f"{f.pct_of_capacity:.1f}%" if f.pct_of_capacity is not None else "—",
         ]
@@ -520,16 +583,39 @@ def build_floor_table(summary: GCSummary, limit: int = 30) -> tuple[list[str], l
 def build_old_gen_rows(summary: GCSummary) -> list[tuple[str, str]]:
     """Old-gen occupancy (sawtooth) and Full GC effectiveness."""
     rows: list[tuple[str, str]] = []
+    basis = summary.old_pct_basis
     if summary.peak_old_pct is not None and summary.avg_old_pct is not None:
-        rows.append(("Peak old gen after GC", f"{summary.peak_old_pct:.1f}%"))
-        rows.append(("Average old gen after GC", f"{summary.avg_old_pct:.1f}%"))
+        rows.append(("Peak old gen after any pause", f"{summary.peak_old_pct:.1f}% of {basis}"))
+        rows.append(("Average old gen after any pause", f"{summary.avg_old_pct:.1f}% of {basis}"))
     if summary.full_gc_count:
-        rows.append(("Avg reclaimed per Full GC", format_kb(summary.avg_reclaimed_kb)))
+        reclaimed = format_kb(summary.avg_reclaimed_kb)
+        if summary.avg_full_gc_reclaimed_pct is not None:
+            reclaimed += f" ({summary.avg_full_gc_reclaimed_pct:.1f}% of the heap before it)"
+        rows.append(("Avg heap freed per Full GC", reclaimed))
         rows.append(
-            ("Full GCs reducing old gen", f"{summary.full_gc_reducing}/{summary.full_gc_count}")
+            ("Full GCs that freed heap", f"{summary.full_gc_reducing}/{summary.full_gc_count}")
         )
+        if summary.heap_full_gc_reclaimed_pcts:
+            shown = summary.heap_full_gc_reclaimed_pcts[-12:]
+            earlier = len(summary.heap_full_gc_reclaimed_pcts) - len(shown)
+            rows.append(
+                (
+                    "Heap freed by each heap-pressure Full GC, in time order",
+                    (f"(first {earlier} omitted) " if earlier else "")
+                    + ", ".join(f"{pct:.1f}%" for pct in shown),
+                )
+            )
+        if summary.ineffective_full_gc_count:
+            rows.append(
+                (
+                    "⚠ Heap-pressure Full GCs that freed < 20% and left it > 80% full",
+                    f"{summary.ineffective_full_gc_count}/{summary.heap_full_gc_count}",
+                )
+            )
         if summary.avg_post_full_gc_pct is not None:
-            rows.append(("Avg old gen after Full GC", f"{summary.avg_post_full_gc_pct:.1f}%"))
+            rows.append(
+                ("Avg old gen after Full GC", f"{summary.avg_post_full_gc_pct:.1f}% of {basis}")
+            )
         if summary.reclamation_declining:
             rows.append(("⚠ Reclamation declining over time", "yes"))
     return rows
@@ -537,7 +623,7 @@ def build_old_gen_rows(summary: GCSummary) -> list[tuple[str, str]]:
 
 def build_trend_table(summary: GCSummary) -> tuple[list[str], list[list[str]]]:
     """Early / middle / late thirds of the window."""
-    headers = ["Period", "Avg old gen after GC", "Full GCs"]
+    headers = ["Period", f"Avg old gen after any pause (% of {summary.old_pct_basis})", "Full GCs"]
     rows: list[list[str]] = []
     for name in ("early", "middle", "late"):
         if period := summary.period_stats.get(name):
@@ -558,8 +644,113 @@ def build_allocation_rows(summary: GCSummary) -> list[tuple[str, str]]:
                 f"{summary.allocation_rate_mb_sec:.2f} MB/s ({summary.allocation_basis})",
             )
         )
-    if summary.avg_promotion_kb:
+    if summary.total_promoted_kb:
         rows.append(("Average promotion per young GC", format_kb(summary.avg_promotion_kb)))
+        promoted = format_kb(summary.total_promoted_kb)
+        if summary.promotion_rate_mb_sec is not None:
+            promoted += f" ({summary.promotion_rate_mb_sec:.2f} MB/s)"
+        rows.append(("Promoted to old gen by young GCs, total", promoted))
+    return rows
+
+
+def build_environment_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """JVM version and host facts from the log header."""
+    env = summary.environment
+    if not env:
+        return []
+    rows: list[tuple[str, str]] = []
+    if env.jvm_version:
+        rows.append(("JVM", env.jvm_version))
+    if env.cpus_total is not None:
+        rows.append(("CPUs", f"{env.cpus_total} total, {env.cpus_available} available to the JVM"))
+    if env.physical_memory_kb:
+        memory = format_kb(env.physical_memory_kb)
+        if env.free_memory_kb is not None:
+            memory += f" ({format_kb(env.free_memory_kb)} free at JVM start)"
+        rows.append(("Physical memory", memory))
+        heap = summary.heap
+        if heap.max_heap_known and heap.max_heap_kb:
+            share = heap.max_heap_kb / env.physical_memory_kb * 100
+            rows.append(("Max heap as share of physical memory", f"{share:.0f}%"))
+    if env.swap_total_kb is not None and env.swap_free_kb is not None:
+        rows.append(
+            (
+                "Swap",
+                f"{format_kb(env.swap_total_kb)} ({format_kb(env.swap_free_kb)} free at JVM start)"
+                if env.swap_total_kb
+                else "none configured",
+            )
+        )
+    if env.large_pages:
+        rows.append(("Large pages", env.large_pages))
+    if env.pre_touch:
+        rows.append(("Pre-touch", env.pre_touch))
+    return rows
+
+
+def build_cpu_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Where pause time went: user (collecting), sys (kernel), or waiting."""
+    cpu = summary.cpu_stats
+    if not cpu:
+        return []
+    rows = [
+        ("Pauses with CPU times", str(cpu.pauses_with_cpu_times)),
+        ("Pauses judged (real ≥ 0.1 s)", str(cpu.judged_pauses)),
+        ("High kernel time (sys > 20% of user)", str(cpu.high_sys_count)),
+    ]
+    if cpu.worst_high_sys:
+        rows.append(("Worst kernel time", cpu.worst_high_sys))
+    rows.append(("Waiting, not working (real > 1.5 x user+sys)", str(cpu.off_cpu_count)))
+    if cpu.worst_off_cpu:
+        rows.append(("Worst wait", cpu.worst_off_cpu))
+    return rows
+
+
+def build_concurrent_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Collector work done alongside the application."""
+    stats = summary.concurrent_stats
+    if not stats:
+        return []
+    share = (
+        f" ({stats.share_percentage:.1f}% of the window)"
+        if stats.share_percentage is not None
+        else ""
+    )
+    rows = [
+        ("Measured", stats.label),
+        ("Count", str(stats.cycles)),
+        ("Total time", f"{format_duration(stats.total_seconds)}{share}"),
+        ("Average / longest", f"{stats.average_seconds:.1f} s / {stats.longest_seconds:.1f} s"),
+    ]
+    if stats.cycles > 1 and summary.runtime_seconds:
+        rows.append(("One every", format_duration(summary.runtime_seconds / stats.cycles)))
+    rows.append(("Note", "runs on GC threads while the application runs; not in pause overhead"))
+    return rows
+
+
+def build_safepoint_rows(summary: GCSummary) -> list[tuple[str, str]]:
+    """Application-stopped time from safepoint logging."""
+    stats = summary.safepoint_stats
+    if not stats:
+        return []
+    rows = [
+        ("Safepoints logged", str(stats.count)),
+        ("Total time application stopped", format_seconds(stats.total_stopped_seconds)),
+        ("Of which GC pauses", format_seconds(summary.total_gc_time_sec)),
+        (
+            "Longest stop",
+            f"{format_seconds(stats.longest_stopped_seconds)} at {stats.longest_stopped_when}",
+        ),
+    ]
+    if stats.longest_stopping_seconds:
+        rows.append(
+            (
+                "Longest time to stop the threads",
+                f"{format_seconds(stats.longest_stopping_seconds)} at "
+                f"{stats.longest_stopping_when}",
+            )
+        )
+    rows.append(("Safepoints taking ≥ 1 s to stop the threads", str(stats.slow_to_stop_count)))
     return rows
 
 
@@ -611,10 +802,33 @@ def build_metaspace_rows(summary: GCSummary) -> list[tuple[str, str]]:
     meta = summary.metaspace_analysis
     if not meta:
         return []
-    rows = [
-        ("Peak metaspace usage", f"{meta.peak_metaspace_used_percentage:.1f}%"),
-        ("Metaspace growth", f"{meta.metaspace_growth_kb // 1024} MB"),
-    ]
+    rows: list[tuple[str, str]] = []
+    if meta.metaspace_events_count:
+        rows.append(
+            (
+                "Metaspace used (first → peak → last)",
+                f"{format_kb(meta.first_used_kb)} → {format_kb(meta.peak_used_kb)} → "
+                f"{format_kb(meta.last_used_kb)}",
+            )
+        )
+        if meta.limit_known and meta.max_metaspace_kb:
+            rows.append(
+                (
+                    "Peak as % of -XX:MaxMetaspaceSize",
+                    f"{meta.peak_metaspace_used_percentage:.1f}% of "
+                    f"{format_kb(meta.max_metaspace_kb)}",
+                )
+            )
+        else:
+            rows.append(("Limit (-XX:MaxMetaspaceSize)", "not set in the log: no % shown"))
+        rows.append(
+            (
+                "Growth after warm-up",
+                f"{meta.metaspace_growth_kb / 1024:+.0f} MB"
+                if meta.growth_measured
+                else "n/a (no samples after warm-up)",
+            )
+        )
     if meta.metadata_full_gc_count:
         rows.append(("Full GCs triggered by metaspace", str(meta.metadata_full_gc_count)))
     return rows
@@ -681,14 +895,16 @@ def build_comparison_table(
 def describe_floor_trend(summary: GCSummary) -> str:
     """One sentence on the live-set trend."""
     trend = summary.floor_trend
-    if not trend.floors:
+    floors = trend.trend_floors
+    if not floors:
         return f"Live set: not assessed: {trend.reason}."
     what = "Old-gen" if trend.metric == "old" else "Heap"
-    first_last = f"{format_kb(trend.floors[0].value_kb)} → {format_kb(trend.floors[-1].value_kb)}"
+    first_last = f"{format_kb(floors[0].value_kb)} → {format_kb(floors[-1].value_kb)}"
+    step = f" {describe_floor_step(trend)}." if trend.step_change is not None else ""
     if not trend.assessed or trend.slope_mb_per_hour is None:
         return (
-            f"Live set: {what} floor {first_last} over {len(trend.floors)} floor(s); trend not "
-            f"assessed: {trend.reason}."
+            f"Live set: {what} floor {first_last} over {len(floors)} floor(s); trend not "
+            f"assessed: {trend.reason}.{step}"
         )
     r2 = trend.r_squared or 0.0
     if r2 < 0.5:
@@ -699,8 +915,8 @@ def describe_floor_trend(summary: GCSummary) -> str:
         direction = "falling or flat"
     return (
         f"Live set: {what} floor {first_last}; {direction}, slope "
-        f"{trend.slope_mb_per_hour:+.1f} MB/h (r²={r2:.2f}) over {len(trend.floors)} floors "
-        f"in {trend.span_hours:.1f} h."
+        f"{format_mb_per_hour(trend.slope_mb_per_hour)} (r²={r2:.2f}) over {len(floors)} floors "
+        f"in {trend.span_hours:.1f} h.{step}"
     )
 
 
@@ -739,65 +955,104 @@ def describe_pause_clustering(events: list[GCEvent], top_n: int = 5, window_s: f
     return ""  # pragma: no cover
 
 
-def build_incident_summary(ctx: ReportContext) -> list[str]:
-    """Top-of-report summary for a troubleshooting session (P2.3)."""
-    summary = ctx.summary
-    lines: list[str] = []
-    if summary.first_timestamp and summary.last_timestamp and ctx.events:
-        first, last = ctx.events[0], ctx.events[-1]
-        lines.append(
-            f"Window: {event_time(first)} to {event_time(last)} "
-            f"({format_duration(summary.runtime_seconds)}), {summary.total_event_count} pauses, "
-            f"{summary.total_gc_time_sec:.1f} s in GC ({summary.gc_overhead_pct:.2f}% overhead)."
-        )
-    top = heapq.nlargest(5, ctx.events, key=lambda e: e.pause_time_seconds)
-    if top:
-        lines.append("Worst pauses:")
-        lines += [
-            f"  {format_seconds(e.pause_time_seconds):>14}  {event_time(e)}  {describe_pause(e)}"
-            for e in top
-        ]
-    if clustering := describe_pause_clustering(ctx.events):
-        lines.append(clustering)
-    lines.append(describe_floor_trend(summary))
-    if summary.full_gc_causes:
-        parts = [f"{c.count} {c.cause}" for c in summary.full_gc_causes]
-        lines.append(f"Full GCs: {summary.full_gc_count} ({', '.join(parts)}).")
-    else:
-        lines.append("Full GCs: none.")
-    cov = ctx.coverage
-    if cov.unparsed_candidate_lines:
-        lines.append(
-            f"Data quality: {cov.unparsed_candidate_lines} of {cov.candidate_lines} GC lines "
-            f"({cov.unparsed_percentage:.1f}%) NOT parsed - see Parsing Coverage."
-        )
-    else:
-        lines.append(f"Data quality: all {cov.candidate_lines} GC lines parsed.")
-    return lines
-
-
-def determine_quick_diagnosis(summary: GCSummary) -> str:
-    """Two lines: GC health and leak risk."""
-    critical = sum(1 for w in summary.warnings if w.startswith("CRITICAL"))
-    warning = sum(1 for w in summary.warnings if w.startswith("WARNING"))
-    if critical:
-        health = "🔴 GC HEALTH: Critical issues detected"
-    elif warning:
-        health = "🟡 GC HEALTH: Degraded; review warnings"
-    else:
-        health = "✅ GC HEALTH: Stable"
+def describe_leak_risk(summary: GCSummary) -> str:
+    """Leak level in words, saying when it could not be assessed."""
     leak = summary.leak_severity
     if not leak.assessed:
-        leak_line = "⚪ LEAK RISK: Not assessed (no post-collection floors)"
-    elif leak.severity_level in ("Critical", "High"):
-        leak_line = f"🔴 LEAK RISK: {leak.severity_level} (score {leak.score:.0f}/100)"
-    elif leak.severity_level in ("Medium", "Low"):
-        leak_line = f"🟡 LEAK RISK: {leak.severity_level} (score {leak.score:.0f}/100)"
-    elif not summary.floor_trend.assessed:
-        leak_line = "⚪ LEAK RISK: No signal, but floor trend not assessed (see Data Notes)"
+        return "not assessed (no post-collection floors)"
+    if leak.severity_level != "None":
+        return f"{leak.severity_level} (score {leak.score:.0f}/100)"
+    if not summary.floor_trend.assessed:
+        return "no signal, but the floor trend could not be assessed (see Data Notes)"
+    return "none detected"
+
+
+def describe_data_quality(coverage: CandidateCoverage) -> str:
+    """How much of the log was understood."""
+    if coverage.unparsed_candidate_lines == 1 and coverage.truncated_final_record:
+        return (
+            f"all {coverage.parsed_candidate_lines} complete GC records parsed; only the "
+            "unfinished final record was not"
+        )
+    if coverage.unparsed_candidate_lines:
+        return (
+            f"{coverage.unparsed_candidate_lines} of {coverage.candidate_lines} GC lines "
+            f"({coverage.unparsed_percentage:.1f}%) NOT parsed - see Parsing Coverage"
+        )
+    return f"all {coverage.candidate_lines} GC lines parsed"
+
+
+def build_summary_rows(ctx: ReportContext) -> list[tuple[str, str]]:
+    """The one summary of the run: status, window, pauses, heap, live set, data quality."""
+    summary = ctx.summary
+    heap = summary.heap
+    basis = "max heap" if heap.max_heap_known else "committed heap"
+    rows: list[tuple[str, str]] = [
+        ("Status", determine_overall_status(summary)[0]),
+        ("Leak risk", describe_leak_risk(summary)),
+    ]
+    if ctx.events:
+        first, last = ctx.events[0], ctx.events[-1]
+        # with --start/--end the requested bounds are the window, not the first/last pause
+        span = (
+            ctx.window_label.removeprefix("window ")
+            if ctx.window_label
+            else f"{event_time(first)} to {event_time(last)}"
+        )
+        rows.append(("Window", f"{span} ({format_duration(summary.runtime_seconds)})"))
+    kinds = ", ".join(
+        f"{summary.counts_by_kind[kind]} {kind}"
+        for kind in GC_KINDS
+        if kind in summary.counts_by_kind
+    )
+    rows.append(("Pauses", f"{summary.total_event_count} ({kinds})"))
+    rows.append(
+        (
+            "Time in GC pauses",
+            f"{summary.total_gc_time_sec:.1f} s; overhead over the whole window "
+            f"{_overhead_text(summary)}",
+        )
+    )
+    worst = next((w for w in summary.worst_pause_shares if w.window_seconds == 300.0), None)
+    if worst is not None:
+        rows.append(("Worst 5 minutes", format_pause_share(worst)))
+    rows.append(
+        (
+            "P99 / longest pause",
+            f"{summary.overall_pauses.p99:.3f}s "
+            f"({_interpret_p99_pause(summary.overall_pauses.p99)}) / "
+            f"{format_seconds(summary.overall_pauses.maximum)}",
+        )
+    )
+    if clustering := describe_pause_clustering(ctx.events):
+        rows.append(("Longest pauses", clustering))
+    rows.append(
+        (
+            "Heap after GC (peak, any Young/Mixed/Full)",
+            f"{heap.peak_after_gc_pct:.1f}% of {basis}" if heap.events_with_heap_data else "n/a",
+        )
+    )
+    rows.append(
+        (
+            "Fullest after old-gen cleanup",
+            _fullest_cleaned_floor(summary)
+            or "n/a (no Full GC or completed mixed cycle in the window)",
+        )
+    )
+    if summary.full_gc_causes:
+        causes = ", ".join(f"{c.count} {c.cause}" for c in summary.full_gc_causes)
+        rows.append(("Full GCs", f"{summary.full_gc_count} ({causes})"))
     else:
-        leak_line = "🟢 LEAK RISK: None detected"
-    return f"{health}\n{leak_line}"
+        rows.append(("Full GCs", "none"))
+    rows.append(
+        (
+            "Heap-pressure Full GCs",
+            _rate_or_count(summary.heap_full_gc_count, summary.full_gc_per_hour, summary),
+        )
+    )
+    rows.append(("Live set", describe_floor_trend(summary).removeprefix("Live set: ")))
+    rows.append(("Data quality", describe_data_quality(ctx.coverage)))
+    return rows
 
 
 def determine_overall_status(summary: GCSummary) -> tuple[str, Style]:
@@ -811,115 +1066,6 @@ def determine_overall_status(summary: GCSummary) -> tuple[str, Style]:
     if warning:
         return "⚠ DEGRADED - MONITORING REQUIRED", "warning"
     return "✓ STABLE", "success"
-
-
-def build_evidence_based_recommendations(summary: GCSummary, gc_type: str = "") -> list[str]:
-    """Recommendations tied to observed metrics and the JVM's own flags."""
-    recs: list[str] = []
-    config = summary.jvm_heap_config
-    xmx = (
-        _format_bytes_human(config.max_heap_size_bytes)
-        if config and config.max_heap_size_bytes
-        else None
-    )
-    trend = summary.floor_trend
-
-    if trend.assessed and (trend.slope_mb_per_hour or 0) > 0 and (trend.r_squared or 0) >= 0.5:
-        recs.append(
-            "Old-gen floor is rising; take two heap dumps hours apart (jcmd <pid> GC.heap_dump) "
-            "and compare retained sizes to find what is growing"
-        )
-    if summary.avg_post_full_gc_pct is not None and summary.avg_post_full_gc_pct > 80:
-        rec = (
-            f"Old gen stays {summary.avg_post_full_gc_pct:.0f}% full after Full GC; the live set "
-            "nearly fills it"
-        )
-        if xmx:
-            rec += f". Current -Xmx is {xmx}; raise it only after ruling out a leak"
-        recs.append(rec)
-    if summary.explicit_full_gc_count:
-        rec = (
-            f"{summary.explicit_full_gc_count} explicit Full GC(s): if they come from RMI "
-            "distributed GC (hourly in Tomcat), raise -Dsun.rmi.dgc.server.gcInterval and "
-            "-Dsun.rmi.dgc.client.gcInterval"
-        )
-        if "G1" in gc_type or "CMS" in gc_type:
-            rec += " or add -XX:+ExplicitGCInvokesConcurrent so System.gc() runs concurrently"
-        recs.append(rec)
-    if summary.metadata_full_gc_count:
-        rec = "Metaspace is triggering Full GCs; raise -XX:MetaspaceSize (the first GC threshold)"
-        if config and config.metaspace_size_bytes:
-            rec += f" (currently {_format_bytes_human(config.metaspace_size_bytes)})"
-        recs.append(rec)
-    if summary.cms_metrics and (
-        summary.cms_metrics.concurrent_mode_failures or summary.cms_metrics.promotion_failures
-    ):
-        rec = (
-            "CMS failures: start cycles earlier with a lower -XX:CMSInitiatingOccupancyFraction "
-            "and -XX:+UseCMSInitiatingOccupancyOnly, or give the old gen more room"
-        )
-        if config and config.cms_initiating_occupancy_fraction is not None:
-            rec += f" (current fraction {config.cms_initiating_occupancy_fraction}%)"
-        recs.append(rec)
-    if summary.g1_metrics and summary.g1_metrics.evacuation_failure_count:
-        rec = (
-            "G1 evacuation failures: increase -XX:G1ReservePercent or the heap, or lower "
-            "-XX:InitiatingHeapOccupancyPercent to start marking earlier"
-        )
-        if config and config.initiating_heap_occupancy_percent is not None:
-            rec += f" (IHOP currently {config.initiating_heap_occupancy_percent}%)"
-        recs.append(rec)
-    if (
-        summary.g1_metrics
-        and summary.g1_metrics.humongous_allocation_count > summary.total_event_count * 0.05
-    ):
-        rec = (
-            f"{summary.g1_metrics.humongous_allocation_count} pauses were triggered by "
-            "humongous allocations (objects ≥ half a G1 region)"
-        )
-        if config and config.g1_heap_region_size_bytes:
-            rec += (
-                "; current "
-                f"-XX:G1HeapRegionSize={_format_bytes_human(config.g1_heap_region_size_bytes)}, "
-                "consider a larger region"
-            )
-        else:
-            rec += "; consider a larger -XX:G1HeapRegionSize"
-        recs.append(rec)
-    if summary.gc_overhead_pct > 10:
-        recs.append(
-            f"GC overhead {summary.gc_overhead_pct:.1f}%: reduce allocation rate or resize the "
-            "heap/young gen"
-        )
-    if summary.overall_pauses.p99 > 5:
-        recs.append(
-            "P99 pause above 5s: look at the Worst pauses list for the kind and cause to tune"
-        )
-    if summary.max_full_gc_streak >= 3:
-        recs.append(
-            "Back-to-back heap Full GCs: the heap is nearly full of live data; "
-            "capture a heap dump now"
-        )
-    heap = summary.heap
-    if heap.events_with_heap_data and heap.max_heap_known and heap.headroom_pct < 10:
-        rec = f"Only {heap.headroom_pct:.1f}% headroom after GC against max heap"
-        if xmx and config and config.max_heap_size_bytes:
-            rec += (
-                f"; current -Xmx {xmx}, consider "
-                f"{_format_bytes_human(int(config.max_heap_size_bytes * 1.25))} after leak triage"
-            )
-        recs.append(rec)
-    if (
-        summary.metaspace_analysis
-        and summary.metaspace_analysis.peak_metaspace_used_percentage > 90
-    ):
-        recs.append("Metaspace above 90%: check for classloader leaks or raise MaxMetaspaceSize")
-    if summary.allocation_rate_mb_sec and summary.allocation_rate_mb_sec > 500:
-        recs.append(
-            f"High allocation rate ({summary.allocation_rate_mb_sec:.0f} MB/s): profile "
-            "allocation hotspots"
-        )
-    return recs
 
 
 # ============================================================
@@ -956,22 +1102,55 @@ def build_sections(ctx: ReportContext) -> list[Section]:
                 id="unparsed", title="Incomplete Parse", kind="text", text=warning, style="warning"
             )
         )
+
+    # 1. What is wrong, ranked, with evidence and action
+    status_style = determine_overall_status(s)[1]
+    findings = build_findings(s, ctx.gc_type, ctx.events, ctx.coverage)
     out.append(
         Section(
-            id="incident",
-            title="Incident Summary",
-            kind="text",
-            text="\n".join(build_incident_summary(ctx)),
-            style="info",
+            id="findings",
+            title="Findings",
+            kind="findings",
+            findings=findings,
+            text="No problems found in this window.",
+            style=status_style,
         )
     )
+    # 2. The run in one block
+    out.append(
+        Section(
+            id="summary",
+            title="Summary",
+            kind="kv",
+            rows=build_summary_rows(ctx),
+            style=status_style,
+        )
+    )
+    # 3. When it happened
+    if s.timeline:
+        out.append(
+            _table(
+                "timeline",
+                f"Timeline ({format_duration(s.timeline_bucket_seconds)} slices)",
+                build_timeline_table(s),
+            )
+        )
+    if ctx.comparison is not None:
+        out.append(
+            _table(
+                "comparison",
+                f"Compared with {ctx.comparison_label}",
+                build_comparison_table(s, ctx.comparison),
+            )
+        )
+
+    # 4. How far the data can be trusted
     if s.data_notes:
         out.append(
             Section(
                 id="notes", title="Data Notes", kind="bullets", items=s.data_notes, style="info"
             )
         )
-
     without_heap = s.total_event_count - s.heap.events_with_heap_data
     out.append(
         _kv(
@@ -1005,14 +1184,10 @@ def build_sections(ctx: ReportContext) -> list[Section]:
                 ),
             )
         )
-    if ctx.comparison is not None:
-        out.append(
-            _table(
-                "comparison",
-                f"Compared with {ctx.comparison_label}",
-                build_comparison_table(s, ctx.comparison),
-            )
-        )
+
+    # 5. Details
+    if environment := build_environment_rows(s):
+        out.append(_kv("environment", "JVM & Host", environment))
     if s.jvm_heap_config:
         out.append(
             _kv(
@@ -1021,18 +1196,6 @@ def build_sections(ctx: ReportContext) -> list[Section]:
                 build_jvm_config_rows(s.jvm_heap_config),
             )
         )
-
-    out.append(
-        Section(
-            id="diagnosis",
-            title="Quick Diagnosis",
-            kind="text",
-            text=determine_quick_diagnosis(s),
-            style=_diagnosis_style(s),
-        )
-    )
-    out.append(_kv("glance", "At-a-Glance", build_at_a_glance_rows(s)))
-    out.append(_kv("overview", "JVM Runtime Overview", build_runtime_overview_rows(s)))
     out.append(_kv("frequency", "GC Frequency", build_frequency_rows(s)))
     if s.full_gc_causes:
         out.append(_table("full_gc_causes", "Full GC Causes", build_full_gc_cause_table(s)))
@@ -1043,10 +1206,10 @@ def build_sections(ctx: ReportContext) -> list[Section]:
     if violations := build_pause_violation_rows(s):
         out.append(_kv("violations", "Pause Threshold Violations", violations))
     if ctx.events:
-        top = build_top_pauses_table(ctx.events, 10)
+        top = build_top_pauses_table(ctx.events, 10, s.old_pct_basis, s.old_pct_capacity_kb)
         out.append(_table("top_pauses", f"Top {len(top[1])} Longest Pauses", top))
 
-    out.append(_kv("floor", "Old-Gen Floor Trend (leak signal)", build_floor_rows(s)))
+    out.append(_kv("floor", "Old-Gen Floor Trend (live-set growth)", build_floor_rows(s)))
     if s.floor_trend.floors:
         out.append(
             _table("floors", "Floors (occupancy after cleaning collections)", build_floor_table(s))
@@ -1061,6 +1224,12 @@ def build_sections(ctx: ReportContext) -> list[Section]:
         out.append(_kv("g1", "G1 GC Metrics", build_g1_rows(s)))
     if s.cms_metrics:
         out.append(_kv("cms", "CMS GC Metrics", build_cms_rows(s)))
+    if concurrent := build_concurrent_rows(s):
+        out.append(_kv("concurrent", "Concurrent GC Work", concurrent))
+    if cpu := build_cpu_rows(s):
+        out.append(_kv("cpu", "GC CPU Time", cpu))
+    if safepoints := build_safepoint_rows(s):
+        out.append(_kv("safepoints", "Safepoints (application stopped time)", safepoints))
     if s.metaspace_analysis:
         out.append(_kv("metaspace", "Metaspace", build_metaspace_rows(s)))
 
@@ -1080,37 +1249,7 @@ def build_sections(ctx: ReportContext) -> list[Section]:
             style=_leak_style(s),
         )
     )
-    if recs := build_evidence_based_recommendations(s, ctx.gc_type):
-        out.append(
-            Section(
-                id="recommendations",
-                title="Evidence-Based Recommendations",
-                kind="bullets",
-                items=recs,
-                style="info",
-            )
-        )
-    if s.warnings:
-        style: Style = (
-            "critical" if any(w.startswith("CRITICAL") for w in s.warnings) else "warning"
-        )
-        out.append(
-            Section(id="warnings", title="Warnings", kind="bullets", items=s.warnings, style=style)
-        )
-    status, status_style = determine_overall_status(s)
-    out.append(
-        Section(id="status", title="Overall Status", kind="text", text=status, style=status_style)
-    )
     return out
-
-
-def _diagnosis_style(summary: GCSummary) -> Style:
-    text = determine_quick_diagnosis(summary)
-    if "🔴" in text:
-        return "critical"
-    if "🟡" in text:
-        return "warning"
-    return "success"
 
 
 def _leak_style(summary: GCSummary) -> Style:
@@ -1134,6 +1273,20 @@ _BORDER = {
     "success": "green",
     "header": "magenta",
 }
+
+
+def finding_lines(finding: Finding) -> list[tuple[str, str]]:
+    """The labelled lines under a finding's title (shared by terminal and Markdown)."""
+    lines: list[tuple[str, str]] = []
+    if finding.when:
+        lines.append(("When", finding.when))
+    lines += [("Evidence", item) for item in finding.evidence]
+    lines.append(("Confidence", finding.confidence))
+    if finding.action:
+        lines.append(("Action", finding.action))
+    if finding.source:
+        lines.append(("Reference", finding.source))
+    return lines
 
 
 def _rich_section(section: Section) -> Panel | Table:
@@ -1165,6 +1318,19 @@ def _rich_section(section: Section) -> Panel | Table:
             text.append("• ", style=item_style)
             text.append(item + ("\n" if index < len(section.items) - 1 else ""), style=item_style)
         return Panel(text, title=section.title, border_style=_BORDER[section.style])
+    if section.kind == "findings":
+        text = Text()
+        if not section.findings:
+            text.append(section.text, style="success")
+        for number, finding in enumerate(section.findings, 1):
+            style = "info" if finding.severity == "info" else finding.severity
+            text.append(f"{number}. [{finding.severity.upper()}] {finding.title}\n", style=style)
+            for label, value in finding_lines(finding):
+                text.append(f"   {label}: ", style="label")
+                text.append(f"{value}\n", style="metric")
+            if number < len(section.findings):
+                text.append("\n")
+        return Panel(text, title=section.title, border_style=_BORDER[section.style])
     if section.id == "header":
         return Panel(Text(f"GC Type: {section.text}"), style="header", expand=True)
     return Panel(
@@ -1195,7 +1361,15 @@ def build_jvm_config_rows(config: JVMHeapConfig) -> list[tuple[str, str]]:
     if config.max_heap_size_bytes:
         rows.append(("Maximum Heap Size (-Xmx)", config.format_size(config.max_heap_size_bytes)))
     if config.new_size_bytes:
-        rows.append(("New Generation Size (-Xmn)", config.format_size(config.new_size_bytes)))
+        # -XX:NewSize alone is only the starting/minimum size; the young generation is fixed
+        # (what -Xmn sets) only when MaxNewSize equals it.
+        fixed = config.max_new_size_bytes == config.new_size_bytes
+        label = (
+            "New Generation Size (-Xmn)"
+            if fixed
+            else "New Generation Size, initial/minimum only (-XX:NewSize)"
+        )
+        rows.append((label, config.format_size(config.new_size_bytes)))
     if config.max_new_size_bytes:
         rows.append(("Max New Generation Size", config.format_size(config.max_new_size_bytes)))
     if config.old_size_bytes:

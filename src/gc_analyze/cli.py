@@ -19,7 +19,7 @@ from .models import DiagnosticThresholds, GCSummary
 from .pipeline import NoEventsError, parse_time_option, run_analysis
 from .report import ReportContext, build_sections, console, render_rich
 
-__version__ = "4.0.0"
+__version__ = "5.0.0"
 
 app = typer.Typer(
     name="gc-analyze",
@@ -113,7 +113,7 @@ def analyze(
         int,
         typer.Option(
             "--full-gc-streak",
-            help="Heap-pressure Full GCs within 5 minutes that count as thrashing",
+            help="Back-to-back heap-pressure Full GCs (within 5 minutes) that count as thrashing",
             min=2,
         ),
     ] = 3,

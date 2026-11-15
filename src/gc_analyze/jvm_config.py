@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .models import JVMHeapConfig
+from .models import JVMEnvironment, JVMHeapConfig
 
 
 def parse_jvm_size_to_bytes(value: str, unit: str | None) -> int:
@@ -210,3 +210,53 @@ def parse_size_argument(text: str) -> int:
     if match is None:
         raise ValueError(f"not a size: {text!r} (use e.g. 4g, 3072m)")
     return int(float(match.group("value")) * _UNIT_BYTES[match.group("unit").upper()])
+
+
+# Java 8 header:
+#   "OpenJDK 64-Bit Server VM (25.202-b08) for linux-amd64 JRE (1.8.0_202-b08), built on ..."
+#   "Memory: 4k page, physical 16000000k(8000000k free), swap 2000000k(2000000k free)"
+_LEGACY_VERSION = re.compile(
+    r"^(?P<vm>.*\bVM) \((?P<build>[^)]+)\) for (?P<platform>\S+) JRE \((?P<jre>[^)]+)\)"
+)
+_LEGACY_MEMORY = re.compile(
+    r"^Memory: \d+k page, physical (?P<physical>\d+)k\((?P<free>\d+)k free\)"
+    r"(?:, swap (?P<swap>\d+)k\((?P<swap_free>\d+)k free\))?"
+)
+# JDK 17+ "[gc,init]" lines
+_INIT_VERSION = re.compile(r"\] Version: (?P<version>.+?)\s*$")
+_INIT_CPUS = re.compile(r"\] CPUs: (?P<total>\d+) total, (?P<available>\d+) available")
+_INIT_MEMORY = re.compile(r"\] Memory: (?P<value>\d+)(?P<unit>[KMGT])\b")
+_INIT_LARGE_PAGES = re.compile(r"\] Large Page Support: (?P<value>.+?)\s*$")
+_INIT_PRE_TOUCH = re.compile(r"\] Pre-touch: (?P<value>.+?)\s*$")
+ENVIRONMENT_HEADER_LINES = 400
+
+
+def parse_jvm_environment(log_lines: list[str]) -> JVMEnvironment | None:
+    """JVM version and host memory/CPU facts from the log header, if it has any."""
+    found: dict[str, Any] = {}
+    for line in log_lines[:ENVIRONMENT_HEADER_LINES]:
+        if match := _LEGACY_VERSION.match(line):
+            found.setdefault(
+                "jvm_version",
+                f"{match.group('jre')} ({match.group('vm')}, {match.group('platform')})",
+            )
+        elif match := _LEGACY_MEMORY.match(line):
+            found.setdefault("physical_memory_kb", int(match.group("physical")))
+            found.setdefault("free_memory_kb", int(match.group("free")))
+            if match.group("swap") is not None:
+                found.setdefault("swap_total_kb", int(match.group("swap")))
+                found.setdefault("swap_free_kb", int(match.group("swap_free")))
+        elif "[gc,init" in line:
+            if match := _INIT_VERSION.search(line):
+                found.setdefault("jvm_version", match.group("version"))
+            elif match := _INIT_CPUS.search(line):
+                found.setdefault("cpus_total", int(match.group("total")))
+                found.setdefault("cpus_available", int(match.group("available")))
+            elif match := _INIT_MEMORY.search(line):
+                kb = int(match.group("value")) * _UNIT_BYTES[match.group("unit")] // 1024
+                found.setdefault("physical_memory_kb", kb)
+            elif match := _INIT_LARGE_PAGES.search(line):
+                found.setdefault("large_pages", match.group("value"))
+            elif match := _INIT_PRE_TOUCH.search(line):
+                found.setdefault("pre_touch", match.group("value"))
+    return JVMEnvironment(**found) if found else None

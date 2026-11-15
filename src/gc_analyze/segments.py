@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import CandidateCoverage, GCEvent, SegmentInfo
+from .models import CandidateCoverage, GCEvent, SegmentInfo, SideRecord
 from .parsers import GCParser
 
 JVM_START_HEADER: re.Pattern[str] = re.compile(
@@ -37,6 +37,7 @@ class LoadedFile:
     coverage: CandidateCoverage
     events: list[GCEvent] = field(default_factory=list[GCEvent])
     header_line_numbers: list[int] = field(default_factory=list[int])  # 1-based
+    side_records: list[SideRecord] = field(default_factory=list[SideRecord])
 
     @property
     def first_event(self) -> GCEvent | None:
@@ -147,9 +148,13 @@ def select_segment(
 def filter_window(
     events: list[GCEvent], start: datetime | None, end: datetime | None
 ) -> list[GCEvent]:
-    """Keep events with start <= timestamp <= end (P2.2)."""
+    """Keep pauses that overlap [start, end] (P2.2).
+
+    A long pause that began before ``start`` or finished after ``end`` still stopped the
+    application inside the window, so it is kept; the summary only counts the part inside.
+    """
     return [
         e
         for e in events
-        if (start is None or e.timestamp >= start) and (end is None or e.timestamp <= end)
+        if (start is None or e.pause_end >= start) and (end is None or e.pause_start <= end)
     ]
