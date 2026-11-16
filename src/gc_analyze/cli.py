@@ -13,13 +13,14 @@ import typer
 
 from .coverage import UNPARSED_WARNING_THRESHOLD_PCT
 from .export import ExportError, export_events
+from .findings import build_findings, overall_status
 from .jvm_config import parse_size_argument
 from .markdown import render_brief_markdown, render_markdown
-from .models import DiagnosticThresholds, GCSummary
+from .models import DiagnosticThresholds, Finding
 from .pipeline import NoEventsError, parse_time_option, run_analysis
 from .report import ReportContext, build_sections, console, render_rich
 
-__version__ = "5.0.0"
+__version__ = "6.0.0"
 
 app = typer.Typer(
     name="gc-analyze",
@@ -29,13 +30,15 @@ app = typer.Typer(
 )
 
 
-def exit_code(summary: GCSummary, unparsed_pct: float) -> int:
-    """0 clean, 1 warnings or incomplete parse, 2 critical issues."""
-    if summary.leak_severity.severity_level in ("High", "Critical") or any(
-        w.startswith("CRITICAL") for w in summary.warnings
-    ):
+def exit_code(findings: list[Finding], unparsed_pct: float) -> int:
+    """0 clean, 1 warning findings or incomplete parse, 2 critical findings.
+
+    The same findings the report lists decide the code: informational findings do not count.
+    """
+    status = overall_status(findings)
+    if status == "critical":
         return 2
-    if summary.warnings or unparsed_pct > UNPARSED_WARNING_THRESHOLD_PCT:
+    if status == "warning" or unparsed_pct > UNPARSED_WARNING_THRESHOLD_PCT:
         return 1
     return 0
 
@@ -129,6 +132,17 @@ def analyze(
             "--heap-critical", help="Heap-after-GC % that is critical", min=0.0, max=100.0
         ),
     ] = 95.0,
+    workload: Annotated[
+        str,
+        typer.Option(
+            "--workload",
+            help=(
+                "Pause limits to judge by: server (request-serving; any pause >= 5 s warns, "
+                ">= 30 s is critical, P99 > 1 s warns) or batch (throughput first; P99 > 5 s "
+                "warns, a single pause only from 60 s)"
+            ),
+        ),
+    ] = "server",
     verbose: Annotated[bool, typer.Option("--verbose", "-v", help="Show parsing details")] = False,
     profile: Annotated[bool, typer.Option("--profile", help="Show profiling statistics")] = False,
     profile_output: Annotated[
@@ -137,7 +151,7 @@ def analyze(
 ) -> None:
     """Analyze JVM GC log file(s).
 
-    Exit codes: 0 = clean, 1 = warnings or incomplete parse, 2 = critical issues.
+    Exit codes: 0 = clean, 1 = warning findings or incomplete parse, 2 = critical findings.
     """
     profiler = cProfile.Profile() if profile else None
     if profiler:
@@ -146,14 +160,16 @@ def analyze(
     try:
         jvm_start_dt = parse_time_option(jvm_start, "--jvm-start", None)
         max_heap_bytes = parse_size_argument(max_heap) if max_heap else None
+        thresholds = DiagnosticThresholds.for_workload(workload).model_copy(
+            update={
+                "heap_warning_percentage": heap_warning,
+                "heap_critical_percentage": heap_critical,
+                "min_rate_window_hours": min_rate_window / 60,
+                "full_gc_streak_count": full_gc_streak,
+            }
+        )
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
-    thresholds = DiagnosticThresholds(
-        heap_warning_percentage=heap_warning,
-        heap_critical_percentage=heap_critical,
-        min_rate_window_hours=min_rate_window / 60,
-        full_gc_streak_count=full_gc_streak,
-    )
 
     try:
         try:
@@ -194,6 +210,7 @@ def analyze(
             comparison=result.comparison,
             comparison_label=result.comparison_label,
             inputs=[str(f.path) for f in result.files],
+            findings=build_findings(summary, result.gc_type, result.events, result.coverage),
         )
         sections = build_sections(ctx)
 
@@ -222,7 +239,7 @@ def analyze(
             stats.strip_dirs().sort_stats("cumulative").print_stats(20)
             console.print(stream.getvalue())
 
-        code = exit_code(summary, result.coverage.unparsed_percentage)
+        code = exit_code(ctx.findings or [], result.coverage.unparsed_percentage)
         if code:
             sys.exit(code)
 

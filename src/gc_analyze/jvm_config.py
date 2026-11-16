@@ -104,6 +104,7 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
 
     bool_patterns = {
         "always_pre_touch": re.compile(r"-XX:\+AlwaysPreTouch"),
+        "heap_dump_on_out_of_memory_error": re.compile(r"-XX:\+HeapDumpOnOutOfMemoryError"),
         "use_adaptive_size_policy": re.compile(r"-XX:\+UseAdaptiveSizePolicy"),
         "use_adaptive_size_policy_footprint_goal": re.compile(
             r"-XX:\+UseAdaptiveSizePolicyFootprintGoal"
@@ -173,6 +174,16 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
             match := unified_workers_pattern.search(line)
         ):
             unified_config["parallel_gc_threads"] = int(match.group(2))
+        if "[gc,init" in line:
+            # JDK 17+ prints the sizing the JVM settled on, whatever flags produced it
+            for pattern, field in _INIT_SIZES:
+                if field not in unified_config and (match := pattern.search(line)):
+                    unified_config[field] = int(
+                        float(match.group("value")) * _UNIT_BYTES[match.group("unit")]
+                    )
+            for pattern, field in _INIT_COUNTS:
+                if field not in unified_config and (match := pattern.search(line)):
+                    unified_config[field] = int(match.group("count"))
 
     if unified_config:
         return JVMHeapConfig(**unified_config)
@@ -188,6 +199,18 @@ _UNIFIED_MAX_HEAP = (
     re.compile(r"Heap address: 0x[0-9a-fA-F]+, size: (?P<value>\d+) (?P<unit>[KMGT]?)B\b"),
 )
 _UNIT_BYTES = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
+
+
+# JDK 17+ "[gc,init]" sizing and worker lines
+_INIT_SIZE = r":\s+(?P<value>\d+(?:\.\d+)?)(?P<unit>[KMGT]?)B?\b"
+_INIT_SIZES: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"Heap Min Capacity" + _INIT_SIZE), "min_heap_size_bytes"),
+    (re.compile(r"Heap Initial Capacity" + _INIT_SIZE), "initial_heap_size_bytes"),
+)
+_INIT_COUNTS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"\] Parallel Workers: (?P<count>\d+)"), "parallel_gc_threads"),
+    (re.compile(r"\] Concurrent Workers: (?P<count>\d+)"), "conc_gc_threads"),
+)
 
 
 def parse_max_heap_from_log(log_lines: list[str]) -> int | None:

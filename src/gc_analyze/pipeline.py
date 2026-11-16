@@ -72,7 +72,10 @@ def load_file(path: Path, jvm_start: datetime | None, label: str | None) -> Load
         raw_events=raw_events,
         coverage=compute_candidate_coverage(lines, raw_events, label),
         header_line_numbers=find_header_lines(lines),
-        side_records=scan_side_records(lines),
+        side_records=[
+            record.model_copy(update={"source_file": str(path)})
+            for record in scan_side_records(lines)
+        ],
     )
     for raw in raw_events:
         if event := normalize_event(raw, jvm_start, source_file=str(path)):

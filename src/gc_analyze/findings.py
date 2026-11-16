@@ -3,6 +3,9 @@
 Every warning in ``GCSummary.health_warnings`` ends up in exactly one finding: the builders
 below claim the warnings they explain by code, and any warning left over becomes a finding of
 its own, so nothing the analysis flagged can go missing from the top of the report.
+
+The findings list is the single source of truth for the report's status and the process exit
+code (``overall_status``): a problem that is reported is a problem that counts.
 """
 
 from __future__ import annotations
@@ -13,11 +16,13 @@ from itertools import pairwise
 from statistics import median
 from typing import Literal
 
-from .advice import ADVICE, Advice, jdk_major
+from .advice import ADVICE, LARGE_HEAP_BYTES, Advice, jdk_major
 from .analysis import (
+    cleaned_floors,
     describe_floor_step,
     format_duration,
     format_mb_per_hour,
+    format_size_kb,
     format_time,
     is_heap_pressure_full_gc,
 )
@@ -29,8 +34,10 @@ from .models import (
     GCSummary,
     HealthWarning,
 )
+from .parsers import parse_unified_prefix_times, to_float
 
 SEVERITY_ORDER = {"critical": 0, "warning": 1, "info": 2}
+ROLE_ORDER = {"cause": 0, "symptom": 1, "": 2}
 # Explicit Full GCs this evenly spaced come from a timer, not from application logic
 PERIODIC_MIN_INTERVALS = 3
 PERIODIC_TOLERANCE = 0.05
@@ -38,9 +45,23 @@ GCLOCKER_MIN_PAUSES = 5
 GCLOCKER_MIN_SHARE = 0.05
 LONG_REMARK_SECONDS = 0.5
 LONG_PAUSE_SECONDS = 1.0
+SECONDARY_NOTE = (
+    "Secondary: the heap ran out of room (see the findings above). Fix that first and "
+    "revisit this only if it is still there afterwards. "
+)
 
 
 Severity = Literal["critical", "warning", "info"]
+Status = Literal["critical", "warning", "ok"]
+
+
+def overall_status(findings: list[Finding]) -> Status:
+    """Worst severity among the findings; informational findings do not change the status."""
+    if any(f.severity == "critical" for f in findings):
+        return "critical"
+    if any(f.severity == "warning" for f in findings):
+        return "warning"
+    return "ok"
 
 
 def _severity(warnings: list[HealthWarning]) -> Severity:
@@ -48,7 +69,16 @@ def _severity(warnings: list[HealthWarning]) -> Severity:
 
 
 def _size(kb: float) -> str:
-    return f"{kb / 1048576:.2f} GB" if kb >= 1048576 else f"{kb / 1024:.0f} MB"
+    return format_size_kb(kb)
+
+
+def format_pause(seconds: float) -> str:
+    """'0.020 s', '1.50 s', '60.0 s': enough digits that a short pause is not shown as 0.0."""
+    if seconds < 1:
+        return f"{seconds:.3f} s"
+    if seconds < 10:
+        return f"{seconds:.2f} s"
+    return f"{seconds:.1f} s"
 
 
 def _sources(*advice: Advice) -> str:
@@ -87,13 +117,95 @@ def explicit_gc_period_seconds(events: list[GCEvent]) -> float | None:
     return typical
 
 
+def memory_inspection_advice(summary: GCSummary) -> tuple[str, str]:
+    """How to see what holds the memory, scaled to the heap: (text, sources).
+
+    A full dump of a very large heap is slow and as big as the live data, so above
+    ``LARGE_HEAP_BYTES`` the class histogram comes first. The OutOfMemoryError dump flag is
+    named either as already set or as worth setting.
+    """
+    heap = summary.heap
+    config = summary.jvm_heap_config
+    advice: list[Advice] = []
+    large = bool(heap.max_heap_kb and heap.max_heap_kb * 1024 >= LARGE_HEAP_BYTES)
+    if large:
+        advice.append(ADVICE["class_histogram"])
+        text = (
+            f"{ADVICE['class_histogram'].text}. A full dump (jcmd <pid> GC.heap_dump <file>) "
+            "requests a full GC first and needs disk space and analysis memory on the scale of "
+            "the live data"
+        )
+        advice.append(ADVICE["heap_dump"])
+    else:
+        advice.append(ADVICE["heap_dump"])
+        text = ADVICE["heap_dump"].text
+    oom = ADVICE["heap_dump_on_oom"]
+    if config and config.heap_dump_on_out_of_memory_error:
+        text += (
+            ". -XX:+HeapDumpOnOutOfMemoryError is already set, so an OutOfMemoryError will "
+            "leave a dump to analyse"
+        )
+    else:
+        text += f". {oom.text}"
+    advice.append(oom)
+    return text, _sources(*advice)
+
+
+def _truncated_record_context(record: str, events: list[GCEvent]) -> list[str]:
+    """What the JVM was doing just before the unfinished final record (U6)."""
+    if not events:
+        return []
+    last = events[-1]
+    lines = [
+        f"Last finished pause: {last.gc_kind} ({last.cause or 'cause not logged'}), "
+        f"{format_pause(last.pause_time_seconds)}, ending at "
+        f"{format_time(last.pause_end, last.wall_clock, _end_uptime(last))}"
+    ]
+    # the sample is "L123: <line>" (with a "file:" prefix for several inputs)
+    text = record.split(": ", 1)[1] if ": " in record else record
+    uptime: float | None
+    if text.startswith("["):
+        uptime = parse_unified_prefix_times(text)[1]
+    else:
+        head = text.split(": [", 1)[0].rsplit(": ", 1)[-1].strip()
+        try:
+            uptime = to_float(head)
+        except ValueError:
+            uptime = None
+    last_end = _end_uptime(last)
+    if uptime is not None and last_end is not None and uptime >= last_end:
+        lines.append(
+            f"The unfinished collection started {format_pause(uptime - last_end)} after that "
+            "pause ended"
+        )
+    return lines
+
+
+def _end_uptime(event: GCEvent) -> float | None:
+    if event.uptime_seconds is None:
+        return None
+    if event.stamp_at_pause_end:
+        return event.uptime_seconds
+    return event.uptime_seconds + event.pause_time_seconds
+
+
+def _trailing_full_gcs(events: list[GCEvent]) -> int:
+    """How many Full GCs the window ends with, back to back."""
+    count = 0
+    for event in reversed(events):
+        if event.gc_kind != "Full":
+            break
+        count += 1
+    return count
+
+
 def build_findings(
     summary: GCSummary,
     gc_type: str,
     events: list[GCEvent],
     coverage: CandidateCoverage | None = None,
 ) -> list[Finding]:
-    """All findings, most severe first (order within a severity is by importance)."""
+    """All findings, most severe first; within a severity causes come before symptoms."""
     warnings = _Warnings(summary.health_warnings)
     findings: list[Finding] = []
     is_g1 = "G1" in gc_type
@@ -108,23 +220,44 @@ def build_findings(
         if heap.max_heap_known and heap.max_heap_kb
         else ""
     )
-    dump = ADVICE["heap_dump"]
+    inspect_text, inspect_source = memory_inspection_advice(summary)
+    # The heap ran out of room: everything else in the report follows from that
+    exhausted = any(
+        (w.code == "heap_occupancy" and w.level == "CRITICAL") or w.code == "ineffective_full_gc"
+        for w in summary.health_warnings
+    )
 
     # ---- the log stops inside a collection
     if coverage is not None and coverage.truncated_final_record:
         record = coverage.truncated_final_record
+        in_full_gc = "Full" in record
+        trailing = _trailing_full_gcs(events)
         findings.append(
             Finding(
-                severity="critical" if "Full" in record else "warning",
-                title="The log ends in the middle of a collection",
+                severity="critical" if in_full_gc else "warning",
+                title=(
+                    "The JVM was in back-to-back Full GCs when the log stops, in the middle "
+                    "of another one"
+                    if in_full_gc and trailing >= 2
+                    else "The log ends in the middle of a collection"
+                ),
                 when="end of the log",
-                evidence=[f"Last record, never finished: {record}"],
+                evidence=[
+                    f"Last record, never finished: {record}",
+                    *_truncated_record_context(record, events),
+                    *(
+                        [f"The {trailing} pauses before it were all Full GCs"]
+                        if trailing >= 2
+                        else []
+                    ),
+                ],
                 action=(
                     "Find out what stopped the JVM at that moment: a kill or restart (service "
                     "manager, operator, health check), the kernel OOM killer (dmesg / journal), "
                     "or a crash (hs_err_pid*.log). If the JVM was still running, the log was "
                     "copied while a collection was in progress"
                 ),
+                role="symptom" if exhausted else "",
             )
         )
 
@@ -165,9 +298,10 @@ def build_findings(
                 action=(
                     "During such a stretch the server answers almost nothing: expect request "
                     "timeouts, failed health checks and exhausted connection pools upstream. "
-                    "The Timeline shows when it began; the findings below explain the pauses "
+                    "The Timeline shows when it began; the other findings explain the pauses "
                     "responsible"
                 ),
+                role="symptom",
             )
         )
 
@@ -199,23 +333,18 @@ def build_findings(
                 ]
                 * bool(floors),
                 action=(
-                    "First rule out unbounded growth with a heap dump (jcmd <pid> GC.heap_dump "
-                    f"<file>) and the live-set findings. {advice_text}"
+                    "First rule out unbounded growth (see the live-set findings) by looking at "
+                    f"what holds the memory. {inspect_text}. {advice_text}"
                 ),
-                source=_sources(dump) + (f"; {source}" if source else ""),
+                source=inspect_source + (f"; {source}" if source else ""),
+                role="cause",
             )
         )
 
     # ---- Full GCs
-    if taken := warnings.claim(
-        "ineffective_full_gc",
-        "full_gc_streak",
-        "reclamation_declining",
-        "full_gc_accelerating",
-        "full_gc_rate",
-    ):
+    if taken := warnings.claim("ineffective_full_gc", "full_gc_streak", "full_gc_rate"):
         struggling = bool(summary.ineffective_full_gc_count) or any(
-            w.code in ("full_gc_streak", "reclamation_declining") for w in taken
+            w.code == "full_gc_streak" for w in taken
         )
         heap_fulls = [e for e in events if is_heap_pressure_full_gc(e)]
         evidence = [w.text for w in taken]
@@ -225,41 +354,51 @@ def build_findings(
                 "Heap freed by the last heap-pressure Full GCs: "
                 + ", ".join(f"{pct:.1f}%" for pct in shown)
             )
+        # supporting evidence only: neither raises an alarm by itself
+        if summary.reclamation_declining:
+            evidence.append("Each heap-pressure Full GC frees a smaller share of the heap")
+        if summary.full_gc_accelerating:
+            evidence.append("The gaps between heap-pressure Full GCs are getting shorter")
         if heap_fulls:
             longest = max(heap_fulls, key=lambda e: e.pause_time_seconds)
             evidence.append(
-                f"Longest: {longest.pause_time_seconds:.1f} s at {_when(longest)} "
+                f"Longest: {format_pause(longest.pause_time_seconds)} at {_when(longest)} "
                 f"({longest.cause or 'cause not logged'})"
             )
-        full_gc_advice: list[Advice] = [dump]
+        full_gc_sources = [inspect_source] if struggling else []
         action = (
-            f"The heap cannot hold what the application is keeping. {dump.text}. Then either "
-            f"fix what retains the memory or raise -Xmx{max_heap}"
+            f"The heap cannot hold what the application is keeping. {inspect_text}. Then "
+            f"either fix what retains the memory or raise -Xmx{max_heap}"
             if struggling
             else "Each heap-pressure Full GC stops the application; find why the old generation "
             "fills (see heap and live-set findings)"
         )
         if is_g1:
-            full_gc_advice.append(ADVICE["g1_full_gc"])
+            full_gc_sources.append(ADVICE["g1_full_gc"].source)
             action += f". {ADVICE['g1_full_gc'].text}"
             if major is not None and major < 10:
-                full_gc_advice.append(ADVICE["g1_full_gc_single_threaded"])
+                full_gc_sources.append(ADVICE["g1_full_gc_single_threaded"].source)
                 action += f". {ADVICE['g1_full_gc_single_threaded'].text}"
         if is_parallel and summary.ineffective_full_gc_count:
-            full_gc_advice.append(ADVICE["parallel_overhead_limit"])
+            full_gc_sources.append(ADVICE["parallel_overhead_limit"].source)
             action += f". {ADVICE['parallel_overhead_limit'].text}"
+        if not struggling:
+            title = "Heap-pressure Full GCs are frequent"
+        elif summary.max_full_gc_streak >= 2:
+            title = "Back-to-back Full GCs are freeing little memory"
+        elif summary.heap_full_gc_count == 1:
+            title = "A Full GC freed little memory"
+        else:
+            title = "Full GCs are freeing little memory"
         findings.append(
             Finding(
                 severity=_severity(taken),
-                title=(
-                    "Back-to-back Full GCs are freeing little memory"
-                    if struggling
-                    else "Heap-pressure Full GCs are frequent"
-                ),
+                title=title,
                 when=f"{_when(heap_fulls[0])} to {_when(heap_fulls[-1])}" if heap_fulls else "",
                 evidence=evidence,
                 action=action,
-                source=_sources(*full_gc_advice) if struggling or is_g1 else "",
+                source="; ".join(dict.fromkeys(full_gc_sources)),
+                role="cause" if struggling else "symptom",
             )
         )
 
@@ -280,55 +419,50 @@ def build_findings(
                 action=(
                     "This is sudden retention, not a slow leak. Find what started in that "
                     "interval (a very large request or query, a batch job, a cache load) in the "
-                    "access and application logs. A heap dump taken while the heap is high "
-                    "shows what holds the memory (jcmd <pid> GC.heap_dump <file>; it requests "
-                    "a full GC first)"
+                    "access and application logs, then look at what holds the memory while the "
+                    f"heap is high. {inspect_text}"
                 ),
-                source=dump.source,
+                source=inspect_source,
+                role="cause",
             )
         )
-    rising = (
-        trend.assessed
-        and (trend.slope_mb_per_hour or 0.0) > 0
-        and (trend.r_squared or 0.0) >= 0.5
-        and summary.leak_severity.severity_level != "None"
-    )
-    if rising and trend.slope_mb_per_hour is not None:
-        level = summary.leak_severity.severity_level
+    if (taken := warnings.claim("live_set_growing")) and trend.slope_mb_per_hour is not None:
         floors = trend.trend_floors
         findings.append(
             Finding(
-                severity="critical" if level in ("High", "Critical") else "warning",
+                severity=_severity(taken),
                 title=f"The live set is growing {format_mb_per_hour(trend.slope_mb_per_hour)}",
                 when=f"over {trend.span_hours:.1f} h",
-                evidence=[
-                    f"Floor after cleanup went from {_size(floors[0].value_kb)} to "
-                    f"{_size(floors[-1].value_kb)} over {len(floors)} floors "
-                    f"(fit r²={trend.r_squared:.2f})",
-                    *summary.leak_severity.indicators,
-                ],
+                evidence=list(summary.leak.evidence),
                 confidence="high"
-                if (trend.r_squared or 0.0) >= 0.8 and len(floors) >= 6
+                if (trend.p_value or 1.0) < 0.01 and len(floors) >= 10
                 else "medium",
                 action=(
                     "Growth like this is a leak, a cache that is still filling, or rising load. "
-                    "Take two heap dumps hours apart and compare retained sizes to see what is "
-                    f"growing ({dump.text[0].lower()}{dump.text[1:]})"
+                    "Compare what holds the memory at two moments hours apart to see what is "
+                    f"growing. {inspect_text}"
                 ),
-                source=dump.source,
+                source=inspect_source,
+                role="cause",
             )
         )
 
     # ---- long pauses
     top = sorted(events, key=lambda e: e.pause_time_seconds, reverse=True)[:10]
-    dominant = Counter(e.gc_kind for e in top).most_common(1)[0][0] if top else ""
     longest_pause = top[0] if top else None
-    taken = warnings.claim("p99_pause")
+    taken = warnings.claim("p99_pause", "long_pause")
+    has_full_gc_finding = any("Full GC" in f.title for f in findings)
     if longest_pause and (taken or longest_pause.pause_time_seconds >= LONG_PAUSE_SECONDS):
         pause_advice: list[Advice] = []
-        if dominant == "Full":
-            action = "The longest pauses are Full GCs: act on the Full GC findings"
-        elif dominant == "Remark" and is_g1:
+        kind = longest_pause.gc_kind
+        if kind == "Full" and has_full_gc_finding:
+            action = "The longest pause is a Full GC: act on the Full GC findings"
+        elif kind == "Full":
+            action = (
+                "The longest pause is a Full GC, which stops the application for its whole "
+                "length; Full GC Causes shows why each one ran"
+            )
+        elif kind == "Remark" and is_g1:
             pause_advice.append(ADVICE["g1_remark"])
             action = ADVICE["g1_remark"].text
         elif is_g1:
@@ -336,7 +470,12 @@ def build_findings(
             action = ADVICE["g1_young_pause"].text
         else:
             action = "See Top 10 Longest Pauses for the kind and cause of each"
-        if is_parallel or "Serial" in gc_type:
+        if taken:
+            action = (
+                "A pause this long outlasts typical proxy and health-check timeouts: requests "
+                f"in flight fail and the node can be taken out of rotation. {action}"
+            )
+        if (is_parallel or "Serial" in gc_type) and not exhausted:
             pause_advice.append(ADVICE["selecting_collector"])
             action += f". {ADVICE['selecting_collector'].text}"
         over = [
@@ -344,26 +483,38 @@ def build_findings(
             for label, count in (
                 ("1 s", summary.pauses_over_1s),
                 ("5 s", summary.pauses_over_5s),
+                ("30 s", summary.pauses_over_30s),
                 ("60 s", summary.pauses_over_60s),
             )
             if count
         ]
+        kinds = Counter(e.gc_kind for e in top)
+        p99_of = f"{summary.worst_p99_kind} " if summary.worst_p99_kind else ""
+        # the P99 belongs in the title only when it is part of the problem
+        p99_text = (
+            f"; {p99_of}P99 {format_pause(summary.worst_p99_seconds)}"
+            if any(w.code == "p99_pause" for w in taken)
+            else ""
+        )
         findings.append(
             Finding(
                 severity=_severity(taken) if taken else "info",
                 title=(
-                    f"Pauses are long: P99 {summary.overall_pauses.p99:.1f} s, longest "
-                    f"{longest_pause.pause_time_seconds:.1f} s"
+                    f"Pauses are long: longest {format_pause(longest_pause.pause_time_seconds)}"
+                    f"{p99_text}"
                 ),
                 when=f"longest at {_when(longest_pause)}",
                 evidence=[
+                    *[w.text for w in taken],
                     f"Longest: {longest_pause.gc_kind} "
                     f"({longest_pause.cause or 'cause not logged'})",
-                    f"The 10 longest are mostly {dominant} pauses",
+                    f"The {len(top)} longest: "
+                    + ", ".join(f"{count} {name}" for name, count in kinds.most_common()),
                     *([f"Pauses {', '.join(over)}"] if over else []),
                 ],
                 action=action,
                 source=_sources(*pause_advice),
+                role="symptom",
             )
         )
     elif (
@@ -406,6 +557,40 @@ def build_findings(
                     "allocates and keeps: act on the heap and Full GC findings first, then "
                     f"reduce allocation{rate}"
                 ),
+                role="symptom",
+            )
+        )
+
+    # ---- stops that are not GC
+    if taken := warnings.claim("safepoint_non_gc"):
+        stops = summary.safepoint_stats
+        # a slow-to-stop warning about the same stop belongs here, not in a second finding
+        if stops is not None and stops.longest_stopping_when == stops.longest_non_gc_when:
+            taken += warnings.claim("safepoint_slow")
+        evidence = [w.text for w in taken]
+        if stops is not None and stops.non_gc_count is not None:
+            evidence.append(
+                f"{stops.non_gc_count} of {stops.count} safepoints are not explained by a GC "
+                f"pause; together they stopped the application for "
+                f"{format_pause(stops.non_gc_total_seconds)}"
+            )
+        findings.append(
+            Finding(
+                severity=_severity(taken),
+                title=(
+                    "The application was stopped for "
+                    f"{format_pause(stops.longest_non_gc_seconds if stops else 0.0)} by "
+                    "something other than garbage collection"
+                ),
+                when=stops.longest_non_gc_when if stops else "",
+                evidence=evidence,
+                action=(
+                    "This freeze is not GC work, so heap tuning will not shorten it. The VM "
+                    "operation names what the JVM stopped for (a thread dump, a heap "
+                    "inspection, deoptimization, ...); a long wait to stop the threads means "
+                    "some thread did not reach a safepoint promptly. Match the time against "
+                    "monitoring agents, scheduled diagnostics and the application's own logs"
+                ),
             )
         )
 
@@ -413,9 +598,12 @@ def build_findings(
     overflow = summary.survivor_overflow
     if (taken := warnings.claim("survivor_overflow")) and overflow is not None:
         survivor = _size(overflow.survivor_capacity_kb)
+        survivor_advice = ADVICE[
+            "survivor_overflow_parallel" if is_parallel else "survivor_overflow"
+        ]
         findings.append(
             Finding(
-                severity="warning",
+                severity="info" if exhausted else "warning",
                 title="Young collections are overflowing the survivor space",
                 when=f"{overflow.first_when} to {overflow.last_when}",
                 evidence=[
@@ -423,27 +611,97 @@ def build_findings(
                     f"The survivor space was {survivor} and full after each of them",
                 ],
                 confidence="medium",
-                action=(
-                    f"{ADVICE['survivor_overflow'].text}. If the live-set findings show the "
+                action=(SECONDARY_NOTE if exhausted else "")
+                + (
+                    f"{survivor_advice.text}. If the live-set findings show the "
                     "application keeping everything it allocates, a larger survivor space only "
                     "delays the old generation filling"
                 ),
-                source=ADVICE["survivor_overflow"].source,
+                source=survivor_advice.source,
+                role="symptom" if exhausted else "",
+            )
+        )
+
+    # ---- promotion failure (any generational collector) and CMS fallback
+    promotion = warnings.claim("promotion_failure")
+    cms_failure = warnings.claim("cms_concurrent_mode_failure")
+    if cms_failure or (promotion and "CMS" in gc_type):
+        findings.append(
+            Finding(
+                severity=_severity(cms_failure + promotion),
+                title="CMS fell back to stop-the-world collections",
+                evidence=[w.text for w in cms_failure + promotion],
+                action=ADVICE["cms_concurrent_mode_failure"].text,
+                source=ADVICE["cms_concurrent_mode_failure"].source,
+                role="symptom" if exhausted else "",
+            )
+        )
+    elif promotion:
+        failed = [e for e in events if e.promotion_failed]
+        findings.append(
+            Finding(
+                severity=_severity(promotion),
+                title=f"{len(failed)} young collection(s) ended in a promotion failure",
+                when=", ".join(_when(e) for e in failed[:3]) + (" ..." if len(failed) > 3 else ""),
+                evidence=[
+                    *[w.text for w in promotion],
+                    "Longest of them: " + format_pause(max(e.pause_time_seconds for e in failed)),
+                ],
+                action=(
+                    "A promotion failure means the old generation had no room for the objects "
+                    "surviving a young collection; a Full GC normally follows. The old "
+                    "generation is too full: act on the heap, Full GC and live-set findings"
+                ),
+                role="symptom",
             )
         )
 
     # ---- G1 specifics
-    if taken := warnings.claim("g1_evacuation_failure"):
-        failed = [e for e in events if e.evacuation_failed]
+    failed = [e for e in events if e.evacuation_failed]
+    taken = warnings.claim("g1_evacuation_failure")
+    if failed:
+        g1 = summary.g1_metrics
+        startup_only = not taken
+        first = failed[0]
+        evidence = [w.text for w in taken]
+        if startup_only:
+            evidence.append(
+                (
+                    f"It happened during JVM start-up, {first.uptime_seconds or 0:.0f} s after "
+                    "the JVM started"
+                    if len(failed) == 1
+                    else f"All {len(failed)} happened during JVM start-up (the first "
+                    f"{first.uptime_seconds or 0:.0f} s after the JVM started)"
+                )
+                + f", with the committed heap at {_size(first.heap_total_kb)}"
+                + (f" of a {_size(heap.max_heap_kb)} maximum" if heap.max_heap_kb else "")
+            )
+        if g1 and heap.max_committed_kb >= 1.1 * max(1, heap.min_committed_kb):
+            evidence.append(
+                f"The committed heap grew from {_size(heap.min_committed_kb)} to "
+                f"{_size(heap.max_committed_kb)} in this window: -Xms is below -Xmx"
+            )
         findings.append(
             Finding(
-                severity=_severity(taken),
-                title=f"{len(failed)} G1 evacuation failure(s)",
+                severity="info" if startup_only else _severity(taken),
+                title=f"{len(failed)} G1 evacuation failure(s)"
+                + (" during JVM start-up" if startup_only else ""),
                 when=", ".join(_when(e) for e in failed[:3]) + (" ..." if len(failed) > 3 else ""),
-                evidence=[w.text for w in taken],
+                evidence=evidence,
                 confidence="high" if len(failed) > 1 else "medium",
-                action=ADVICE["g1_evacuation_failure"].text,
-                source=ADVICE["g1_evacuation_failure"].source,
+                action=(
+                    "During start-up the heap is still growing to its working size, and a "
+                    "failure then says little about steady state. Setting -Xms equal to -Xmx "
+                    "gives G1 the whole heap from the start. "
+                    if startup_only
+                    else ""
+                )
+                + ADVICE["g1_evacuation_failure"].text,
+                source=_sources(
+                    ADVICE["g1_evacuation_failure"],
+                    *([ADVICE["high_sys_time"]] if startup_only else []),
+                ),
+                role="symptom" if exhausted else "",
             )
         )
     if taken := warnings.claim("g1_humongous"):
@@ -453,46 +711,89 @@ def build_findings(
                 f"Region size is {config.g1_heap_region_size_bytes // 1048576} MB, so objects of "
                 f"{config.g1_heap_region_size_bytes // 2097152 or 0.5} MB or more are humongous"
             )
-        concurrent = summary.concurrent_stats
-        if concurrent and concurrent.cycles > 1 and summary.runtime_seconds:
-            evidence.append(
-                f"{concurrent.cycles} concurrent cycles, one every "
-                f"{format_duration(summary.runtime_seconds / concurrent.cycles)}"
-            )
         findings.append(
             Finding(
                 severity="warning",
-                title="Humongous allocations drive a large share of the collections",
+                title="Humongous objects take a large share of the G1 heap",
                 evidence=evidence,
                 action=ADVICE["g1_humongous"].text,
                 source=_sources(ADVICE["g1_humongous"]),
             )
         )
-    if taken := warnings.claim("concurrent_share"):
+    marking_claimed = warnings.claim("concurrent_share")
+    g1_metrics = summary.g1_metrics
+    frequent_marking = (
+        g1_metrics is not None
+        and g1_metrics.marking_cycles_per_hour is not None
+        and g1_metrics.marking_cycles_per_hour >= FREQUENT_MARKING_CYCLES_PER_HOUR
+    )
+    if marking_claimed or frequent_marking:
+        evidence = [w.text for w in marking_claimed]
+        concurrent = summary.concurrent_stats
+        if g1_metrics is not None and g1_metrics.concurrent_marking_cycles:
+            cycles = g1_metrics.concurrent_marking_cycles
+            line = f"{cycles} marking cycles"
+            if summary.runtime_seconds:
+                line += f", one every {format_duration(summary.runtime_seconds / cycles)}"
+            if concurrent and concurrent.share_percentage is not None:
+                line += (
+                    f"; concurrent work ran for {concurrent.share_percentage:.1f}% of the window"
+                )
+            evidence.append(line)
+            if g1_metrics.median_marking_start_pct is not None:
+                evidence.append(
+                    "Marking starts with the old generation at a median "
+                    f"{g1_metrics.median_marking_start_pct:.0f}% of max heap"
+                )
+            floors_pct = [
+                f.pct_of_capacity for f in cleaned_floors(trend) if f.pct_of_capacity is not None
+            ]
+            if floors_pct:
+                evidence.append(
+                    f"After each mixed cycle the old generation is still at a median "
+                    f"{median(floors_pct):.0f}% of max heap: that is the live data"
+                )
+            if g1_metrics.mixed_per_marking_cycle is not None:
+                evidence.append(
+                    f"{g1_metrics.mixed_per_marking_cycle:.1f} mixed collections per marking "
+                    "cycle: each cycle finds little to reclaim"
+                )
+            if g1_metrics.concurrent_start_count and g1_metrics.humongous_concurrent_start_count:
+                humongous_note = (
+                    f"{g1_metrics.humongous_concurrent_start_count} of "
+                    f"{g1_metrics.concurrent_start_count} cycles were started by a pause with "
+                    'the cause "G1 Humongous Allocation". G1 checks the threshold at every '
+                    "humongous allocation, so the cause names when the threshold was noticed, "
+                    "not why it was exceeded"
+                )
+                if (
+                    g1_metrics.typical_humongous_pct is not None
+                    and g1_metrics.peak_humongous_pct is not None
+                ):
+                    humongous_note += (
+                        " (humongous objects typically held "
+                        f"{g1_metrics.typical_humongous_pct:.1f}% of the heap, at most "
+                        f"{g1_metrics.peak_humongous_pct:.1f}%)"
+                    )
+                evidence.append(humongous_note)
         findings.append(
             Finding(
-                severity="warning",
-                title="The collector is marking almost continuously",
-                evidence=[w.text for w in taken],
+                severity="warning" if marking_claimed else "info",
+                title=(
+                    "G1 is running marking cycles back to back"
+                    if is_g1
+                    else "The collector is marking almost continuously"
+                ),
+                evidence=evidence,
                 confidence="medium",
                 action=(
-                    "Marking starts whenever old-generation occupancy passes the initiating "
-                    "threshold, so live data sitting near that threshold keeps it running. "
-                    "A larger heap lowers the occupancy; fewer humongous allocations lower it too"
+                    ADVICE["g1_marking_threshold"].text
+                    if is_g1
+                    else "Concurrent cycles start whenever old-generation occupancy passes the "
+                    "initiating threshold, so live data sitting near that threshold keeps them "
+                    "running. A larger heap lowers the occupancy"
                 ),
-                source=ADVICE["g1_humongous"].source if is_g1 else "",
-            )
-        )
-
-    # ---- CMS
-    if taken := warnings.claim("cms_concurrent_mode_failure", "cms_promotion_failure"):
-        findings.append(
-            Finding(
-                severity=_severity(taken),
-                title="CMS fell back to stop-the-world collections",
-                evidence=[w.text for w in taken],
-                action=ADVICE["cms_concurrent_mode_failure"].text,
-                source=ADVICE["cms_concurrent_mode_failure"].source,
+                source=ADVICE["g1_marking_threshold"].source if is_g1 else "",
             )
         )
 
@@ -505,10 +806,12 @@ def build_findings(
         )
         findings.append(
             Finding(
-                severity="warning",
+                severity="info" if exhausted else "warning",
                 title=f"{summary.metadata_full_gc_count} Full GC(s) were triggered by metaspace",
                 evidence=[w.text for w in taken],
-                action=ADVICE["metaspace_threshold"].text + current,
+                action=(SECONDARY_NOTE if exhausted else "")
+                + ADVICE["metaspace_threshold"].text
+                + current,
                 source=ADVICE["metaspace_threshold"].source,
             )
         )
@@ -561,7 +864,7 @@ def build_findings(
         findings.append(
             Finding(
                 severity="warning",
-                title="The application was frozen before collections even started",
+                title="Application threads were slow to reach a safepoint",
                 evidence=[w.text for w in taken],
                 action=(
                     "Time to reach a safepoint is not GC work, so heap tuning will not shorten "
@@ -585,19 +888,57 @@ def build_findings(
     findings += [Finding(severity=_severity([w]), title=w.text) for w in warnings.left]
 
     # ---- informational
+    basis = "max heap" if heap.max_heap_known else "committed heap"
+    if (
+        not cleaned_floors(trend)
+        and heap.events_with_heap_data
+        and heap.peak_after_gc_pct > HEAP_NOT_COLLECTED_NOTE_PERCENTAGE
+    ):
+        bound = summary.live_set_bound
+        evidence = [
+            f"Heap after GC peaked at {heap.peak_after_gc_pct:.1f}% of {basis}; that figure "
+            "includes old-generation garbage no collection has removed yet",
+            f"Floors: {trend.reason or 'none in this window'}",
+        ]
+        if bound.assessed and bound.direction == "rising":
+            evidence.append(
+                f"Lowest heap after GC rose from {_size(bound.first_kb)} to "
+                f"{_size(bound.last_kb)} over {bound.span_hours:.1f} h, which is what an old "
+                "generation filling with garbage between collections looks like"
+            )
+        findings.append(
+            Finding(
+                severity="info",
+                title=(
+                    "The old generation was not collected in this window, so the live set is "
+                    "unknown"
+                ),
+                evidence=evidence,
+                confidence="high",
+                action=(
+                    "Nothing to act on yet. The first Full GC (or completed concurrent or "
+                    "mixed cycle) shows how much of the heap is live; analyse a log that "
+                    "includes one before concluding the heap is too small"
+                ),
+            )
+        )
     if summary.explicit_full_gc_count:
         period = explicit_gc_period_seconds(events)
         explicit_pause = sum(
             c.total_pause_seconds for c in summary.full_gc_causes if c.category == "explicit"
         )
         explicit_advice = [ADVICE["explicit_gc_g1"] if is_g1 else ADVICE["explicit_gc"]]
+        causes = ", ".join(
+            f"{c.count} {c.cause}" for c in summary.full_gc_causes if c.category == "explicit"
+        )
         evidence = [
-            f"{summary.explicit_full_gc_count} explicit Full GC(s), "
-            f"{explicit_pause:.1f} s "
-            "paused in total"
+            f"{summary.explicit_full_gc_count} Full GC(s) not caused by heap pressure "
+            f"({causes}), {explicit_pause:.1f} s paused in total"
         ]
         if period is not None:
             explicit_advice.insert(0, ADVICE["rmi_dgc"])
+            if major is not None and major <= 8:
+                explicit_advice.append(ADVICE["tomcat_gc_daemon"])
             evidence.append(f"They come every {format_duration(period)}, as from a timer")
         findings.append(
             Finding(
@@ -623,5 +964,69 @@ def build_findings(
             )
         )
 
-    findings.sort(key=lambda f: SEVERITY_ORDER[f.severity])
+    findings.sort(key=lambda f: (SEVERITY_ORDER[f.severity], ROLE_ORDER[f.role]))
     return findings
+
+
+# G1 marking cycles this frequent (per hour) are reported even without a health warning
+FREQUENT_MARKING_CYCLES_PER_HOUR = 6.0
+# Heap-after-GC above this with no cleaning collection gets the "live set unknown" note
+HEAP_NOT_COLLECTED_NOTE_PERCENTAGE = 80.0
+
+
+def build_diagnosis(
+    summary: GCSummary, findings: list[Finding], coverage: CandidateCoverage | None = None
+) -> str:
+    """One paragraph that puts the cause first and the consequences after it (A1).
+
+    Only written when a finding names a cause; otherwise the findings list speaks for itself.
+    """
+    if not any(f.role == "cause" and f.severity != "info" for f in findings):
+        return ""
+    trend = summary.floor_trend
+    floors = trend.trend_floors
+    parts: list[str] = []
+    step = trend.step_change
+    if step is not None:
+        parts.append(
+            f"The live set jumped from {_size(step.before.value_kb)} to "
+            f"{_size(step.after.value_kb)} between {_floor_when(step.before)} and "
+            f"{_floor_when(step.after)}"
+        )
+    elif summary.leak.verdict == "growing" and trend.slope_mb_per_hour is not None:
+        parts.append(
+            f"The live set grew {format_mb_per_hour(trend.slope_mb_per_hour)} over "
+            f"{trend.span_hours:.1f} h (from {_size(floors[0].value_kb)} to "
+            f"{_size(floors[-1].value_kb)})"
+        )
+    if floors and floors[-1].pct_of_capacity is not None:
+        of = (
+            "the old generation"
+            if trend.capacity_source == "old generation capacity"
+            else "the heap"
+        )
+        latest = floors[-1].pct_of_capacity
+        if latest > 80:
+            parts.append(
+                f"{'then ' if parts else 'Live data '}"
+                f"{'reached' if parts else 'fills'} {latest:.1f}% of {of} after a full cleanup"
+            )
+    if summary.ineffective_full_gc_count:
+        limit = summary.thresholds.ineffective_full_gc_reclaim_percentage
+        parts.append(
+            f"{summary.ineffective_full_gc_count} of {summary.heap_full_gc_count} heap-pressure "
+            f"Full GCs freed less than {limit:g}% of the heap"
+        )
+    worst = next((w for w in summary.worst_pause_shares if w.window_seconds == 300.0), None)
+    if worst is not None and worst.share_percentage > 25:
+        parts.append(
+            f"in the worst 5 minutes (from "
+            f"{format_time(worst.window_start, worst.wall_clock, worst.uptime_seconds)}) the "
+            f"application was stopped {worst.share_percentage:.0f}% of the time"
+        )
+    if coverage is not None and coverage.truncated_final_record:
+        parts.append("the log ends in the middle of a collection")
+    if not parts:
+        return ""
+    text = "; ".join(parts)
+    return text[0].upper() + text[1:] + ". The findings below start with the cause."

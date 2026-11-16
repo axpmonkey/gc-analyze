@@ -3,12 +3,15 @@
 Tallies GC pauses straight from the log with deliberately simple, *different* logic from the
 tool's parsers (legacy records are read up to their "[Times:" line instead of balancing
 brackets; unified pause lines are matched with one regex), then compares per-kind counts,
-total pause time, the longest pause, and the summed whole-heap sizes before and after each
-pause with what gc-analyze reports.
+total pause time, the longest pause, the summed whole-heap sizes before and after each
+pause, the old-generation size after the last pause that logs one, the last metaspace
+figure, and the number of safepoint lines (JDK 8-12 and 13+ formats) with what gc-analyze
+reports.
 
     uv run python scripts/crosscheck.py gc.log [more.log ...]
 
-Exit status is 1 if any number differs.
+Exit status is 1 if any number differs. Logs written with a decimal comma ("0,0301 secs")
+are not read by this script; check those by hand.
 """
 
 from __future__ import annotations
@@ -38,6 +41,64 @@ G1_DETAIL_HEAP = re.compile(
     r"Heap: (?P<hb>\d+(?:\.\d+)?[BKMG])\(\d+(?:\.\d+)?[BKMG]\)->(?P<ha>\d+(?:\.\d+)?[BKMG])\("
 )
 UNIT_KB = {"B": 1 / 1024, "K": 1, "M": 1024, "G": 1024 * 1024}
+# Old generation: "[ParOldGen: 1K->2K(3K)]" (Java 8 Parallel), "[CMS: ...]", "[Tenured: ...]"
+LEGACY_OLD = re.compile(
+    r"\[(?:ParOldGen|PSOldGen|CMS|Tenured): \d+K->(?P<after>\d+)K\("
+    r"|\[1 CMS-(?:initial-mark|remark): (?P<occupancy>\d+)K\("
+)
+# A young-only record does not print the old generation: old = whole heap - young, after GC
+LEGACY_YOUNG_ONLY = re.compile(
+    r"\[(?:ParNew|DefNew|PSYoungGen): \d+K->(?P<young>\d+)K\(\d+K\)(?:, [\d.]+ secs)?\] "
+    r"\d+K->(?P<heap>\d+)K\("
+)
+# G1 unified: "GC(5) Old regions: 10->12" plus "Humongous regions" and the region size
+G1_REGIONS = re.compile(
+    r"GC\((?P<id>\d+)\) (?P<kind>Old|Humongous|Archive) regions: \d+->(?P<n>\d+)"
+)
+G1_REGION_SIZE = re.compile(r"Heap [Rr]egion [Ss]ize: (?P<mb>\d+)M")
+# Java 8 G1 detail line: old = heap after - eden after - survivors after
+G1_LEGACY_DETAIL = re.compile(
+    r"\[Eden: \S+\(\S+\)->(?P<eden>\d+(?:\.\d+)?[BKMG])\(\S+\) "
+    r"Survivors: \S+->(?P<surv>\d+(?:\.\d+)?[BKMG]) "
+    r"Heap: \S+\(\S+\)->(?P<heap>\d+(?:\.\d+)?[BKMG])\("
+)
+METASPACE = re.compile(r"Metaspace: \d+K(?:\(\d+K\))?->(?P<after>\d+)K")
+SAFEPOINT = re.compile(
+    r"Total time for which application threads were stopped|Safepoint \"[^\"]+\", Time since last"
+)
+
+
+def tally_extras(path: Path) -> tuple[int | None, int | None, int]:
+    """(old gen KB after the last pause that logs it, last metaspace KB after, safepoint lines).
+
+    Read with different logic from the tool: the last match in the file wins.
+    """
+    old_kb: int | None = None
+    meta_kb: int | None = None
+    safepoints = 0
+    region_mb: int | None = None
+    regions: dict[str, dict[str, int]] = {}
+    last_id: str | None = None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if region_mb is None and (size := G1_REGION_SIZE.search(line)):
+            region_mb = int(size.group("mb"))
+        if match := LEGACY_OLD.search(line):
+            old_kb = int(match.group("after") or match.group("occupancy"))
+        elif match := LEGACY_YOUNG_ONLY.search(line):
+            old_kb = int(match.group("heap")) - int(match.group("young"))
+        elif match := G1_LEGACY_DETAIL.search(line):
+            young = to_kb(match.group("eden")) + to_kb(match.group("surv"))
+            old_kb = max(0, to_kb(match.group("heap")) - young)
+        if match := G1_REGIONS.search(line):
+            gc_id = match.group("id")
+            last_id = gc_id
+            regions.setdefault(gc_id, {})[match.group("kind")] = int(match.group("n"))
+        for match in METASPACE.finditer(line):
+            meta_kb = int(match.group("after"))
+        safepoints += bool(SAFEPOINT.search(line))
+    if region_mb is not None and last_id is not None:
+        old_kb = sum(regions[last_id].values()) * region_mb * 1024
+    return old_kb, meta_kb, safepoints
 
 
 def to_kb(size: str) -> int:
@@ -152,12 +213,27 @@ def main(paths: list[str]) -> int:
         actual_max = result.summary.overall_pauses.maximum
         actual_before = sum(e.heap_before_kb for e in result.events if e.has_heap_data)
         actual_after = sum(e.heap_after_kb for e in result.events if e.has_heap_data)
+        expected_old, expected_meta, expected_stops = tally_extras(path)
+        with_old = [e for e in result.events if e.old_after_kb is not None]
+        actual_old = (
+            max(with_old, key=lambda e: e.line_number or 0).old_after_kb if with_old else None
+        )
+        with_meta = [e for e in result.events if e.metaspace_after_kb is not None]
+        actual_meta = (
+            max(with_meta, key=lambda e: e.line_number or 0).metaspace_after_kb
+            if with_meta
+            else None
+        )
+        actual_stops = sum(1 for f in result.files for r in f.side_records if r.kind == "safepoint")
         ok = (
             expected_kinds == actual_kinds
             and abs(expected_sum - actual_sum) < 1e-6
             and abs(expected_max - actual_max) < 1e-9
             and expected_before == actual_before
             and expected_after == actual_after
+            and expected_old == actual_old
+            and expected_meta == actual_meta
+            and expected_stops == actual_stops
         )
         failed |= not ok
         print(f"{'OK  ' if ok else 'DIFF'} {path.name}")
@@ -171,6 +247,9 @@ def main(paths: list[str]) -> int:
         print(f"       longest       independent={expected_max:.6f}s gc-analyze={actual_max:.6f}s")
         print(f"       heap before   independent={expected_before}K gc-analyze={actual_before}K")
         print(f"       heap after    independent={expected_after}K gc-analyze={actual_after}K")
+        print(f"       last old gen  independent={expected_old}K gc-analyze={actual_old}K")
+        print(f"       last metaspace independent={expected_meta}K gc-analyze={actual_meta}K")
+        print(f"       safepoints    independent={expected_stops} gc-analyze={actual_stops}")
     return 1 if failed else 0
 
 

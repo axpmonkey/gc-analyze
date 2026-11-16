@@ -5,7 +5,8 @@ Every parser turns log lines into raw event dicts (see ``RawEvent``) that
 
     timestamp (str | None), uptime (float | None), gc_kind, pause (s), cause,
     heap_before/heap_after/heap_total (KB), young_*/old_* (KB), metaspace_* (KB),
-    humongous_detected, evacuation_failed, to_space_exhausted,
+    humongous_detected, evacuation_failed, to_space_exhausted, concurrent_start,
+    humongous_before/humongous_after (KB), promoted (KB),
     concurrent_mode_failure, promotion_failed,
     line_index (0-based first line of the record), line_end (0-based last line)
 
@@ -25,7 +26,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any, Protocol
 
-from .events import parse_size_to_kb
+from .events import parse_log_timestamp, parse_size_to_kb
 from .models import SideRecord
 
 RawEvent = dict[str, Any]
@@ -49,8 +50,16 @@ class GCParser(Protocol):
 # A parenthesised group allowing one level of nesting: "(System.gc())", "(Allocation Failure)"
 PAREN_GROUP = r"\((?:[^()]|\([^()]*\))*\)"
 _PAREN_GROUP_RE = re.compile(PAREN_GROUP)
-LEGACY_DATE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{4}|Z)?"
-SIZE = r"\d+(?:\.\d+)?[BKMG]"
+# A JVM running under a decimal-comma locale writes "10,000: [GC ... 0,0301000 secs]", so
+# every number that can carry a fraction accepts either separator.
+DEC = r"\d+(?:[.,]\d+)?"
+LEGACY_DATE = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:[+-]\d{4}|Z)?"
+SIZE = r"\d+(?:[.,]\d+)?[BKMG]"
+
+
+def to_float(text: str) -> float:
+    """Number as logged, with "." or "," as the decimal separator."""
+    return float(text.replace(",", "."))
 
 
 def paren_contents(text: str) -> list[str]:
@@ -65,6 +74,7 @@ def _new_event(**fields: Any) -> RawEvent:
         "to_space_exhausted": False,
         "concurrent_mode_failure": False,
         "promotion_failed": False,
+        "concurrent_start": False,
     }
     event.update(fields)
     return event
@@ -84,15 +94,15 @@ def _metaspace(event: RawEvent, match: re.Match[str] | None) -> None:
 # Record prefix: optional datestamp (-XX:+PrintGCDateStamps), optional uptime
 # (-XX:+PrintGCTimeStamps). Anchored at the start of the record.
 LEGACY_STAMP_RE: re.Pattern[str] = re.compile(
-    rf"^\s*(?:(?P<timestamp>{LEGACY_DATE}):\s+)?(?:(?P<uptime>\d+\.\d+):\s+)?"
+    rf"^\s*(?:(?P<timestamp>{LEGACY_DATE}):\s+)?(?:(?P<uptime>\d+[.,]\d+):\s+)?"
 )
 # A legacy GC record starts at column 0 with "[GC" / "[Full GC" after the stamp. Indented
 # lines ("      [GC Worker Start (ms): ...") are G1 details, and "[GC concurrent-*" are G1
 # concurrent-phase notes, not pauses.
 LEGACY_RECORD_START: re.Pattern[str] = re.compile(
-    rf"^(?:{LEGACY_DATE}:\s+)?(?:\d+\.\d+:\s+)?\[(?:Full GC|GC(?! concurrent-))\b"
+    rf"^(?:{LEGACY_DATE}:\s+)?(?:\d+[.,]\d+:\s+)?\[(?:Full GC|GC(?! concurrent-))\b"
 )
-_INNER_STAMP = rf"(?:{LEGACY_DATE}:\s*)?(?:\d+\.\d+:\s*)?"
+_INNER_STAMP = rf"(?:{LEGACY_DATE}:\s*)?(?:\d+[.,]\d+:\s*)?"
 # Text that appears inside a record but carries no pause data; removed before matching.
 LEGACY_NOISE: tuple[re.Pattern[str], ...] = (
     # -XX:+PrintTenuringDistribution table lines (whole physical lines)
@@ -109,7 +119,7 @@ LEGACY_NOISE: tuple[re.Pattern[str], ...] = (
 )
 MAX_CONTINUATION_LINES = 40
 LEGACY_TIMES_RE: re.Pattern[str] = re.compile(
-    r"\[Times: user=(?P<user>[\d.]+) sys=(?P<sys>[\d.]+),? real=(?P<real>[\d.]+) secs\]"
+    rf"\[Times: user=(?P<user>{DEC}) sys=(?P<sys>{DEC}),? real=(?P<real>{DEC}) secs\]"
 )
 # Concurrent phases carry their own [Times: ...]; they are not the pause's CPU time
 _CONCURRENT_WITH_TIMES = re.compile(r"\[CMS-concurrent-[^\]]*\]\s*\[Times:[^\]]*\]")
@@ -167,9 +177,9 @@ def legacy_cpu_times(log_lines: list[str], start: int, end: int) -> dict[str, fl
     if found is None:
         return {}
     return {
-        "cpu_user": float(found.group("user")),
-        "cpu_sys": float(found.group("sys")),
-        "cpu_real": float(found.group("real")),
+        "cpu_user": to_float(found.group("user")),
+        "cpu_sys": to_float(found.group("sys")),
+        "cpu_real": to_float(found.group("real")),
     }
 
 
@@ -211,7 +221,7 @@ def _legacy_stamp(text: str) -> tuple[str | None, float | None, str]:
     match = LEGACY_STAMP_RE.match(text)
     assert match is not None  # pattern can match the empty string
     uptime = match.group("uptime")
-    return match.group("timestamp"), float(uptime) if uptime else None, text[match.end() :]
+    return match.group("timestamp"), to_float(uptime) if uptime else None, text[match.end() :]
 
 
 _CAUSE = r"(?:\s*\((?P<cause>(?:[^()]|\([^()]*\))*)\))?"
@@ -219,7 +229,7 @@ _LEGACY_TAIL = (
     r"(?P<hb>\d+)K->(?P<ha>\d+)K\((?P<ht>\d+)K\)"
     r"(?:,\s*\[(?:Metaspace|PSPermGen|CMS Perm|Perm)\s*:\s+"
     r"(?P<mb>\d+)K->(?P<ma>\d+)K\((?P<mt>\d+)K\)\])?"
-    r",\s+(?P<pause>[\d.]+)\s+secs\]"
+    rf",\s+(?P<pause>{DEC})\s+secs\]"
 )
 
 # -XX:+PrintGC without details: "[GC (Allocation Failure)  65536K->10008K(251392K), 0.01 secs]"
@@ -257,7 +267,7 @@ class _LegacyParserBase:
         event = _new_event(
             gc_kind="Full" if match.group("full") == "Full GC" else "Young",
             cause=match.group("cause"),
-            pause=float(match.group("pause")),
+            pause=to_float(match.group("pause")),
             heap_before=int(match.group("hb")),
             heap_after=int(match.group("ha")),
             heap_total=int(match.group("ht")),
@@ -295,7 +305,7 @@ class ParallelGCParser(_LegacyParserBase):
         event = _new_event(
             gc_kind="Full" if match.group("full") == "Full GC" else "Young",
             cause=match.group("cause"),
-            pause=float(match.group("pause")),
+            pause=to_float(match.group("pause")),
             heap_before=heap[0],
             heap_after=heap[1],
             heap_total=heap[2],
@@ -329,19 +339,19 @@ class GenerationalGCParser(_LegacyParserBase):
     RECORD_RE: re.Pattern[str] = re.compile(
         rf"^\[(?P<full>Full GC|GC){_CAUSE}\s*"
         rf"(?:{_INNER_STAMP}\[(?P<ygen>ParNew|DefNew)\s*(?:\((?P<yflag>[^)]*)\))?:\s+"
-        r"(?P<yb>\d+)K->(?P<ya>\d+)K\((?P<yt>\d+)K\),\s+[\d.]+\s+secs\]\s*)?"
+        r"(?P<yb>\d+)K->(?P<ya>\d+)K\((?P<yt>\d+)K\),\s+[\d.,]+\s+secs\]\s*)?"
         rf"(?:{_INNER_STAMP}\[(?P<ogen>CMS|Tenured)\s*(?:\((?P<oflag>[^)]*)\))?:\s+"
-        r"(?P<ob>\d+)K->(?P<oa>\d+)K\((?P<ot>\d+)K\),\s+[\d.]+\s+secs\]\s*)?" + _LEGACY_TAIL
+        r"(?P<ob>\d+)K->(?P<oa>\d+)K\((?P<ot>\d+)K\),\s+[\d.,]+\s+secs\]\s*)?" + _LEGACY_TAIL
     )
     INITIAL_MARK_RE: re.Pattern[str] = re.compile(
         r"^\[GC\s*(?:\(CMS Initial Mark\)\s*)?\[1 CMS-initial-mark:\s+"
         r"(?P<oa>\d+)K\((?P<ot>\d+)K\)\]\s*(?P<ha>\d+)K\((?P<ht>\d+)K\),\s+"
-        r"(?P<pause>[\d.]+)\s+secs\]"
+        rf"(?P<pause>{DEC})\s+secs\]"
     )
     REMARK_RE: re.Pattern[str] = re.compile(
         r"^\[GC\s*(?:\(CMS Final Remark\))?.*\[1 CMS-remark:\s+"
         r"(?P<oa>\d+)K\((?P<ot>\d+)K\)\]\s*(?P<ha>\d+)K\((?P<ht>\d+)K\),\s+"
-        r"(?P<pause>[\d.]+)\s+secs\]"
+        rf"(?P<pause>{DEC})\s+secs\]"
     )
 
     def _parse_record(self, rest: str) -> RawEvent | None:
@@ -352,7 +362,7 @@ class GenerationalGCParser(_LegacyParserBase):
                 return _new_event(
                     gc_kind=kind,
                     cause="CMS Initial Mark" if kind == "Initial Mark" else "CMS Final Remark",
-                    pause=float(match.group("pause")),
+                    pause=to_float(match.group("pause")),
                     # these phases log occupancy, not a before->after transition
                     heap_before=heap_after,
                     heap_after=heap_after,
@@ -378,7 +388,7 @@ class GenerationalGCParser(_LegacyParserBase):
             # an old-generation collection inside the pause makes it a full collection
             gc_kind="Full" if match.group("full") == "Full GC" or has_old else "Young",
             cause=match.group("cause"),
-            pause=float(match.group("pause")),
+            pause=to_float(match.group("pause")),
             heap_before=heap[0],
             heap_after=heap[1],
             heap_total=heap[2],
@@ -420,18 +430,18 @@ class G1LegacyGCParser:
     PAUSE_RE: re.Pattern[str] = re.compile(
         rf"^\[GC pause\s*(?P<tags>(?:{PAREN_GROUP}\s*)+)"
         rf"(?:(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\))?,?\s+"
-        r"(?P<pause>[\d.]+)\s+secs\]"
+        rf"(?P<pause>{DEC})\s+secs\]"
     )
     FULL_RE: re.Pattern[str] = re.compile(
         rf"^\[Full GC{_CAUSE}\s+(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\),\s+"
-        r"(?P<pause>[\d.]+)\s+secs\]"
+        rf"(?P<pause>{DEC})\s+secs\]"
     )
     # Greedy ".*": sub-phases ("[Finalize Marking, 0.0001 secs]") come first; the remark
     # total is the last ", N secs]".
-    REMARK_RE: re.Pattern[str] = re.compile(r"^\[GC remark\b.*,\s+(?P<pause>[\d.]+)\s+secs\]")
+    REMARK_RE: re.Pattern[str] = re.compile(rf"^\[GC remark\b.*,\s+(?P<pause>{DEC})\s+secs\]")
     CLEANUP_RE: re.Pattern[str] = re.compile(
         rf"^\[GC cleanup\s+(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\),\s+"
-        r"(?P<pause>[\d.]+)\s+secs\]"
+        rf"(?P<pause>{DEC})\s+secs\]"
     )
     DETAIL_RE: re.Pattern[str] = re.compile(
         rf"\[Eden:\s+(?P<eb>{SIZE})\((?P<et>{SIZE})\)->(?P<ea>{SIZE})\({SIZE}\)\s+"
@@ -474,10 +484,11 @@ class G1LegacyGCParser:
                 **stamp,
                 gc_kind="Mixed" if "mixed" in tags else "Young",
                 cause=cause,
-                pause=float(match.group("pause")),
+                pause=to_float(match.group("pause")),
                 humongous_detected=cause is not None and "Humongous" in cause,
                 to_space_exhausted=to_space,
                 evacuation_failed=to_space,
+                concurrent_start="initial-mark" in tags,
             )
             if match.group("hb") is not None:
                 self._apply_heap(event, match)
@@ -487,17 +498,23 @@ class G1LegacyGCParser:
                 **stamp,
                 gc_kind="Full",
                 cause=match.group("cause"),
-                pause=float(match.group("pause")),
+                pause=to_float(match.group("pause")),
             )
             self._apply_heap(event, match)
             return event
         if match := self.REMARK_RE.match(rest):
             return _new_event(
-                **stamp, gc_kind="Remark", cause="G1 Remark", pause=float(match.group("pause"))
+                **stamp,
+                gc_kind="Remark",
+                cause="G1 Remark",
+                pause=to_float(match.group("pause")),
             )
         if match := self.CLEANUP_RE.match(rest):
             event = _new_event(
-                **stamp, gc_kind="Cleanup", cause="G1 Cleanup", pause=float(match.group("pause"))
+                **stamp,
+                gc_kind="Cleanup",
+                cause="G1 Cleanup",
+                pause=to_float(match.group("pause")),
             )
             self._apply_heap(event, match)
             return event
@@ -633,7 +650,7 @@ def parse_unified_prefix_times(line: str) -> tuple[str | None, float | None]:
 UNIFIED_PAUSE_RE: re.Pattern[str] = re.compile(
     r"^GC\((?P<gc_id>\d+)\)\s+Pause\s+(?P<type>Young|Mixed|Full|Initial Mark|Remark|Cleanup)\b"
     rf"\s*(?P<tags>(?:{PAREN_GROUP}\s*)*)"
-    rf"(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\)\s+(?P<pause>[\d.]+)\s*ms$"
+    rf"(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\)\s+(?P<pause>{DEC})\s*ms$"
 )
 # Tags that describe the young-pause phase, not the cause
 G1_YOUNG_PHASE_TAGS: frozenset[str] = frozenset(
@@ -656,7 +673,7 @@ UNIFIED_METASPACE_RE: re.Pattern[str] = re.compile(
 )
 UNIFIED_TO_SPACE_RE: re.Pattern[str] = re.compile(r"^GC\((?P<gc_id>\d+)\)\s+To-space exhausted")
 UNIFIED_CPU_RE: re.Pattern[str] = re.compile(
-    r"^GC\((?P<gc_id>\d+)\)\s+User=(?P<user>[\d.]+)s Sys=(?P<sys>[\d.]+)s Real=(?P<real>[\d.]+)s"
+    rf"^GC\((?P<gc_id>\d+)\)\s+User=(?P<user>{DEC})s Sys=(?P<sys>{DEC})s Real=(?P<real>{DEC})s"
 )
 YOUNG_GENERATIONS: frozenset[str] = frozenset({"PSYoungGen", "DefNew", "ParNew"})
 
@@ -753,9 +770,9 @@ class UnifiedGCParser:
                 if gc_id not in by_id:
                     continue  # CPU times follow their pause line; never hold them for a later one
                 update = {
-                    "cpu_user": float(m.group("user")),
-                    "cpu_sys": float(m.group("sys")),
-                    "cpu_real": float(m.group("real")),
+                    "cpu_user": to_float(m.group("user")),
+                    "cpu_sys": to_float(m.group("sys")),
+                    "cpu_real": to_float(m.group("real")),
                 }
 
             if gc_id is None or not update:
@@ -796,13 +813,16 @@ class UnifiedGCParser:
             uptime=prefix.uptime,
             gc_kind=kind,
             cause=cause,
-            pause=float(match.group("pause")) / 1000,
+            pause=to_float(match.group("pause")) / 1000,
             heap_before=parse_size_to_kb(match.group("hb")),
             heap_after=parse_size_to_kb(match.group("ha")),
             heap_total=parse_size_to_kb(match.group("ht")),
             humongous_detected=cause is not None and "Humongous" in cause,
             evacuation_failed=evacuation_failed,
             to_space_exhausted=False,
+            # JDK 9-11 "Pause Initial Mark" and JDK 12+ "(Concurrent Start)" start G1 marking
+            concurrent_start=self.gc_type_name == "G1 GC"
+            and (pause_type == "Initial Mark" or "Concurrent Start" in tags),
             stamp_at_pause_end=True,  # the pause line is written when the pause finishes
         )
 
@@ -822,9 +842,17 @@ def apply_region_counts(event: RawEvent) -> None:
         if eden is not None and survivor is not None:
             event[f"young_{when}"] = (eden + survivor) * region_kb
         old = regions("old", when)
+        humongous = regions("humongous", when)
+        if humongous is not None:
+            event[f"humongous_{when}"] = humongous * region_kb
         if old is not None:
-            extra = (regions("humongous", when) or 0) + (regions("archive", when) or 0)
+            extra = (humongous or 0) + (regions("archive", when) or 0)
             event[f"old_{when}"] = (old + extra) * region_kb
+    old_before, old_after = regions("old", "before"), regions("old", "after")
+    if old_before is not None and old_after is not None:
+        # "Old regions" alone: humongous regions freed in the same pause would otherwise
+        # cancel what the pause promoted
+        event["promoted"] = max(0, old_after - old_before) * region_kb
     if "old_after" in event and event.get("heap_total"):
         # G1 has no fixed old-gen size; the committed heap is the capacity old can grow into
         event["old_total"] = event["heap_total"]
@@ -836,65 +864,112 @@ def apply_region_counts(event: RawEvent) -> None:
 
 # JDK 11: "GC(1) Concurrent Cycle 250.000ms"; JDK 17+: "GC(4) Concurrent Mark Cycle 80.1ms"
 UNIFIED_CONCURRENT_CYCLE_RE: re.Pattern[str] = re.compile(
-    r"\bGC\(\d+\) Concurrent (?:Mark |Undo )?Cycle (?P<ms>[\d.]+)ms\s*$"
+    rf"\bGC\(\d+\) Concurrent (?:Mark |Undo )?Cycle (?P<ms>{DEC})ms\s*$"
+)
+# Unified CMS: "GC(1) Concurrent Mark 450.000ms", "GC(1) Concurrent Sweep 300.000ms". (G1's
+# "Concurrent Mark (1.2s, 1.3s) 111ms" carries a parenthesis and is covered by its Cycle line.)
+UNIFIED_CMS_CONCURRENT_RE: re.Pattern[str] = re.compile(
+    rf"\bGC\(\d+\) Concurrent (?P<phase>Mark|Sweep) (?P<ms>{DEC})ms\s*$"
 )
 LEGACY_G1_CONCURRENT_MARK_RE: re.Pattern[str] = re.compile(
-    r"\[GC concurrent-mark-end, (?P<seconds>[\d.]+) secs\]"
+    rf"\[GC concurrent-mark-end, (?P<seconds>{DEC}) secs\]"
 )
 # "[CMS-concurrent-mark: 0.100/0.200 secs]": CPU time / elapsed time
 LEGACY_CMS_CONCURRENT_RE: re.Pattern[str] = re.compile(
-    r"\[CMS-concurrent-(?:mark|sweep): [\d.]+/(?P<seconds>[\d.]+) secs\]"
+    rf"\[CMS-concurrent-(?P<phase>mark|sweep): {DEC}/(?P<seconds>{DEC}) secs\]"
 )
 # -XX:+PrintGCApplicationStoppedTime (Java 8) and -Xlog:safepoint (JDK 9-12)
 STOPPED_TIME_RE: re.Pattern[str] = re.compile(
-    r"Total time for which application threads were stopped: (?P<stopped>[\d.]+) seconds"
-    r"(?:, Stopping threads took: (?P<stopping>[\d.]+) seconds)?"
+    rf"Total time for which application threads were stopped: (?P<stopped>{DEC}) seconds"
+    rf"(?:, Stopping threads took: (?P<stopping>{DEC}) seconds)?"
 )
+# -Xlog:safepoint on JDK 13+ (runtime/safepoint.cpp, SafepointTracing::end). Fields between
+# "Reaching safepoint" and "Total" differ by release (Cleanup, At safepoint, Leaving
+# safepoint), and newer releases append a thread count:
+#   Safepoint "G1CollectForAllocation", Time since last: 1 ns, Reaching safepoint: 2 ns,
+#   Cleanup: 3 ns, At safepoint: 4 ns, Total: 9 ns
+SAFEPOINT_RE: re.Pattern[str] = re.compile(
+    r'Safepoint "(?P<operation>[^"]+)", Time since last: \d+ ns, '
+    r"Reaching safepoint: (?P<reaching>\d+) ns, .*?\bTotal: (?P<total>\d+) ns"
+)
+# G1 at debug level: "GC(12) MMU target violated: 201.0ms (200.0ms/201.0ms)"
+MMU_VIOLATED_RE: re.Pattern[str] = re.compile(rf"MMU target violated: (?P<ms>{DEC})ms")
 
 
-def _line_time(line: str) -> str:
-    """Time of a log line as written: datestamp if present, else uptime."""
+def _line_stamp(line: str) -> tuple[str | None, float | None]:
+    """(datestamp, uptime seconds) of a log line of either family."""
     if line.startswith("["):
-        prefix = parse_unified_prefix_times(line)
-        if prefix[0]:
-            return prefix[0]
-        return f"uptime {prefix[1]:.3f}s" if prefix[1] is not None else ""
+        return parse_unified_prefix_times(line)
     timestamp, uptime, _ = _legacy_stamp(line)
+    return timestamp, uptime
+
+
+def _side_record(kind: str, index: int, line: str, seconds: float, **fields: Any) -> SideRecord:
+    timestamp, uptime = _line_stamp(line)
+    when = timestamp or (f"uptime {uptime:.3f}s" if uptime is not None else "")
+    parsed: datetime | None = None
     if timestamp:
-        return timestamp
-    return f"uptime {uptime:.3f}s" if uptime is not None else ""
+        try:
+            parsed = parse_log_timestamp(timestamp)
+        except ValueError:
+            parsed = None
+    return SideRecord(
+        kind=kind,  # pyright: ignore[reportArgumentType] - callers pass the three literals
+        line_number=index + 1,
+        seconds=seconds,
+        when=when,
+        uptime_seconds=uptime,
+        timestamp=parsed,
+        **fields,
+    )
 
 
 def scan_side_records(log_lines: list[str]) -> list[SideRecord]:
-    """Concurrent-work durations and application-stopped times, in line order."""
+    """Concurrent-work durations, safepoints and G1 pause-goal misses, in line order."""
     records: list[SideRecord] = []
     for index, line in enumerate(log_lines):
         if "oncurrent" in line:
+            phase = "cycle"
             if match := UNIFIED_CONCURRENT_CYCLE_RE.search(line):
-                seconds, label = float(match.group("ms")) / 1000, "G1 concurrent cycles"
+                seconds, label = to_float(match.group("ms")) / 1000, "G1 concurrent cycles"
+            elif match := UNIFIED_CMS_CONCURRENT_RE.search(line):
+                seconds = to_float(match.group("ms")) / 1000
+                label, phase = "CMS concurrent mark and sweep phases", match.group("phase").lower()
             elif match := LEGACY_G1_CONCURRENT_MARK_RE.search(line):
-                seconds, label = float(match.group("seconds")), "G1 concurrent marking phases"
+                seconds, label = to_float(match.group("seconds")), "G1 concurrent marking phases"
+                phase = "mark"
             elif match := LEGACY_CMS_CONCURRENT_RE.search(line):
-                seconds, label = (
-                    float(match.group("seconds")),
-                    "CMS concurrent mark and sweep phases",
-                )
+                seconds = to_float(match.group("seconds"))
+                label, phase = "CMS concurrent mark and sweep phases", match.group("phase")
             else:
                 continue
             records.append(
-                SideRecord(kind="concurrent", line_number=index + 1, seconds=seconds, label=label)
+                _side_record("concurrent", index, line, seconds, label=label, phase=phase)
             )
         elif "application threads were stopped" in line and (match := STOPPED_TIME_RE.search(line)):
             stopping = match.group("stopping")
             records.append(
-                SideRecord(
-                    kind="safepoint",
-                    line_number=index + 1,
-                    seconds=float(match.group("stopped")),
-                    stopping_seconds=float(stopping) if stopping else None,
-                    when=_line_time(line),
+                _side_record(
+                    "safepoint",
+                    index,
+                    line,
+                    to_float(match.group("stopped")),
+                    stopping_seconds=to_float(stopping) if stopping else None,
                 )
             )
+        elif 'Safepoint "' in line and (match := SAFEPOINT_RE.search(line)):
+            records.append(
+                _side_record(
+                    "safepoint",
+                    index,
+                    line,
+                    int(match.group("total")) / 1e9,
+                    stopping_seconds=int(match.group("reaching")) / 1e9,
+                    operation=match.group("operation"),
+                )
+            )
+        elif "MMU target violated" in line and (match := MMU_VIOLATED_RE.search(line)):
+            records.append(_side_record("mmu", index, line, to_float(match.group("ms")) / 1000))
     return records
 
 

@@ -20,7 +20,7 @@ def parse_log_timestamp(timestamp_str: str) -> datetime:
 
     A datestamp without a UTC offset is taken as UTC (``timestamp_has_offset`` tells callers).
     """
-    text = timestamp_str.strip().replace("Z", "+00:00")
+    text = timestamp_str.strip().replace("Z", "+00:00").replace(",", ".")
     if re.search(r"[+-]\d{4}$", text):
         text = f"{text[:-2]}:{text[-2:]}"
     parsed = datetime.fromisoformat(text)
@@ -101,6 +101,10 @@ def normalize_event(
         old_after_kb=old_after,
         old_total_kb=old_total,
         old_used_percentage=old_used_pct,
+        concurrent_start=raw_event.get("concurrent_start", False),
+        humongous_before_kb=raw_event.get("humongous_before"),
+        humongous_after_kb=raw_event.get("humongous_after"),
+        promoted_kb=raw_event.get("promoted"),
         humongous_detected=raw_event.get("humongous_detected", False),
         evacuation_failed=raw_event.get("evacuation_failed", False),
         to_space_exhausted=raw_event.get("to_space_exhausted", False),
@@ -121,10 +125,10 @@ def normalize_event(
 
 def parse_size_to_kb(size_text: str) -> int:
     """Parse a JVM size token like '1024K', '1.5M', '0.0B' into KB."""
-    match = re.fullmatch(r"(?P<value>[\d.]+)(?P<unit>[BKMG])", size_text.strip())
+    match = re.fullmatch(r"(?P<value>[\d.,]+)(?P<unit>[BKMG])", size_text.strip())
     if not match:
         raise ValueError(f"Unrecognized size token: {size_text}")
-    value = float(match.group("value"))
+    value = float(match.group("value").replace(",", "."))
     unit = match.group("unit")
     if unit == "B":
         return int(value / 1024)

@@ -36,7 +36,7 @@ LEGACY_CONCURRENT_FRAGMENT: re.Pattern[str] = re.compile(r"\[GC concurrent-[^\]]
 # Unified logging line carrying a GC id. Only the line ending in a duration is the pause
 # record; "gc,start" openers and gc,heap detail lines for the same GC id are not.
 UNIFIED_GC_ID_LINE: re.Pattern[str] = re.compile(r"^\[[^\]]*\].*\bGC\(\d+\)")
-UNIFIED_DURATION_SUFFIX: re.Pattern[str] = re.compile(r"[\d.]+\s*ms$")
+UNIFIED_DURATION_SUFFIX: re.Pattern[str] = re.compile(r"[\d.,]+\s*ms$")
 UNPARSED_SAMPLE_LIMIT = 5
 UNPARSED_SAMPLE_MAX_CHARS = 160
 UNPARSED_WARNING_THRESHOLD_PCT = 1.0

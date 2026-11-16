@@ -64,6 +64,15 @@ class GCEvent(BaseModel):
     concurrent_mode_failure: bool = False
     promotion_failed: bool = False
 
+    # G1 pause that also starts concurrent marking ("Concurrent Start" / "initial-mark")
+    concurrent_start: bool = False
+    # G1 humongous regions before/after the pause (unified logs with gc+heap region counts)
+    humongous_before_kb: KilobytesValue | None = None
+    humongous_after_kb: KilobytesValue | None = None
+    # Growth of G1 "Old regions" alone across the pause: what a young collection promoted.
+    # (old_after - old_before also contains humongous regions freed in the same pause.)
+    promoted_kb: KilobytesValue | None = None
+
     # Metaspace
     metaspace_before_kb: KilobytesValue | None = None
     metaspace_after_kb: KilobytesValue | None = None
@@ -111,12 +120,23 @@ class DiagnosticThresholds(BaseModel):
     gc_overhead_critical_percentage: float = 20.0
     gc_overhead_warning_percentage: float = 10.0
 
-    pause_critical_seconds: float = 10.0
-    pause_warning_seconds: float = 5.0
-    pause_extreme_seconds: float = 60.0
+    # P99 pause (of the kind of pause with the worst P99). Defaults suit a request-serving
+    # JVM (Tomcat behind a proxy); ``for_workload("batch")`` gives the throughput-first set.
+    pause_critical_seconds: float = 5.0
+    pause_warning_seconds: float = 1.0
+    # Any single stop this long, GC pause or other safepoint
+    longest_pause_critical_seconds: float = 30.0
+    longest_pause_warning_seconds: float = 5.0
 
+    # Second half below this share of the first half, with a monotonic trend
     reclamation_decline_threshold: float = 0.7
     full_gc_acceleration_threshold: float = 0.7
+    # Half-versus-half comparisons of Full GCs need at least this many heap-pressure Full GCs
+    min_full_gcs_for_trend: int = 6
+    # Mann-Kendall significance for every trend test (floors, Full GC intervals, reclaim)
+    trend_p_value: float = 0.05
+    # A significant floor trend only matters when it moves the floor this far over the span
+    trend_min_growth_capacity_percentage: float = 5.0
 
     # P1.4: per-hour rates and rate-based warnings need at least this much log
     min_rate_window_hours: float = 1.0
@@ -126,9 +146,6 @@ class DiagnosticThresholds(BaseModel):
     # P1.1: the old-gen floor trend needs this many floors spanning this long
     min_floor_count: int = 3
     min_floor_span_hours: float = 1.0
-    # A floor slope only counts as a leak signal when the line fits reasonably
-    min_floor_r_squared: float = 0.5
-
     # Share of wall-clock time paused inside the worst 5-minute stretch
     pause_share_critical_percentage: float = 50.0
     pause_share_warning_percentage: float = 25.0
@@ -145,15 +162,48 @@ class DiagnosticThresholds(BaseModel):
     # Concurrent collector work above this share of the window is near-continuous marking
     concurrent_share_warning_percentage: float = 25.0
     floor_step_min_capacity_percentage: float = 10.0
+    # G1: humongous regions holding this share of the max heap, or humongous allocation
+    # making up this share of all allocation, is a humongous-object problem
+    humongous_heap_share_warning_percentage: float = 10.0
+    humongous_allocation_share_warning_percentage: float = 20.0
+
+    @classmethod
+    def for_workload(cls, workload: str) -> DiagnosticThresholds:
+        """Thresholds for a "server" (request-serving, the default) or "batch" workload.
+
+        "batch" restores the limits used before v6: P99 over 5 s / 10 s, and a single pause
+        only matters from 60 s (critical from 300 s).
+        """
+        if workload == "server":
+            return cls()
+        if workload == "batch":
+            return cls(
+                pause_warning_seconds=5.0,
+                pause_critical_seconds=10.0,
+                longest_pause_warning_seconds=60.0,
+                longest_pause_critical_seconds=300.0,
+            )
+        raise ValueError(f"--workload must be 'server' or 'batch', not {workload!r}")
 
 
-class LeakSeverity(BaseModel):
-    """Memory leak severity assessment (no time-to-OOM extrapolation)."""
+type LeakVerdictName = Literal["growing", "step_change", "full", "none", "not_assessed"]
 
-    score: float = Field(ge=0.0, le=100.0)
-    severity_level: Literal["None", "Low", "Medium", "High", "Critical"]
-    assessed: bool = True
-    indicators: list[str] = Field(default_factory=list)
+
+class LeakVerdict(BaseModel):
+    """What the log shows about the live set, with the evidence for it.
+
+    growing: floors after cleaning collections rise (trend test passed, growth is material).
+    step_change: the live set jumped between two collections and stayed up.
+    full: live data fills the space and no growth trend explains it (or none could be tested).
+    none: floors (or, without floors, the lowest heap after GC) show no material growth.
+    not_assessed: the log has nothing to measure the live set with.
+    """
+
+    verdict: LeakVerdictName = "not_assessed"
+    evidence: list[str] = Field(default_factory=list)
+    # "floors" (after collections that clean the old generation) or "upper bound" (lowest
+    # heap after any GC: includes uncollected garbage, so it can only rule growth out)
+    basis: Literal["floors", "upper bound", ""] = ""
 
 
 class MetaspaceAnalysis(BaseModel):
@@ -193,7 +243,9 @@ class JVMHeapConfig(BaseModel):
     max_ram_percentage: int | None = None  # -XX:MaxRAMPercentage
     max_ram_fraction: int | None = None  # -XX:MaxRAMFraction (legacy)
     soft_max_heap_size_bytes: int | None = None  # -XX:SoftMaxHeapSize (ZGC)
+    min_heap_size_bytes: int | None = None  # JDK 17+ gc,init "Heap Min Capacity"
     always_pre_touch: bool | None = None  # -XX:+AlwaysPreTouch
+    heap_dump_on_out_of_memory_error: bool | None = None  # -XX:+HeapDumpOnOutOfMemoryError
     thread_stack_size_kb: int | None = None  # -XX:ThreadStackSize
     new_ratio: int | None = None  # -XX:NewRatio
     survivor_ratio: int | None = None  # -XX:SurvivorRatio
@@ -264,6 +316,24 @@ class G1Metrics(BaseModel):
     evacuation_failure_count: int
     to_space_exhausted_count: int
     concurrent_marking_cycles: int = 0
+    # Pauses that started marking, and how many of those name a humongous allocation as cause
+    concurrent_start_count: int = 0
+    humongous_concurrent_start_count: int = 0
+    # Old-generation occupancy (old + humongous) right after the pauses that start marking,
+    # as % of max heap: where G1's marking threshold sits in practice
+    median_marking_start_pct: float | None = None
+    marking_cycles_per_hour: float | None = None
+    mixed_per_marking_cycle: float | None = None
+    # Humongous regions (None when the log has no region counts)
+    peak_humongous_kb: int | None = None
+    peak_humongous_pct: float | None = None  # of max (or committed) heap
+    # Median humongous occupancy before a pause: what humongous objects normally hold. The
+    # warning is judged on this, not on the peak, which a single burst can set.
+    typical_humongous_kb: int | None = None
+    typical_humongous_pct: float | None = None
+    humongous_allocation_mb_sec: float | None = None
+    humongous_allocation_share_pct: float | None = None  # of all allocation
+    mmu_violation_count: int = 0
     g1_warnings: list[str] = Field(default_factory=list)
 
 
@@ -345,12 +415,20 @@ class SideRecord(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    kind: Literal["concurrent", "safepoint"]
+    kind: Literal["concurrent", "safepoint", "mmu"]
     line_number: int  # 1-based
     seconds: float  # concurrent work duration, or total time the application was stopped
     stopping_seconds: float | None = None  # safepoint: time to bring the threads to a stop
     label: str = ""  # concurrent: what the duration covers
     when: str = ""  # time as written in the log
+    # safepoint (JDK 13+): the VM operation, e.g. "G1CollectForAllocation", "ThreadDump"
+    operation: str = ""
+    # concurrent: "mark", "sweep" (CMS: the old generation has just been cleaned) or "cycle"
+    phase: str = ""
+    # When the line was written (the end of what it reports), for placing it among pauses
+    uptime_seconds: float | None = None
+    timestamp: datetime | None = None
+    source_file: str | None = None
 
 
 class ConcurrentStats(BaseModel):
@@ -362,6 +440,10 @@ class ConcurrentStats(BaseModel):
     share_percentage: float | None  # of the window; None for a window without elapsed time
     average_seconds: float
     longest_seconds: float
+    # Time from the first to the last cycle; None when the lines carry no time
+    first_when: str = ""
+    last_when: str = ""
+    span_seconds: float | None = None
 
 
 class SafepointStats(BaseModel):
@@ -375,6 +457,15 @@ class SafepointStats(BaseModel):
     slow_to_stop_count: int = 0
     longest_stopping_seconds: float = 0.0
     longest_stopping_when: str = ""
+    # Stops no GC pause overlaps (thread dumps, deoptimization, biased-lock revocation, ...).
+    # None when the stops could not be placed in time against the pauses.
+    non_gc_count: int | None = None
+    non_gc_total_seconds: float = 0.0
+    longest_non_gc_seconds: float = 0.0
+    longest_non_gc_when: str = ""
+    longest_non_gc_operation: str = ""
+    longest_non_gc_stopping_seconds: float | None = None
+    non_gc_over_warning_count: int = 0
 
 
 class CpuStats(BaseModel):
@@ -388,6 +479,9 @@ class CpuStats(BaseModel):
     # real > 1.5 x (user + sys): the collector was waiting, not running
     off_cpu_count: int = 0
     worst_off_cpu: str = ""
+    # Median (user + sys) / real per pause kind over the judged pauses: how many threads'
+    # worth of CPU the collector actually used
+    parallelism_by_kind: dict[str, float] = Field(default_factory=dict)
 
 
 class JVMEnvironment(BaseModel):
@@ -441,6 +535,8 @@ class Finding(BaseModel):
     confidence: Literal["high", "medium", "low"] = "high"
     action: str = ""
     source: str = ""  # documentation the action restates
+    # "cause": what went wrong first; "symptom": what followed from it; "": unrelated
+    role: Literal["cause", "symptom", ""] = ""
 
 
 class TimelineBucket(BaseModel):
@@ -491,7 +587,12 @@ class FloorStep(BaseModel):
 
 
 class FloorTrend(BaseModel):
-    """Least-squares trend of post-collection floors: the leak signal."""
+    """Trend of post-collection floors: the leak signal.
+
+    The slope is the Theil-Sen estimate (median of all pairwise slopes), which a few outlying
+    floors cannot drag; whether a trend exists is the Mann-Kendall test; whether it matters
+    is the growth over the span as a share of capacity.
+    """
 
     assessed: bool
     reason: str | None = None  # why not assessed
@@ -502,7 +603,24 @@ class FloorTrend(BaseModel):
     span_hours: float = 0.0
     slope_mb_per_hour: float | None = None
     slope_pct_per_hour: float | None = None
-    r_squared: float | None = None
+    # Mann-Kendall two-sided p-value of "the floors have a monotonic trend"
+    p_value: float | None = None
+    # slope x span, as MB and as % of capacity
+    growth_mb: float | None = None
+    growth_pct_of_capacity: float | None = None
+    # "growing": significant and material; "stable": no material growth; "unclear": the
+    # floors moved materially but not consistently
+    direction: Literal["growing", "stable", "unclear"] | None = None
+    # 90% confidence interval of the slope (Sen), and the hours until the floor reaches
+    # capacity at those slopes if growth stays linear (None = not within reach)
+    slope_low_mb_per_hour: float | None = None
+    slope_high_mb_per_hour: float | None = None
+    hours_to_capacity_soonest: float | None = None
+    hours_to_capacity_latest: float | None = None
+    # Floors the statistics were computed on (an even sample when there are very many)
+    trend_sample_size: int = 0
+    # True when the window spans several JVM runs and only the latest run's floors are used
+    latest_run_only: bool = False
     first_mb: float | None = None
     last_mb: float | None = None
     step_change: FloorStep | None = None
@@ -511,6 +629,26 @@ class FloorTrend(BaseModel):
     def trend_floors(self) -> list[FloorPoint]:
         """Floors the trend is computed from (start-up floors left out)."""
         return [f for f in self.floors if not f.warmup]
+
+
+class LiveSetBound(BaseModel):
+    """Lowest heap after GC in each slice of the window: an upper bound on the live set.
+
+    Used when the window has too few floors. It still contains old-generation garbage that
+    no collection has removed yet, so a flat bound rules growth out, while a rising bound
+    proves nothing.
+    """
+
+    assessed: bool = False
+    slices: int = 0
+    span_hours: float = 0.0
+    first_kb: int = 0
+    last_kb: int = 0
+    lowest_kb: int = 0
+    highest_kb: int = 0
+    growth_pct_of_capacity: float | None = None
+    p_value: float | None = None
+    direction: Literal["flat", "rising", "unclear"] | None = None
 
 
 class HeapStats(BaseModel):
@@ -533,6 +671,11 @@ class HeapStats(BaseModel):
     collecting_events_with_heap_data: int = 0
     # Occupancy above the stated max heap: the max heap value is wrong for this log
     exceeds_max_heap: bool = False
+    # Committed heap as logged with each pause: growth means -Xms is below -Xmx
+    first_committed_kb: int = 0
+    last_committed_kb: int = 0
+    min_committed_kb: int = 0
+    max_committed_kb: int = 0
 
 
 class PeriodStatistics(BaseModel):
@@ -576,6 +719,7 @@ class GCSummary(BaseModel):
     initial_mark_count: int = 0
     remark_gc_count: int = 0
     cleanup_gc_count: int = 0
+    promotion_failure_count: int = 0  # any generational collector
     heap_full_gc_count: int = 0  # Full GCs not explained by System.gc()/metadata
     explicit_full_gc_count: int = 0
     metadata_full_gc_count: int = 0
@@ -588,6 +732,8 @@ class GCSummary(BaseModel):
     avg_full_gc_interval_min: float | None = None
     min_full_gc_interval_min: float | None = None
     time_to_first_full_gc_hours: float | None = None
+    # True: measured from JVM start (uptime); False: from the first pause in the window
+    time_to_first_full_gc_from_jvm_start: bool = False
     full_gc_accelerating: bool = False
     # Most heap-pressure Full GCs with the last starting within the streak window of the
     # first one finishing
@@ -607,6 +753,15 @@ class GCSummary(BaseModel):
     # Pauses
     overall_pauses: PauseStats = Field(default_factory=PauseStats)
     pauses_by_kind: dict[str, PauseStats] = Field(default_factory=dict)
+    # The kind of pause with the highest P99 among kinds with at least 100 pauses (a P99 of
+    # fewer is just the maximum); None when no kind has that many, and the all-pauses P99 is
+    # used. Thousands of millisecond-long Cleanup pauses otherwise hide a slow kind.
+    worst_p99_kind: str | None = None
+    worst_p99_seconds: float = 0.0
+    worst_p99_count: int = 0
+    longest_pause_kind: str = ""
+    longest_pause_cause: str = ""
+    longest_pause_when: str = ""
     pauses_over_1s: int = 0
     pauses_over_5s: int = 0
     pauses_over_30s: int = 0
@@ -640,10 +795,13 @@ class GCSummary(BaseModel):
     promotion_rate_mb_sec: float | None = None
     allocation_rate_mb_sec: float | None = None
     allocation_basis: str | None = None  # "young generation" or "whole heap"
+    # G1 evacuation failures after JVM start-up (the ones that count against steady state)
+    evacuation_failures_after_warmup: int = 0
 
     period_stats: dict[str, PeriodStatistics] = Field(default_factory=dict)
 
-    leak_severity: LeakSeverity
+    leak: LeakVerdict = Field(default_factory=LeakVerdict)
+    live_set_bound: LiveSetBound = Field(default_factory=LiveSetBound)
     metaspace_analysis: MetaspaceAnalysis | None = None
     g1_metrics: G1Metrics | None = None
     cms_metrics: CMSMetrics | None = None
@@ -660,6 +818,9 @@ class GCSummary(BaseModel):
     concurrent_stats: ConcurrentStats | None = None
     safepoint_stats: SafepointStats | None = None
     environment: JVMEnvironment | None = None
+
+    # The limits this summary was judged against (so the report can name them)
+    thresholds: DiagnosticThresholds = Field(default_factory=DiagnosticThresholds)
 
     # Health warnings and data-quality notes, kept apart. ``warnings`` holds the same
     # warnings as ``health_warnings`` as "WARNING: ..."/"CRITICAL: ..." lines.

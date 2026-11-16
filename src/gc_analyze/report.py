@@ -19,15 +19,18 @@ from rich.text import Text
 from rich.theme import Theme
 
 from .analysis import (
+    MIN_PAUSES_FOR_P99,
     cleaned_floors,
     describe_floor_step,
+    describe_time_to_capacity,
+    describe_trend_numbers,
     format_duration,
     format_mb_per_hour,
     format_time,
     max_events_in_window,
 )
 from .coverage import build_unparsed_warning
-from .findings import build_findings
+from .findings import build_diagnosis, build_findings, overall_status
 from .models import (
     GC_KINDS,
     CandidateCoverage,
@@ -88,6 +91,8 @@ class ReportContext:
     comparison: GCSummary | None = None  # same window 24 h earlier (P2.2)
     comparison_label: str = ""
     inputs: list[str] = field(default_factory=list[str])
+    # Built once (cli) so the report and the exit code use the same list; None = build here
+    findings: list[Finding] | None = None
 
 
 # ============================================================
@@ -214,24 +219,44 @@ def _rate_or_count(count: int, per_hour: float | None, summary: GCSummary, digit
     return f"{count} in {format_duration(summary.runtime_seconds)} (window too short for a rate)"
 
 
-def _interpret_gc_overhead(overhead_pct: float) -> str:
-    if overhead_pct > 20:
-        return "critical, application severely impacted; target <5%"
-    if overhead_pct > 10:
-        return "elevated, investigate allocation hotspots; target <5%"
-    if overhead_pct > 5:
-        return "moderate; target <5%"
-    return "healthy"
+def _interpret_gc_overhead(summary: GCSummary) -> str:
+    limits = summary.thresholds
+    if summary.gc_overhead_pct > limits.gc_overhead_critical_percentage:
+        return (
+            f"over the {limits.gc_overhead_critical_percentage:g}% critical limit: the "
+            "application is severely slowed"
+        )
+    if summary.gc_overhead_pct > limits.gc_overhead_warning_percentage:
+        return f"over the {limits.gc_overhead_warning_percentage:g}% warning limit"
+    return f"under the {limits.gc_overhead_warning_percentage:g}% warning limit"
 
 
-def _interpret_p99_pause(p99_seconds: float) -> str:
-    if p99_seconds > 10:
-        return "1-in-100 pauses this long; severe impact on latency"
-    if p99_seconds > 5:
-        return "1-in-100 pauses this long; may impact latency-sensitive workloads"
-    if p99_seconds > 1:
-        return "1-in-100 pauses this long; monitor for latency impact"
-    return "1-in-100 pauses this long; within normal range"
+def _interpret_p99_pause(summary: GCSummary) -> str:
+    limits = summary.thresholds
+    p99 = summary.worst_p99_seconds
+    if p99 > limits.pause_critical_seconds:
+        return f"over the {limits.pause_critical_seconds:g} s critical limit"
+    if p99 > limits.pause_warning_seconds:
+        return f"over the {limits.pause_warning_seconds:g} s warning limit"
+    return f"within the {limits.pause_warning_seconds:g} s limit"
+
+
+def describe_p99(summary: GCSummary) -> str:
+    """P99 of the kind of pause with the worst one, or why a P99 is not shown."""
+    if summary.worst_p99_count < MIN_PAUSES_FOR_P99:
+        return (
+            f"n/a (only {summary.total_event_count} pauses; a P99 needs about {MIN_PAUSES_FOR_P99})"
+        )
+    if summary.worst_p99_kind is None:
+        return (
+            f"{summary.worst_p99_seconds:.3f}s over all {summary.worst_p99_count} pauses "
+            f"({_interpret_p99_pause(summary)})"
+        )
+    return (
+        f"{summary.worst_p99_seconds:.3f}s for the {summary.worst_p99_count} "
+        f"{summary.worst_p99_kind} pauses, the slowest kind with enough pauses for a P99 "
+        f"({_interpret_p99_pause(summary)}); all pauses together {summary.overall_pauses.p99:.3f}s"
+    )
 
 
 def format_pause_share(window: PauseShareWindow) -> str:
@@ -250,7 +275,7 @@ def _window_name(seconds: float) -> str:
 def _overhead_text(summary: GCSummary) -> str:
     if not summary.overhead_measured:
         return "n/a (single pause: no elapsed time to measure against)"
-    return f"{summary.gc_overhead_pct:.2f}% ({_interpret_gc_overhead(summary.gc_overhead_pct)})"
+    return f"{summary.gc_overhead_pct:.2f}% ({_interpret_gc_overhead(summary)})"
 
 
 def _fullest_cleaned_floor(summary: GCSummary) -> str | None:
@@ -334,8 +359,16 @@ def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
             )
         )
     if summary.time_to_first_full_gc_hours is not None:
+        origin = (
+            "after JVM start"
+            if summary.time_to_first_full_gc_from_jvm_start
+            else "after the first pause in the window"
+        )
         rows.append(
-            ("Time to first heap Full GC", f"{summary.time_to_first_full_gc_hours:.2f} hours")
+            (
+                "First heap Full GC",
+                f"{summary.time_to_first_full_gc_hours:.2f} hours {origin}",
+            )
         )
     if summary.max_full_gc_streak > 1:
         rows.append(
@@ -524,6 +557,8 @@ def build_floor_rows(summary: GCSummary) -> list[tuple[str, str]]:
     trend = summary.floor_trend
     what = "old generation" if trend.metric == "old" else "whole heap"
     rows = [("Measured", f"{what} right after collections that clean it")]
+    if trend.latest_run_only:
+        rows.append(("JVM runs", "the latest run only; earlier runs had a different heap"))
     if trend.capacity_kb:
         rows.append(
             ("Capacity used for %", f"{format_kb(trend.capacity_kb)} ({trend.capacity_source})")
@@ -547,15 +582,40 @@ def build_floor_rows(summary: GCSummary) -> list[tuple[str, str]]:
         )
     if trend.step_change is not None:
         rows.append(("⚠ Step change", describe_floor_step(trend)))
-    if trend.assessed and trend.slope_mb_per_hour is not None:
+    if trend.assessed and trend.slope_mb_per_hour is not None and trend.p_value is not None:
         pct = (
             f" ({trend.slope_pct_per_hour:+.2f}% of capacity/h)"
             if trend.slope_pct_per_hour is not None
             else ""
         )
-        rows.append(("Slope", f"{format_mb_per_hour(trend.slope_mb_per_hour)}{pct}"))
-        rows.append(("Fit (r²)", f"{trend.r_squared:.2f}"))
-        rows.append(("Span", f"{trend.span_hours:.1f} h"))
+        rows.append(("Slope (Theil-Sen)", f"{format_mb_per_hour(trend.slope_mb_per_hour)}{pct}"))
+        if trend.slope_low_mb_per_hour is not None and trend.slope_high_mb_per_hour is not None:
+            rows.append(
+                (
+                    "Slope, 90% interval",
+                    f"{format_mb_per_hour(trend.slope_low_mb_per_hour)} to "
+                    f"{format_mb_per_hour(trend.slope_high_mb_per_hour)}",
+                )
+            )
+        growth = f"{trend.growth_mb or 0.0:+.0f} MB"
+        if trend.growth_pct_of_capacity is not None:
+            growth += f" ({trend.growth_pct_of_capacity:+.1f}% of capacity)"
+        rows.append(("Growth over the span", f"{growth} in {trend.span_hours:.1f} h"))
+        p_text = "< 0.001" if trend.p_value < 0.001 else f"{trend.p_value:.3f}"
+        sampled = (
+            f" on {trend.trend_sample_size} evenly spaced floors"
+            if trend.trend_sample_size < len(used)
+            else ""
+        )
+        rows.append(("Trend test (Mann-Kendall p)", f"{p_text}{sampled}"))
+        verdicts = {
+            "growing": "growing: the trend is consistent and large enough to matter",
+            "stable": "no material growth",
+            "unclear": "no consistent trend: the floors moved, but not steadily",
+        }
+        rows.append(("Verdict", verdicts[trend.direction or "stable"]))
+        if to_capacity := describe_time_to_capacity(trend):
+            rows.append(("Projection", to_capacity))
     else:
         rows.append(("Trend", f"not assessed: {trend.reason}"))
     return rows
@@ -640,7 +700,7 @@ def build_allocation_rows(summary: GCSummary) -> list[tuple[str, str]]:
     if summary.allocation_rate_mb_sec is not None:
         rows.append(
             (
-                "Allocation rate (between GCs)",
+                "Allocation rate (between GCs, while the application runs)",
                 f"{summary.allocation_rate_mb_sec:.2f} MB/s ({summary.allocation_basis})",
             )
         )
@@ -703,6 +763,19 @@ def build_cpu_rows(summary: GCSummary) -> list[tuple[str, str]]:
     rows.append(("Waiting, not working (real > 1.5 x user+sys)", str(cpu.off_cpu_count)))
     if cpu.worst_off_cpu:
         rows.append(("Worst wait", cpu.worst_off_cpu))
+    if cpu.parallelism_by_kind:
+        threads = summary.jvm_heap_config.parallel_gc_threads if summary.jvm_heap_config else None
+        rows.append(
+            (
+                "CPU used per second of pause, median ((user+sys) ÷ real)",
+                ", ".join(
+                    f"{kind} {cpu.parallelism_by_kind[kind]:.1f}x"
+                    for kind in GC_KINDS
+                    if kind in cpu.parallelism_by_kind
+                )
+                + (f" (of {threads} GC threads)" if threads else ""),
+            )
+        )
     return rows
 
 
@@ -723,7 +796,21 @@ def build_concurrent_rows(summary: GCSummary) -> list[tuple[str, str]]:
         ("Average / longest", f"{stats.average_seconds:.1f} s / {stats.longest_seconds:.1f} s"),
     ]
     if stats.cycles > 1 and summary.runtime_seconds:
-        rows.append(("One every", format_duration(summary.runtime_seconds / stats.cycles)))
+        # an average only describes cycles that are spread over the window
+        clustered = (
+            stats.span_seconds is not None
+            and stats.span_seconds < CLUSTERED_SHARE_OF_WINDOW * summary.runtime_seconds
+        )
+        if clustered and stats.span_seconds is not None:
+            rows.append(
+                (
+                    "When",
+                    f"all within {format_duration(stats.span_seconds)} ({stats.first_when} to "
+                    f"{stats.last_when}) of a {format_duration(summary.runtime_seconds)} window",
+                )
+            )
+        else:
+            rows.append(("One every", format_duration(summary.runtime_seconds / stats.cycles)))
     rows.append(("Note", "runs on GC threads while the application runs; not in pause overhead"))
     return rows
 
@@ -751,6 +838,34 @@ def build_safepoint_rows(summary: GCSummary) -> list[tuple[str, str]]:
             )
         )
     rows.append(("Safepoints taking ≥ 1 s to stop the threads", str(stats.slow_to_stop_count)))
+    if stats.non_gc_count is None:
+        rows.append(
+            (
+                "Stops not explained by a GC pause",
+                "not assessed (the safepoint lines could not be placed in time)",
+            )
+        )
+    else:
+        rows.append(
+            (
+                "Stops not explained by a GC pause",
+                f"{stats.non_gc_count}, {format_seconds(stats.non_gc_total_seconds)} in total "
+                "(heap tuning cannot shorten these)",
+            )
+        )
+        if stats.non_gc_count:
+            operation = (
+                f", VM operation {stats.longest_non_gc_operation}"
+                if stats.longest_non_gc_operation
+                else ""
+            )
+            rows.append(
+                (
+                    "Longest stop not explained by a GC pause",
+                    f"{format_seconds(stats.longest_non_gc_seconds)} at "
+                    f"{stats.longest_non_gc_when}{operation}",
+                )
+            )
     return rows
 
 
@@ -764,14 +879,60 @@ def build_g1_rows(summary: GCSummary) -> list[tuple[str, str]]:
         if g1.mixed_gc_frequency_per_hour is not None
         else "n/a (short window)"
     )
-    return [
+    rows = [
         ("Mixed GC count", str(g1.mixed_gc_count)),
         ("Mixed GCs per hour", per_hour),
         ("Concurrent marking cycles", str(g1.concurrent_marking_cycles)),
-        ("Pauses triggered by humongous allocation", str(g1.humongous_allocation_count)),
+    ]
+    if g1.marking_cycles_per_hour is not None and g1.concurrent_marking_cycles:
+        rows.append(("Marking cycles per hour", f"{g1.marking_cycles_per_hour:.2f}"))
+    if g1.median_marking_start_pct is not None:
+        rows.append(
+            (
+                "Old gen when marking starts (median)",
+                f"{g1.median_marking_start_pct:.1f}% of {summary.old_pct_basis}",
+            )
+        )
+    if g1.concurrent_start_count:
+        rows.append(
+            (
+                'Marking cycles started with cause "G1 Humongous Allocation"',
+                f"{g1.humongous_concurrent_start_count} of {g1.concurrent_start_count} (the "
+                "cause names when the threshold was noticed, not why it was exceeded)",
+            )
+        )
+    rows.append(('Pauses with cause "G1 Humongous Allocation"', str(g1.humongous_allocation_count)))
+    if g1.typical_humongous_kb is not None:
+        typical = format_kb(g1.typical_humongous_kb)
+        if g1.typical_humongous_pct is not None:
+            typical += f" ({g1.typical_humongous_pct:.1f}% of the heap)"
+        rows.append(("Humongous objects, median before a pause", typical))
+    if g1.peak_humongous_kb is not None:
+        peak = format_kb(g1.peak_humongous_kb)
+        if g1.peak_humongous_pct is not None:
+            peak += f" ({g1.peak_humongous_pct:.1f}% of the heap)"
+        rows.append(("Humongous objects, peak", peak))
+    if g1.humongous_allocation_mb_sec is not None:
+        share = (
+            f" ({g1.humongous_allocation_share_pct:.1f}% of all allocation)"
+            if g1.humongous_allocation_share_pct is not None
+            else ""
+        )
+        rows.append(
+            ("Humongous allocation rate", f"{g1.humongous_allocation_mb_sec:.2f} MB/s{share}")
+        )
+    rows += [
         ("Evacuation failures", str(g1.evacuation_failure_count)),
         ("To-space exhausted", str(g1.to_space_exhausted_count)),
     ]
+    if g1.mmu_violation_count:
+        rows.append(
+            (
+                "Pause-time goal missed (MMU target violated lines)",
+                str(g1.mmu_violation_count),
+            )
+        )
+    return rows
 
 
 def build_cms_rows(summary: GCSummary) -> list[tuple[str, str]]:
@@ -790,7 +951,7 @@ def build_cms_rows(summary: GCSummary) -> list[tuple[str, str]]:
         ("Average Initial Mark pause", format_seconds(cms.average_initial_mark_pause_seconds)),
         ("Average Remark pause", format_seconds(cms.average_remark_pause_seconds)),
         ("Concurrent mode failures", str(cms.concurrent_mode_failures)),
-        ("Promotion failures", str(cms.promotion_failures)),
+        ("Promotion failures", str(summary.promotion_failure_count)),
     ]
     if cms.concurrent_mode_failures:
         rows.append(("⚠ Old gen filled before the concurrent cycle finished", ""))
@@ -906,18 +1067,23 @@ def describe_floor_trend(summary: GCSummary) -> str:
             f"Live set: {what} floor {first_last} over {len(floors)} floor(s); trend not "
             f"assessed: {trend.reason}.{step}"
         )
-    r2 = trend.r_squared or 0.0
-    if r2 < 0.5:
-        direction = "no consistent trend"
-    elif trend.slope_mb_per_hour > 0:
-        direction = "rising"
-    else:
-        direction = "falling or flat"
+    direction = {
+        "growing": "growing",
+        "stable": "no material growth",
+        "unclear": "no consistent trend",
+    }[trend.direction or "stable"]
+    projection = describe_time_to_capacity(trend)
     return (
-        f"Live set: {what} floor {first_last}; {direction}, slope "
-        f"{format_mb_per_hour(trend.slope_mb_per_hour)} (r²={r2:.2f}) over {len(floors)} floors "
-        f"in {trend.span_hours:.1f} h.{step}"
+        f"Live set: {what} floor {first_last} over {len(floors)} floors; {direction}, "
+        f"{describe_trend_numbers(trend)}.{step}"
+        + (f" {projection[0].upper()}{projection[1:]}." if projection else "")
     )
+
+
+# The longest pauses must stand out from the typical pause before their timing is discussed
+CLUSTERING_MIN_RATIO_TO_MEDIAN = 2.0
+# Concurrent cycles packed into less than this share of the window are not "one every N"
+CLUSTERED_SHARE_OF_WINDOW = 0.25
 
 
 def describe_pause_clustering(events: list[GCEvent], top_n: int = 5, window_s: float = 900) -> str:
@@ -932,6 +1098,10 @@ def describe_pause_clustering(events: list[GCEvent], top_n: int = 5, window_s: f
     )
     if len(top) < 3:
         return ""
+    typical = sorted(e.pause_time_seconds for e in events)[len(events) // 2]
+    shortest_of_top = min(e.pause_time_seconds for e in top)
+    if shortest_of_top < CLUSTERING_MIN_RATIO_TO_MEDIAN * typical:
+        return ""  # the "longest" pauses are ordinary ones: where they fall means nothing
     base = top[0].timestamp
     seconds = [(e.timestamp - base).total_seconds() for e in top]
     best = max_events_in_window(seconds, window_s)
@@ -955,16 +1125,30 @@ def describe_pause_clustering(events: list[GCEvent], top_n: int = 5, window_s: f
     return ""  # pragma: no cover
 
 
+LEAK_VERDICT_TEXT = {
+    "growing": "growing: the live set rises steadily",
+    "step_change": "step change: the live set jumped and stayed up (not gradual growth)",
+    "full": "full: live data fills the space; no growth trend established",
+    "none": "none detected",
+    "not_assessed": "not assessed",
+}
+
+
 def describe_leak_risk(summary: GCSummary) -> str:
-    """Leak level in words, saying when it could not be assessed."""
-    leak = summary.leak_severity
-    if not leak.assessed:
-        return "not assessed (no post-collection floors)"
-    if leak.severity_level != "None":
-        return f"{leak.severity_level} (score {leak.score:.0f}/100)"
-    if not summary.floor_trend.assessed:
-        return "no signal, but the floor trend could not be assessed (see Data Notes)"
-    return "none detected"
+    """The leak verdict in words, with its one-line reason."""
+    leak = summary.leak
+    text = LEAK_VERDICT_TEXT[leak.verdict]
+    if leak.verdict == "none" and leak.basis == "upper bound":
+        return (
+            "none detected: no growth observed in the lowest heap after GC (an upper bound on "
+            "the live set; the window has no floors to measure it directly)"
+        )
+    if leak.verdict == "not_assessed":
+        reason = summary.floor_trend.reason
+        if summary.floor_trend.assessed:
+            reason = "the floors moved, but not steadily enough to call it a trend"
+        return f"{text} ({reason})" if reason else text
+    return text
 
 
 def describe_data_quality(coverage: CandidateCoverage) -> str:
@@ -988,16 +1172,19 @@ def build_summary_rows(ctx: ReportContext) -> list[tuple[str, str]]:
     heap = summary.heap
     basis = "max heap" if heap.max_heap_known else "committed heap"
     rows: list[tuple[str, str]] = [
-        ("Status", determine_overall_status(summary)[0]),
-        ("Leak risk", describe_leak_risk(summary)),
+        ("Status", determine_overall_status(report_findings(ctx))[0]),
+        ("Leak verdict", describe_leak_risk(summary)),
     ]
     if ctx.events:
-        first, last = ctx.events[0], ctx.events[-1]
-        # with --start/--end the requested bounds are the window, not the first/last pause
+        first = min(ctx.events, key=lambda e: e.pause_start)
+        last = max(ctx.events, key=lambda e: e.pause_end)
+        # with --start/--end the requested bounds are the window, not the first/last pause;
+        # otherwise it runs from the start of the first pause to the end of the last one
         span = (
             ctx.window_label.removeprefix("window ")
             if ctx.window_label
-            else f"{event_time(first)} to {event_time(last)}"
+            else f"{format_time(first.pause_start, first.wall_clock, _start_uptime(first))} to "
+            f"{format_time(last.pause_end, last.wall_clock, _end_uptime(last))}"
         )
         rows.append(("Window", f"{span} ({format_duration(summary.runtime_seconds)})"))
     kinds = ", ".join(
@@ -1016,12 +1203,12 @@ def build_summary_rows(ctx: ReportContext) -> list[tuple[str, str]]:
     worst = next((w for w in summary.worst_pause_shares if w.window_seconds == 300.0), None)
     if worst is not None:
         rows.append(("Worst 5 minutes", format_pause_share(worst)))
+    rows.append(("P99 pause", describe_p99(summary)))
     rows.append(
         (
-            "P99 / longest pause",
-            f"{summary.overall_pauses.p99:.3f}s "
-            f"({_interpret_p99_pause(summary.overall_pauses.p99)}) / "
-            f"{format_seconds(summary.overall_pauses.maximum)}",
+            "Longest pause",
+            f"{format_seconds(summary.overall_pauses.maximum)} ({summary.longest_pause_kind}, "
+            f"{summary.longest_pause_cause}) at {summary.longest_pause_when}",
         )
     )
     if clustering := describe_pause_clustering(ctx.events):
@@ -1036,36 +1223,53 @@ def build_summary_rows(ctx: ReportContext) -> list[tuple[str, str]]:
         (
             "Fullest after old-gen cleanup",
             _fullest_cleaned_floor(summary)
-            or "n/a (no Full GC or completed mixed cycle in the window)",
+            or "n/a (no Full GC or completed mixed/concurrent cycle in the window: the live "
+            "set is unknown)",
         )
     )
     if summary.full_gc_causes:
         causes = ", ".join(f"{c.count} {c.cause}" for c in summary.full_gc_causes)
         rows.append(("Full GCs", f"{summary.full_gc_count} ({causes})"))
+        rows.append(
+            (
+                "Of which heap-pressure",
+                _rate_or_count(summary.heap_full_gc_count, summary.full_gc_per_hour, summary),
+            )
+        )
     else:
         rows.append(("Full GCs", "none"))
-    rows.append(
-        (
-            "Heap-pressure Full GCs",
-            _rate_or_count(summary.heap_full_gc_count, summary.full_gc_per_hour, summary),
-        )
-    )
     rows.append(("Live set", describe_floor_trend(summary).removeprefix("Live set: ")))
     rows.append(("Data quality", describe_data_quality(ctx.coverage)))
     return rows
 
 
-def determine_overall_status(summary: GCSummary) -> tuple[str, Style]:
-    """Overall status text and style."""
-    critical = sum(1 for w in summary.warnings if w.startswith("CRITICAL"))
-    warning = sum(1 for w in summary.warnings if w.startswith("WARNING"))
-    if critical >= 3:
-        return "✖ CRITICAL - IMMEDIATE ACTION REQUIRED", "critical"
-    if critical:
-        return "✖ UNSTABLE - INTERVENTION REQUIRED", "critical"
-    if warning:
-        return "⚠ DEGRADED - MONITORING REQUIRED", "warning"
-    return "✓ STABLE", "success"
+def _start_uptime(event: GCEvent) -> float | None:
+    if event.uptime_seconds is None:
+        return None
+    return event.uptime_seconds - (event.pause_time_seconds if event.stamp_at_pause_end else 0.0)
+
+
+def _end_uptime(event: GCEvent) -> float | None:
+    if event.uptime_seconds is None:
+        return None
+    return event.uptime_seconds + (0.0 if event.stamp_at_pause_end else event.pause_time_seconds)
+
+
+def report_findings(ctx: ReportContext) -> list[Finding]:
+    """The findings of this report, built once and kept on the context."""
+    if ctx.findings is None:
+        ctx.findings = build_findings(ctx.summary, ctx.gc_type, ctx.events, ctx.coverage)
+    return ctx.findings
+
+
+def determine_overall_status(findings: list[Finding]) -> tuple[str, Style]:
+    """Overall status text and style: the worst severity among the findings."""
+    status = overall_status(findings)
+    if status == "critical":
+        return "✖ CRITICAL - ACTION REQUIRED", "critical"
+    if status == "warning":
+        return "⚠ DEGRADED - INVESTIGATE", "warning"
+    return "✓ STABLE - no problems found", "success"
 
 
 # ============================================================
@@ -1104,8 +1308,14 @@ def build_sections(ctx: ReportContext) -> list[Section]:
         )
 
     # 1. What is wrong, ranked, with evidence and action
-    status_style = determine_overall_status(s)[1]
-    findings = build_findings(s, ctx.gc_type, ctx.events, ctx.coverage)
+    findings = report_findings(ctx)
+    status_style = determine_overall_status(findings)[1]
+    if diagnosis := build_diagnosis(s, findings, ctx.coverage):
+        out.append(
+            Section(
+                id="diagnosis", title="Diagnosis", kind="text", text=diagnosis, style=status_style
+            )
+        )
     out.append(
         Section(
             id="findings",
@@ -1233,17 +1443,16 @@ def build_sections(ctx: ReportContext) -> list[Section]:
     if s.metaspace_analysis:
         out.append(_kv("metaspace", "Metaspace", build_metaspace_rows(s)))
 
-    leak = s.leak_severity
-    leak_text = (
-        f"Leak severity score: {leak.score:.1f}/100\nLevel: "
-        f"{leak.severity_level if leak.assessed else 'not assessed'}"
-    )
-    if leak.indicators:
-        leak_text += "\n" + "\n".join(f"• {i}" for i in leak.indicators)
+    leak = s.leak
+    leak_text = f"Verdict: {LEAK_VERDICT_TEXT[leak.verdict]}"
+    if leak.basis:
+        leak_text += f"\nMeasured from: {leak.basis}"
+    if leak.evidence:
+        leak_text += "\n" + "\n".join(f"• {item}" for item in leak.evidence)
     out.append(
         Section(
             id="leak",
-            title="Memory Leak Assessment",
+            title="Live Set and Leak Assessment",
             kind="text",
             text=leak_text,
             style=_leak_style(s),
@@ -1253,12 +1462,10 @@ def build_sections(ctx: ReportContext) -> list[Section]:
 
 
 def _leak_style(summary: GCSummary) -> Style:
-    level = summary.leak_severity.severity_level
-    if level in ("High", "Critical"):
-        return "critical"
-    if level in ("Low", "Medium"):
+    verdict = summary.leak.verdict
+    if verdict in ("growing", "step_change", "full"):
         return "warning"
-    return "success"
+    return "success" if verdict == "none" else "info"
 
 
 # ============================================================
@@ -1292,8 +1499,8 @@ def finding_lines(finding: Finding) -> list[tuple[str, str]]:
 def _rich_section(section: Section) -> Panel | Table:
     if section.kind == "kv":
         table = Table(title=section.title, show_header=False, box=None, padding=(0, 2))
-        table.add_column("Metric", style="label")
-        table.add_column("Value", style="metric")
+        table.add_column("Metric", style="label", overflow="fold")
+        table.add_column("Value", style="metric", overflow="fold")
         for label, value in section.rows:
             style = "warning" if label.startswith("⚠") else None
             table.add_row(escape(label), escape(value), style=style)
@@ -1301,7 +1508,8 @@ def _rich_section(section: Section) -> Panel | Table:
     if section.kind == "table":
         table = Table(title=section.title, show_header=True, header_style="header")
         for index, header in enumerate(section.headers):
-            table.add_column(header, style="info" if index == 0 else "metric")
+            # fold, never "…": a cut-off time or cause is worse than a tall row
+            table.add_column(header, style="info" if index == 0 else "metric", overflow="fold")
         for row in section.table_rows:
             table.add_row(*(escape(cell) for cell in row))
         return table
@@ -1358,8 +1566,12 @@ def build_jvm_config_rows(config: JVMHeapConfig) -> list[tuple[str, str]]:
         rows.append(
             ("Initial Heap Size (-Xms)", config.format_size(config.initial_heap_size_bytes))
         )
+    if config.min_heap_size_bytes:
+        rows.append(("Minimum Heap Size", config.format_size(config.min_heap_size_bytes)))
     if config.max_heap_size_bytes:
         rows.append(("Maximum Heap Size (-Xmx)", config.format_size(config.max_heap_size_bytes)))
+    if config.heap_dump_on_out_of_memory_error is True:
+        rows.append(("Heap Dump On OutOfMemoryError", "enabled"))
     if config.new_size_bytes:
         # -XX:NewSize alone is only the starting/minimum size; the young generation is fixed
         # (what -Xmn sets) only when MaxNewSize equals it.

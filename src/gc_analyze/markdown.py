@@ -11,6 +11,7 @@ from .report import Section, finding_lines, sanitize_text
 BRIEF_SECTION_IDS: tuple[str, ...] = (
     "header",
     "unparsed",
+    "diagnosis",
     "findings",
     "summary",
     "timeline",
@@ -40,10 +41,13 @@ class BriefDetail:
     top_pauses: int
     finding_times: bool
     timeline_rows: int = BRIEF_TIMELINE_ROWS
+    info_findings: bool = True  # False lists only critical and warning findings
+    data_notes: bool = True
 
 
 # Tried in order until the brief fits: detail tables shrink first, then the findings lose
-# their times; the findings themselves stay.
+# their times, then informational findings and data notes go; critical and warning findings,
+# the diagnosis and the summary always stay.
 BRIEF_SHRINK_STEPS: tuple[BriefDetail, ...] = (
     BriefDetail(BRIEF_FLOORS, BRIEF_TOP_PAUSES, True),
     BriefDetail(6, BRIEF_TOP_PAUSES, True),
@@ -52,6 +56,8 @@ BRIEF_SHRINK_STEPS: tuple[BriefDetail, ...] = (
     BriefDetail(4, 3, False),
     BriefDetail(0, 3, False),
     BriefDetail(0, 3, False, timeline_rows=3),
+    BriefDetail(0, 3, False, timeline_rows=3, info_findings=False),
+    BriefDetail(0, 3, False, timeline_rows=3, info_findings=False, data_notes=False),
 )
 # Flags that matter when reading a GC problem; the rest of the config is left out of --brief
 BRIEF_CONFIG_LABELS: tuple[str, ...] = (
@@ -130,7 +136,8 @@ def _brief_section(section: Section, detail: BriefDetail) -> Section:
     if section.id == "findings" and section.findings:
         # one line each: the case file needs the conclusions; evidence is in the full report
         serious = [f for f in section.findings if f.severity != "info"]
-        shown = (serious + [f for f in section.findings if f.severity == "info"])[:BRIEF_FINDINGS]
+        info = [f for f in section.findings if f.severity == "info"] if detail.info_findings else []
+        shown = (serious + info)[:BRIEF_FINDINGS]
         items = [
             f"[{f.severity.upper()}] {f.title}"
             + (f" ({f.when})" if f.when and detail.finding_times else "")
@@ -193,7 +200,9 @@ def render_brief_markdown(sections: list[Section], generated: datetime | None = 
         chosen = [
             _brief_section(by_id[i], detail)
             for i in BRIEF_SECTION_IDS
-            if i in by_id and not (i == "floors" and detail.floors == 0)
+            if i in by_id
+            and not (i == "floors" and detail.floors == 0)
+            and not (i == "notes" and not detail.data_notes)
         ]
         text = render_markdown(chosen, generated).replace(
             "# GC Analysis Report", "# GC Analysis (brief)", 1

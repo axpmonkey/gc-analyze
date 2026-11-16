@@ -1,7 +1,9 @@
 """Advice table: what to do about a finding, by collector and JDK release.
 
 Every entry restates what the cited JDK documentation says; nothing here is folklore. When an
-entry is changed, re-read its source. Sources were read on 2026-11-15.
+entry is changed, re-read its source. Sources were read on 2026-11-16 (JDK 17 guide and
+tool references, the JDK 21 G1 tuning page, JEP 307 and 423, Tomcat 9 configuration
+reference). Not checked against the JDK 11 guide, whose pages no longer resolve.
 """
 
 from __future__ import annotations
@@ -42,6 +44,24 @@ JCMD = (
     "jcmd tool reference (JDK 17), GC.heap_dump: "
     "https://docs.oracle.com/en/java/javase/17/docs/specs/man/jcmd.html"
 )
+JCMD_HISTOGRAM = (
+    "jcmd tool reference (JDK 17), GC.class_histogram: "
+    "https://docs.oracle.com/en/java/javase/17/docs/specs/man/jcmd.html"
+)
+JAVA_17 = (
+    "java command reference (JDK 17), Advanced Garbage Collection and Serviceability options: "
+    "https://docs.oracle.com/en/java/javase/17/docs/specs/man/java.html"
+)
+G1_GUIDE = (
+    "HotSpot GC Tuning Guide (JDK 17), Garbage-First (G1) Garbage Collector - Determining "
+    f"Initiating Heap Occupancy: {GC_TUNING_17}/garbage-first-g1-garbage-collector1.html"
+)
+TOMCAT_LISTENERS = (
+    "Apache Tomcat 9 Configuration Reference, JRE Memory Leak Prevention Listener: "
+    "https://tomcat.apache.org/tomcat-9.0-doc/config/listeners.html"
+)
+# Above this max heap a full dump is slow and as large as the live data: start with a histogram
+LARGE_HEAP_BYTES = 32 * 1024**3
 
 
 @dataclass(frozen=True)
@@ -59,6 +79,17 @@ ADVICE: dict[str, Advice] = {
         "large heap",
         JCMD,
     ),
+    "class_histogram": Advice(
+        "On a heap this large a dump file is as big as the live data and slow to write and "
+        "analyse. Start with jcmd <pid> GC.class_histogram, which prints heap usage per class "
+        "without writing a dump; its impact also depends on the heap size and content",
+        JCMD_HISTOGRAM,
+    ),
+    "heap_dump_on_oom": Advice(
+        "-XX:+HeapDumpOnOutOfMemoryError makes the JVM write a heap dump when an "
+        "OutOfMemoryError is thrown; -XX:HeapDumpPath sets where",
+        JAVA_17,
+    ),
     "old_gen_slack": Advice(
         "Keep the old generation large enough to hold all the live data the application uses "
         "at any time, plus 10 to 20% or more of slack",
@@ -70,6 +101,28 @@ ADVICE: dict[str, Advice] = {
         "size is set relative to eden with -XX:SurvivorRatio (a lower ratio gives larger "
         "survivors); the young generation itself is bounded by -XX:NewSize and -XX:MaxNewSize",
         SIZING,
+    ),
+    "survivor_overflow_parallel": Advice(
+        "If survivor spaces are too small, the copying collection overflows directly into the "
+        "old generation. With the parallel collector adaptive sizing is on by default and "
+        "resizes the survivor spaces itself, starting from -XX:InitialSurvivorRatio, so "
+        "-XX:SurvivorRatio only fixes their size when adaptive sizing is turned off with "
+        "-XX:-UseAdaptiveSizePolicy",
+        JAVA_17,
+    ),
+    "g1_marking_threshold": Advice(
+        "G1 starts a marking cycle when old-generation occupancy reaches the Initiating Heap "
+        "Occupancy threshold, which it sets itself from earlier behaviour. When the live data "
+        "alone sits close to that threshold, every cycle ends with occupancy still near it "
+        "and the next one starts almost at once. That costs CPU on the concurrent GC threads, "
+        "not pause time. A larger heap puts room between the live data and the threshold",
+        G1_GUIDE,
+    ),
+    "tomcat_gc_daemon": Advice(
+        "On Java 8 and earlier, Tomcat's JreMemoryLeakPreventionListener (gcDaemonProtection, "
+        'on by default) itself starts the "GC Daemon" thread, so that thread in a thread '
+        "dump does not by itself show the application using RMI",
+        TOMCAT_LISTENERS,
     ),
     "g1_full_gc": Advice(
         "A G1 Full GC means objects that cannot be reclaimed were allocated faster than "
@@ -94,9 +147,9 @@ ADVICE: dict[str, Advice] = {
     ),
     "g1_humongous": Advice(
         "Objects of half a region or more are humongous: they are allocated straight into the "
-        "old generation as whole contiguous regions and are normally reclaimed only after "
-        "marking or by a Full GC. Increase -XX:G1HeapRegionSize so fewer objects are "
-        "humongous (a power of 2 from 1 to 32 MB), or increase the heap",
+        "old generation as whole contiguous regions. When humongous regions are many compared "
+        "with old regions, the documented remedy is to increase -XX:G1HeapRegionSize so fewer "
+        "objects are humongous (a power of 2 from 1 to 32 MB), or to increase the heap",
         G1_TUNING,
     ),
     "g1_remark": Advice(
@@ -105,7 +158,9 @@ ADVICE: dict[str, Advice] = {
         "one reference-processing thread per -XX:ReferencesPerThread references, up to "
         "-XX:ParallelGCThreads; setting -XX:ReferencesPerThread=0 uses all threads. Check that "
         "parallel reference processing has not been turned off with -XX:-ParallelRefProcEnabled "
-        "(these defaults are as documented for JDK 17; confirm them for an older release)",
+        "(these defaults are as documented for JDK 17 and 21; confirm them for an older "
+        "release). This tool does not read the phase breakdown: the guide's suggested starting "
+        "point for seeing it is to log with -Xlog:gc*=debug",
         G1_TUNING,
     ),
     "g1_young_pause": Advice(
