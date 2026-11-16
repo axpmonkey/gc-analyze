@@ -3,15 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from typing import Literal, TypeAlias
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-GCKind: TypeAlias = Literal["Young", "Mixed", "Full", "Initial Mark", "Remark", "Cleanup"]
-FullGCCategory: TypeAlias = Literal["heap", "explicit", "metadata"]
-KilobytesValue: TypeAlias = int
-PercentageValue: TypeAlias = float
-SecondsValue: TypeAlias = float
+type GCKind = Literal["Young", "Mixed", "Full", "Initial Mark", "Remark", "Cleanup"]
+type FullGCCategory = Literal["heap", "explicit", "metadata"]
+type KilobytesValue = int
+type PercentageValue = float
+type SecondsValue = float
 
 # Pause kinds in report order
 GC_KINDS: tuple[GCKind, ...] = ("Young", "Mixed", "Full", "Initial Mark", "Remark", "Cleanup")

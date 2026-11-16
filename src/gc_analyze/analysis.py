@@ -823,9 +823,11 @@ def compute_cpu_stats(events: list[GCEvent]) -> CpuStats | None:
         worst_off_cpu=describe(
             max(
                 off_cpu,
-                key=lambda e: (e.cpu_real_seconds or 0.0)
-                - (e.cpu_user_seconds or 0.0)
-                - (e.cpu_sys_seconds or 0.0),
+                key=lambda e: (
+                    (e.cpu_real_seconds or 0.0)
+                    - (e.cpu_user_seconds or 0.0)
+                    - (e.cpu_sys_seconds or 0.0)
+                ),
             )
         )
         if off_cpu

@@ -1,23 +1,23 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.33.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "gc-analyze"
 version = "5.0.0"
 description = "JVM GC log analyzer: G1, Parallel, CMS and Serial; Java 8 and unified logging"
-requires-python = ">=3.11"
+requires-python = ">=3.15,<3.16"
 dependencies = [
-    "pydantic>=2.0",
-    "typer>=0.9.0",
-    "rich>=13.0",
+    "pydantic>=2.14.3",
+    "typer>=0.29.1",
+    "rich>=15.0.0",
 ]
 
 [project.scripts]
 gc-analyze = "gc_analyze.cli:app"
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py315"
 line-length = 100
 
 [tool.ruff.lint]
@@ -26,6 +26,7 @@ ignore = [
     "PLR0911",  # Too many return statements (acceptable for guard clauses)
     "PLR0912",  # Too many branches (acceptable for complex diagnostic logic)
     "PLR0913",  # Too many arguments (render/export functions need diagnostic context)
+    "PLR0917",  # Preserve existing CLI and parser positional parameter signatures
     "PLR0915",  # Too many statements (render function is necessarily large)
     "PLR2004",  # Magic values (meaningful in GC analysis context: 90%, 60s, etc.)
 ]
@@ -34,6 +35,7 @@ ignore = [
 convention = "google"
 
 [tool.basedpyright]
+pythonVersion = "3.15"
 typeCheckingMode = "strict"
 reportUnknownParameterType = "error"
 reportUnknownMemberType = "error"
@@ -43,16 +45,16 @@ reportUnnecessaryTypeIgnoreComment = "error"
 
 [dependency-groups]
 dev = [
-    "pip-audit>=2.10.0",
-    "pytest>=9.0.2",
-    "pytest-cov>=7.0.0",
+    "pip-audit>=2.10.1",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "ruff>=0.14.0",
-    "basedpyright>=1.37.0",
-    "pytest>=8.0.0",
-    "pytest-cov>=4.1.0",
-    "pip-audit>=2.7.0",
+    "ruff>=0.17.5",
+    "basedpyright>=1.40.2",
+    "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
+    "pip-audit>=2.10.1",
 ]

@@ -44,6 +44,8 @@ uv run gc-analyze analyze path/to/gc.log
 
 ## Installation
 
+Python **3.15 only** is supported (`>=3.15,<3.16`). Use `uv` for all environment and dependency management.
+
 ### Install uv
 
 ```bash
@@ -61,7 +63,8 @@ irm https://astral.sh/uv/install.ps1 | iex
 ```bash
 git clone <repository-url>
 cd gc-analyze
-uv sync
+uv python install 3.15
+uv sync --frozen
 ```
 
 ## Usage
@@ -255,9 +258,17 @@ One JSON object per pause, following the shared `events.jsonl` format: `ts` (UTC
 
 ## Development
 
+Use Python 3.15 and the latest stable dependency releases compatible with it. Runtime, development,
+and build dependency minimums are declared in `pyproject.toml`; keep them current when upgrading.
+
 ```bash
-ruff format --check && ruff check && basedpyright
+uv sync --upgrade --extra dev
+uv run --frozen --extra dev ruff format --check
+uv run --frozen --extra dev ruff check
+uv run --frozen --extra dev basedpyright
 ```
+
+Verification targets Python 3.15 only. See `AGENTS.md` for the full verification sequence.
 
 The test suite (golden-file fixtures with hand-computed expected results) is kept by the
 maintainer and is not part of this repository.

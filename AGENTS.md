@@ -42,11 +42,12 @@ Given one or more GC log files, the tool:
 
 ## Toolchain
 
-- **Python**: 3.11-3.15 (development on 3.15, pinned in `.python-version`)
+- **Python**: 3.15 only (`>=3.15,<3.16`, pinned in `.python-version`); do not support or test older versions
 - **Formatter/Linter**: `ruff format` and `ruff check --fix`
 - **Type checker**: `basedpyright` (strict)
 - **Tests**: `pytest` with branch coverage >= 90%; optional `hypothesis`
 - **Packaging**: `pyproject.toml` as single source of truth; `uv` exclusively (no pip/poetry/conda)
+- **Dependencies**: Use the latest stable releases compatible with Python 3.15 for runtime, development, and build dependencies; update minimum versions in `pyproject.toml` when upgrading. Do not retain older versions for backward compatibility.
 - **Bash tools**: `rg`, `fd`, `bat`, `jq` only (no grep/find)
 
 ---
@@ -56,17 +57,19 @@ Given one or more GC log files, the tool:
 Run in sequence; **all must pass** before committing:
 
 ```bash
-uv sync --frozen
-ruff format --check
-ruff check
-basedpyright
-pytest -q --cov=src/gc_analyze --cov-branch --cov-fail-under=90  # only where tests/ exists
-pip-audit  # or osv-scanner; fail on critical vulnerabilities
+uv sync --frozen --extra dev
+uv run --frozen --extra dev ruff format --check
+uv run --frozen --extra dev ruff check
+uv run --frozen --extra dev basedpyright
+uv run --frozen --extra dev pytest -q --cov=src/gc_analyze --cov-branch --cov-fail-under=90  # only where tests/ exists
+uv run --frozen --extra dev pip-audit  # or osv-scanner; fail on critical vulnerabilities
 ```
 
 Environment: `TZ=UTC`, `PYTHONUTF8=1`, `LC_ALL=C.UTF-8`, `PYTHONWARNINGS=error`
 
-Matrix across Python 3.11-3.15. Cache `uv` environments. Commit `uv.lock`.
+Verify on Python 3.15 only; no multi-version Python matrix. Cache `uv` environments. Commit `uv.lock`.
+Use `uv sync --upgrade --extra dev` to refresh dependencies to the latest compatible stable releases.
+If an audit tool cannot run on Python 3.15, use `osv-scanner` or report the blocker; do not fall back to an older Python.
 
 ---
 
@@ -91,7 +94,7 @@ uv.lock                # Committed lockfile
 - Complete type hints on all code; `from __future__ import annotations`.
 - No implicit `Any`. No `# type: ignore` without justification.
 - Prefer `Protocol` for behavioral contracts; use `Self`, `ParamSpec`, `TypeVarTuple` as appropriate.
-- PEP 695 syntax when minimum version is >= 3.12; otherwise `TypeVar`/`ParamSpec`.
+- Use PEP 695 syntax for type parameters and type aliases; no compatibility fallbacks for older Python versions.
 
 ### I/O & HTTP
 - Use `pathlib.Path` for filesystem work.
@@ -100,7 +103,7 @@ uv.lock                # Committed lockfile
 - Access package data via `importlib.resources`.
 
 ### Data
-- Prefer `pydantic>=2` or `msgspec` for validation/serialization.
+- Prefer `pydantic` or `msgspec` for validation/serialization, using the latest stable release compatible with Python 3.15.
 - Parameterized SQL only; never format/concatenate SQL with variables.
 - Config via `pydantic-settings` (env + optional .env); env overrides file.
 
