@@ -287,3 +287,5 @@ tests/
 scripts/
 AGENTS.md
 CLAUDE.md
+uv.lock
+.python-version
