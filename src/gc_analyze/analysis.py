@@ -65,14 +65,36 @@ EXPLICIT_FULL_GC_CAUSES: frozenset[str] = frozenset(
         "ScavengeAlot",
         "Allocation Profiler",
         "Full GC for -Xshare:dump",
-        "G1 Periodic Collection",
-        "CodeCache GC Threshold",
-        "CodeCache GC Aggressive",
     }
 )
 # Full GCs triggered by metaspace, not the Java heap: routed to the metaspace section.
 METADATA_FULL_GC_CAUSES: frozenset[str] = frozenset(
     {"Metadata GC Threshold", "Metadata GC Clear Soft References", "Last ditch collection"}
+)
+
+
+HEAP_FULL_GC_CAUSES = frozenset(
+    {
+        "Allocation Failure",
+        "Ergonomics",  # Parallel full collection following scavenge policy
+        "Tenured Generation Full",
+        "CMS Generation Full",
+        "Old Generation Too Full To Scavenge",
+        "G1 Compaction Pause",
+        "G1 Humongous Allocation",
+        "G1 Evacuation Pause",
+        "Promotion Failed",
+    }
+)
+OTHER_FULL_GC_CAUSES = frozenset(
+    {
+        "G1 Periodic Collection",
+        "CodeCache GC Threshold",
+        "CodeCache GC Aggressive",
+        "GCLocker Initiated GC",
+        "Old Generation Expanded On Last Scavenge",
+        "Update Allocation Context Stats",
+    }
 )
 
 
@@ -82,7 +104,11 @@ def classify_full_gc_cause(cause: str | None) -> FullGCCategory:
         return "explicit"
     if cause in METADATA_FULL_GC_CAUSES:
         return "metadata"
-    return "heap"
+    if cause in HEAP_FULL_GC_CAUSES:
+        return "heap"
+    if cause in OTHER_FULL_GC_CAUSES:
+        return "other"
+    return "unknown"
 
 
 def is_heap_pressure_full_gc(event: GCEvent) -> bool:
@@ -262,7 +288,7 @@ def compute_heap_stats(events: list[GCEvent], max_heap_kb: int | None, source: s
         avg_after_gc_pct=pct(avg_after),
         headroom_pct=100.0 - pct(peak_after),
         collecting_events_with_heap_data=len(collecting),
-        exceeds_max_heap=known and peak_before > denominator,
+        exceeds_max_heap=known and max(peak_before, peak_after) > denominator,
         first_committed_kb=with_heap[0].heap_total_kb,
         last_committed_kb=with_heap[-1].heap_total_kb,
         min_committed_kb=min(e.heap_total_kb for e in with_heap),
@@ -275,18 +301,18 @@ def compute_heap_stats(events: list[GCEvent], max_heap_kb: int | None, source: s
 # ============================================================
 
 
-def _mixed_cycle_ends(events: list[GCEvent]) -> list[GCEvent]:
-    """Last Mixed pause of each run of consecutive G1 mixed collections."""
-    ends: list[GCEvent] = []
+def _mixed_cycle_ends(events: list[GCEvent]) -> list[tuple[GCEvent, bool]]:
+    """A normal Young pause establishes that a preceding Mixed sequence ended."""
+    ends: list[tuple[GCEvent, bool]] = []
     last_mixed: GCEvent | None = None
     for event in events:
         if event.gc_kind == "Mixed":
             last_mixed = event
         elif event.gc_kind in ("Young", "Full") and last_mixed is not None:
-            ends.append(last_mixed)
+            ends.append((last_mixed, event.gc_kind == "Young"))
             last_mixed = None
     if last_mixed is not None:
-        ends.append(last_mixed)
+        ends.append((last_mixed, False))
     return ends
 
 
@@ -371,89 +397,111 @@ def compute_floor_trend(
     thresholds: DiagnosticThresholds,
     side_records: list[SideRecord] | None = None,
 ) -> FloorTrend:
-    """Trend of occupancy right after collections that clean the old generation.
-
-    Old gen is a sawtooth; its floors (after Full GCs, after each G1 mixed cycle, after each
-    CMS concurrent cycle) show the live set. A floor that keeps rising means the live set is
-    growing (a leak, a cache filling, or more load). Explicit Full GCs are valid floor
-    measurements, so all Full GCs count here.
-
-    Floors from JVM start-up are listed but left out of the trend, and a trend is only
-    tested when floors are spread over the span: two clusters are a step, not a trend.
-    """
-    # (event, what cleaned the old generation, occupancy override)
-    candidates: list[tuple[GCEvent, str, int | None]] = [
-        (e, f"Full GC ({e.cause or 'cause not logged'})", None)
-        for e in events
-        if e.gc_kind == "Full" and e.has_heap_data
+    """Evaluate comparable post-collection occupancy samples from the latest run."""
+    latest_segment = max((event.segment for event in events), default=1)
+    earlier_runs_left_out = any(event.segment != latest_segment for event in events)
+    events = [event for event in events if event.segment == latest_segment]
+    candidates: list[tuple[GCEvent, str, str, int, bool]] = [
+        (
+            event,
+            "post-Full-GC heap occupancy",
+            f"Full GC ({event.cause or 'cause not logged'})",
+            event.heap_after_kb,
+            True,
+        )
+        for event in events
+        if event.gc_kind == "Full" and event.has_heap_data
     ]
     if is_g1:
-        candidates += [(e, "end of mixed cycle", None) for e in _mixed_cycle_ends(events)]
+        candidates += [
+            (
+                event,
+                "post-Mixed heap occupancy",
+                "end of mixed sequence" if complete else "mixed sequence end unconfirmed",
+                event.heap_after_kb,
+                complete,
+            )
+            for event, complete in _mixed_cycle_ends(events)
+            if event.has_heap_data
+        ]
+        candidates += [
+            (
+                event,
+                "post-Remark heap occupancy",
+                "after Remark (approximate)",
+                event.heap_after_kb,
+                False,
+            )
+            for event in events
+            if event.gc_kind == "Remark" and event.has_heap_data
+        ]
     else:
         candidates += [
-            (e, CMS_CYCLE_FLOOR, e.old_before_kb)
-            for e in cms_cycle_floors(events, side_records or [])
+            (
+                event,
+                "old-generation occupancy after CMS sweep",
+                CMS_CYCLE_FLOOR,
+                event.old_before_kb,
+                True,
+            )
+            for event in cms_cycle_floors(
+                events, [r for r in side_records or [] if r.segment in (None, latest_segment)]
+            )
+            if event.old_before_kb is not None
         ]
     candidates.sort(key=lambda item: item[0].timestamp)
-    # S9: floors from different JVM runs are different heaps; a trend through them would
-    # describe restarts, not the live set. Only the latest run's floors are used.
-    runs = {e.segment for e, _, _ in candidates}
-    earlier_runs_left_out = len(runs) > 1
-    if earlier_runs_left_out:
-        last_run = max(runs)
-        candidates = [item for item in candidates if item[0].segment == last_run]
-
-    metric: Literal["old", "heap"] = "old"
-    if not candidates or any(
-        e.old_after_kb is None and override is None for e, _, override in candidates
-    ):
-        metric = "heap"
-    if is_g1 and not _assessable([e for e, _, _ in candidates], thresholds):
-        # Few or clustered mixed cycles: the heap right after Remark (end of marking) is the
-        # best available approximation of the live set over time.
-        remarks: list[tuple[GCEvent, str, int | None]] = [
-            (e, "after Remark (approximate)", None)
-            for e in events
-            if e.gc_kind == "Remark" and e.has_heap_data
-        ]
-        if _assessable([e for e, _, _ in remarks], thresholds):
-            candidates, metric = remarks, "heap"
-
-    def value(event: GCEvent, override: int | None) -> int:
-        if metric == "old":
-            if override is not None:
-                return override
-            if event.old_after_kb is not None:
-                return event.old_after_kb
-        return event.heap_after_kb
-
-    # Capacity for the % figures: generational collectors have a sized old gen; for G1 and
-    # whole-heap floors the max heap is what the floor can grow into.
-    capacity: int | None
-    capacity_source: str
-    old_totals = [e.old_total_kb for e, _, _ in candidates if e.old_total_kb]
-    if metric == "old" and not is_g1 and old_totals:
-        capacity, capacity_source = max(old_totals), "old generation capacity"
-    elif heap.max_heap_kb:
-        capacity, capacity_source = heap.max_heap_kb, heap.max_heap_source
-    else:
-        capacity, capacity_source = None, "unknown"
-
+    groups: dict[str, list[GCEvent]] = {}
+    for event, measurement, _, _, complete in candidates:
+        if complete:
+            groups.setdefault(measurement, []).append(event)
+    preferred = (
+        "post-Full-GC heap occupancy",
+        "old-generation occupancy after CMS sweep",
+        "post-Mixed heap occupancy",
+    )
+    available = [measurement for measurement in preferred if measurement in groups]
+    measurement = next(
+        (kind for kind in available if _assessable(groups[kind], thresholds)),
+        available[0] if available else "",
+    )
+    metric: Literal["old", "heap"] = "old" if measurement.startswith("old-generation") else "heap"
+    old_totals = [event.old_total_kb for event in groups.get(measurement, []) if event.old_total_kb]
+    old_capacity = max(old_totals, default=None)
+    max_heap = heap.max_heap_kb if heap.max_heap_known and not heap.exceeds_max_heap else None
+    capacity = old_capacity if metric == "old" else max_heap
+    capacity_source = (
+        "observed old generation capacity"
+        if metric == "old" and old_capacity
+        else heap.max_heap_source
+        if capacity
+        else "unknown"
+    )
     floors = [
         FloorPoint(
-            timestamp=e.timestamp,
-            uptime_seconds=e.uptime_seconds,
-            wall_clock=e.wall_clock,
-            value_kb=value(e, override),
-            pct_of_capacity=value(e, override) / capacity * 100 if capacity else None,
+            timestamp=event.timestamp,
+            uptime_seconds=event.uptime_seconds,
+            wall_clock=event.wall_clock,
+            value_kb=value,
+            pct_of_capacity=(
+                value / denominator * 100
+                if (
+                    denominator := (
+                        event.old_total_kb if kind.startswith("old-generation") else max_heap
+                    )
+                )
+                else None
+            ),
             source=source,
-            warmup=_in_warmup(e, thresholds),
+            warmup=_in_warmup(event, thresholds),
+            measurement=kind,
+            complete=complete,
         )
-        for e, source, override in candidates
+        for event, kind, source, value, complete in candidates
     ]
     trend = FloorTrend(
         assessed=False,
         metric=metric,
+        measurement=measurement,
         capacity_kb=capacity,
         capacity_source=capacity_source,
         floors=floors,
@@ -466,7 +514,13 @@ def compute_floor_trend(
             else "no Full GCs or completed concurrent cycles in the window"
         )
         return trend
-    all_floors, floors = floors, trend.trend_floors
+    all_floors = [f for f in floors if f.complete and f.measurement == measurement]
+    floors = trend.trend_floors
+    if not all_floors:
+        trend.reason = (
+            "no comparable samples from a Full GC or a completed old-generation collection sequence"
+        )
+        return trend
     warmup_minutes = thresholds.warmup_seconds / 60
     if not floors:
         trend.reason = (
@@ -474,7 +528,10 @@ def compute_floor_trend(
             f"start-up (first {warmup_minutes:.0f} min of uptime)"
         )
         return trend
-    trend.step_change = find_floor_step(floors, capacity, thresholds)
+    minimum_step_basis = capacity or max(
+        (event.heap_total_kb for event in groups.get(measurement, [])), default=None
+    )
+    trend.step_change = find_floor_step(floors, minimum_step_basis, thresholds)
     span_seconds = (floors[-1].timestamp - floors[0].timestamp).total_seconds()
     trend.span_hours = span_seconds / 3600
     trend.first_mb = floors[0].value_kb / 1024
@@ -532,7 +589,7 @@ def compute_floor_trend(
         trend.direction = "unclear"
     else:
         trend.direction = "stable"
-    if trend.direction == "growing" and capacity:
+    if trend.direction == "growing" and capacity and measurement == "post-Full-GC heap occupancy":
         remaining_mb = capacity / 1024 - median(ys[-3:])
         if remaining_mb > 0:
             trend.hours_to_capacity_soonest = remaining_mb / max(
@@ -554,8 +611,7 @@ def compute_live_set_bound(
     """Lowest heap after GC per slice of the window, and whether it moves.
 
     For windows without enough floors. What is left after a young collection includes old
-    garbage, so this bounds the live set from above: when even the bound stays flat the live
-    set did not grow; when it rises, the cause may be garbage that nothing collected yet.
+    garbage, so these samples only bound live data from above.
     """
     usable = [
         e
@@ -625,7 +681,7 @@ def cleaned_floors(trend: FloorTrend) -> list[FloorPoint]:
     usable = [
         f
         for f in trend.floors
-        if f.pct_of_capacity is not None and not f.source.startswith("after Remark")
+        if f.pct_of_capacity is not None and f.measurement == "post-Full-GC heap occupancy"
     ]
     return [f for f in usable if not f.warmup] or usable
 
@@ -645,8 +701,9 @@ def describe_floor_step(trend: FloorTrend) -> str:
         return format_time(point.timestamp, point.wall_clock, point.uptime_seconds)
 
     return (
-        f"Live set jumped from {format_size_kb(step.before.value_kb)} (after the collection at "
-        f"{when(step.before)}) to {format_size_kb(step.after.value_kb)} (at {when(step.after)})"
+        f"Post-GC occupancy jumped from {format_size_kb(step.before.value_kb)} "
+        f"(at {when(step.before)}) to {format_size_kb(step.after.value_kb)} "
+        f"(at {when(step.after)})"
     )
 
 
@@ -692,10 +749,10 @@ def assess_leak(summary: GCSummary, thresholds: DiagnosticThresholds) -> LeakVer
     bound = summary.live_set_bound
     floors = trend.trend_floors
     evidence: list[str] = []
-    what = "Old-gen" if trend.metric == "old" else "Heap"
+    what = trend.measurement.capitalize() or "Post-GC occupancy"
 
     def bound_line() -> str:
-        capacity = summary.heap.max_heap_kb
+        capacity = summary.heap.max_heap_kb if summary.heap.max_heap_known else None
         pct = (
             f" ({bound.lowest_kb / capacity * 100:.1f}% to "
             f"{bound.highest_kb / capacity * 100:.1f}% of max heap)"
@@ -709,30 +766,19 @@ def assess_leak(summary: GCSummary, thresholds: DiagnosticThresholds) -> LeakVer
         )
 
     if not floors:
-        reason = trend.reason or "no post-collection floors"
-        if bound.assessed and bound.direction == "flat":
-            return LeakVerdict(
-                verdict="none",
-                basis="upper bound",
-                evidence=[
-                    bound_line(),
-                    f"No floors to measure the live set itself ({reason}); the heap left after "
-                    "GC bounds it from above, and that bound did not move",
-                ],
-            )
-        evidence.append(f"Not assessed: {reason}")
-        if bound.assessed and bound.direction == "rising":
-            evidence.append(
-                f"Lowest heap after GC rose from {format_size_kb(bound.first_kb)} to "
-                f"{format_size_kb(bound.last_kb)}, but that includes old-generation garbage no "
-                "collection has removed yet, so it does not show the live set growing"
-            )
-        return LeakVerdict(verdict="not_assessed", evidence=evidence)
+        evidence.append(f"Retention trend not assessed: {trend.reason or 'no comparable samples'}")
+        if bound.assessed:
+            evidence.append(bound_line())
+            evidence.append("These heap samples are upper bounds that include unreclaimed objects")
+        return LeakVerdict(
+            verdict="not_assessed",
+            basis="upper bound" if bound.assessed else "",
+            evidence=evidence,
+        )
 
     first_last = (
-        f"{what} floor went from {format_size_kb(floors[0].value_kb)} to "
-        f"{format_size_kb(floors[-1].value_kb)} over {len(floors)} floor"
-        f"{'s' if len(floors) != 1 else ''}"
+        f"{what} went from {format_size_kb(floors[0].value_kb)} to "
+        f"{format_size_kb(floors[-1].value_kb)} across {len(floors)} sample(s)"
     )
     latest = floors[-1].pct_of_capacity
     step = describe_floor_step(trend)
@@ -752,7 +798,11 @@ def assess_leak(summary: GCSummary, thresholds: DiagnosticThresholds) -> LeakVer
         if latest is not None:
             evidence.append(f"Latest floor at {latest:.1f}% of capacity")
         return LeakVerdict(verdict="step_change", basis="floors", evidence=evidence)
-    if latest is not None and latest > thresholds.heap_warning_percentage:
+    if (
+        trend.measurement == "post-Full-GC heap occupancy"
+        and latest is not None
+        and latest > thresholds.heap_warning_percentage
+    ):
         evidence.append(f"Latest floor at {latest:.1f}% of capacity")
         evidence.append(
             f"{first_last}: {describe_trend_numbers(trend)}"
@@ -768,7 +818,7 @@ def assess_leak(summary: GCSummary, thresholds: DiagnosticThresholds) -> LeakVer
         return LeakVerdict(verdict="none", basis="floors", evidence=evidence)
     if bound.assessed and bound.direction == "flat":
         return LeakVerdict(
-            verdict="none",
+            verdict="not_assessed",
             basis="upper bound",
             evidence=[bound_line(), f"{first_last}; floor trend not assessed: {trend.reason}"],
         )
@@ -1016,7 +1066,10 @@ def merge_intervals(intervals: list[tuple[float, float]]) -> list[tuple[float, f
 
 
 def worst_pause_share(
-    intervals: list[tuple[float, float]], window_seconds: float
+    intervals: list[tuple[float, float]],
+    window_seconds: float,
+    *,
+    bounds: tuple[float, float] | None = None,
 ) -> tuple[float, float] | None:
     """(paused seconds, window start) of the window holding the most pause time.
 
@@ -1026,7 +1079,7 @@ def worst_pause_share(
     """
     if not intervals:
         return None
-    span_start, span_end = intervals[0][0], intervals[-1][1]
+    span_start, span_end = bounds or (intervals[0][0], intervals[-1][1])
     if span_end - span_start < window_seconds:
         return None
     starts = [start for start, _ in intervals]
@@ -1075,6 +1128,10 @@ def build_timeline(
     pause_spans: list[tuple[float, float]],
     origin: datetime,
     heap_capacity_kb: int | None,
+    *,
+    heap_by_segment: dict[int, int | None] | None = None,
+    bounds: tuple[float, float] | None = None,
+    observed_spans: list[tuple[float, float]] | None = None,
 ) -> tuple[list[TimelineBucket], float]:
     """Cut the window into equal slices: pauses, time paused, longest pause, Full GCs, heap.
 
@@ -1084,7 +1141,7 @@ def build_timeline(
     """
     if not pause_spans or pause_spans[-1][1] <= pause_spans[0][0]:
         return [], 0.0
-    span_start, span_end = pause_spans[0][0], pause_spans[-1][1]
+    span_start, span_end = bounds or (pause_spans[0][0], pause_spans[-1][1])
     length = timeline_bucket_length(span_end - span_start)
     count = max(1, int(-(-(span_end - span_start) // length)))
     first_uptime = events[0].uptime_seconds
@@ -1097,7 +1154,14 @@ def build_timeline(
                 start=origin + timedelta(seconds=offset),
                 wall_clock=wall_clock,
                 uptime_seconds=first_uptime + offset if first_uptime is not None else None,
-                length_seconds=min(length, span_end - offset),
+                length_seconds=(
+                    sum(
+                        max(0.0, min(high, offset + length) - max(low, offset))
+                        for low, high in observed_spans
+                    )
+                    if observed_spans is not None
+                    else min(length, span_end - offset)
+                ),
             )
         )
 
@@ -1105,7 +1169,7 @@ def build_timeline(
         return buckets[min(count - 1, max(0, int((moment - span_start) // length)))]
 
     for start, end in pause_spans:
-        index = min(count - 1, int((start - span_start) // length))
+        index = min(count - 1, max(0, int((start - span_start) // length)))
         while index < count and span_start + index * length < end:
             slice_start = span_start + index * length
             overlap = min(end, slice_start + length) - max(start, slice_start)
@@ -1118,13 +1182,15 @@ def build_timeline(
         bucket.full_gc_count += event.gc_kind == "Full"
         if event.has_heap_data and event.gc_kind in COLLECTING_KINDS:
             bucket.heap_after_kb = event.heap_after_kb
+            capacity = heap_by_segment.get(event.segment) if heap_by_segment else heap_capacity_kb
+            bucket.heap_after_percentage = (
+                event.heap_after_kb / capacity * 100 if capacity else None
+            )
     for bucket in buckets:
         if bucket.length_seconds > 0:
             bucket.paused_percentage = min(
                 100.0, bucket.paused_seconds / bucket.length_seconds * 100
             )
-        if bucket.heap_after_kb is not None and heap_capacity_kb:
-            bucket.heap_after_percentage = min(100.0, bucket.heap_after_kb / heap_capacity_kb * 100)
     return buckets, length
 
 
@@ -1271,74 +1337,123 @@ def compute_concurrent_stats(
 SAFEPOINT_MATCH_TOLERANCE_SECONDS = 0.05
 
 
+GC_SAFEPOINT_OPERATIONS = frozenset(
+    {
+        "G1CollectForAllocation",
+        "G1CollectFull",
+        "G1PauseRemark",
+        "G1PauseCleanup",
+        "G1TryInitiateConcMark",
+        "ParallelGCFailedAllocation",
+        "ParallelGCSystemGC",
+        "GenCollectForAllocation",
+        "GenCollectFull",
+        "CMS_Initial_Mark",
+        "CMS_Final_Remark",
+    }
+)
+NON_GC_SAFEPOINT_OPERATIONS = frozenset(
+    {
+        "ThreadDump",
+        "FindDeadlocks",
+        "GetAllStackTraces",
+        "GetThreadListStackTraces",
+        "Deoptimize",
+        "DeoptimizeFrame",
+        "RevokeBias",
+        "BulkRevokeBias",
+        "Cleanup",
+    }
+)
+
+
 def compute_safepoint_stats(
     records: list[SideRecord],
     events: list[GCEvent] | None = None,
     thresholds: DiagnosticThresholds | None = None,
 ) -> SafepointStats | None:
-    """Application-stopped time, slow-to-stop safepoints, and stops that no GC pause explains.
-
-    A stop is explained by GC when a GC pause overlaps it in time. What is left is time the
-    application was frozen for another reason (a thread dump, deoptimization, biased-lock
-    revocation, threads slow to reach the safepoint), which heap tuning cannot fix.
-    """
-    stops = [r for r in records if r.kind == "safepoint"]
+    """Keep the logged elapsed and phase times, and classify independently of thresholds."""
+    stops = [record for record in records if record.kind == "safepoint"]
     if not stops:
         return None
-    longest = max(stops, key=lambda r: r.seconds)
-    slow = [r for r in stops if (r.stopping_seconds or 0.0) >= SLOW_SAFEPOINT_STOPPING_SECONDS]
-    slowest = max(stops, key=lambda r: r.stopping_seconds or 0.0)
+    longest = max(stops, key=lambda record: record.seconds)
+    reaching = [record.stopping_seconds for record in stops if record.stopping_seconds is not None]
+    at = [
+        record.at_safepoint_seconds for record in stops if record.at_safepoint_seconds is not None
+    ]
+    slowest = max(stops, key=lambda record: record.stopping_seconds or 0.0)
     stats = SafepointStats(
         count=len(stops),
-        total_stopped_seconds=sum(r.seconds for r in stops),
+        total_stopped_seconds=sum(record.seconds for record in stops),
         longest_stopped_seconds=longest.seconds,
         longest_stopped_when=longest.when,
-        slow_to_stop_count=len(slow),
+        total_reaching_seconds=sum(reaching) if reaching else None,
+        total_at_safepoint_seconds=sum(at) if at else None,
+        slow_to_stop_count=sum(seconds >= SLOW_SAFEPOINT_STOPPING_SECONDS for seconds in reaching),
         longest_stopping_seconds=slowest.stopping_seconds or 0.0,
         longest_stopping_when=slowest.when if slowest.stopping_seconds else "",
     )
+
     events = events or []
-    use_wall_clock = all(e.wall_clock for e in events) and all(
-        r.timestamp is not None for r in stops
-    )
-    single_run = len({e.segment for e in events}) <= 1
-    if not events or not (use_wall_clock or single_run):
-        return stats
-    pauses: list[tuple[float, float]] = []
+    segments = {event.segment for event in events}
+    default_segment = next(iter(segments)) if len(segments) == 1 else None
+    spans: dict[tuple[int, bool], list[tuple[float, float]]] = {}
     for event in events:
-        if use_wall_clock:
-            pauses.append((event.pause_start.timestamp(), event.pause_end.timestamp()))
-        elif event.uptime_seconds is not None:
-            at, pause = event.uptime_seconds, event.pause_time_seconds
-            pauses.append((at - pause, at) if event.stamp_at_pause_end else (at, at + pause))
-    if not pauses:
-        return stats
-    pauses.sort()
-    starts = [start for start, _ in pauses]
-    # the furthest any earlier pause reaches, so one lookup finds an overlap
-    reach: list[float] = []
-    for _, end in pauses:
-        reach.append(max(end, reach[-1]) if reach else end)
+        if event.wall_clock:
+            spans.setdefault((event.segment, True), []).append(
+                (event.pause_start.timestamp(), event.pause_end.timestamp())
+            )
+        if event.uptime_seconds is not None:
+            uptime = event.uptime_seconds
+            seconds = event.pause_time_seconds
+            start, end = (
+                (uptime - seconds, uptime)
+                if event.stamp_at_pause_end
+                else (uptime, uptime + seconds)
+            )
+            spans.setdefault((event.segment, False), []).append((start, end))
+    lookups: dict[tuple[int, bool], tuple[list[float], list[float]]] = {}
+    for key, intervals in spans.items():
+        merged = merge_intervals(sorted(intervals))
+        lookups[key] = ([start for start, _ in merged], [end for _, end in merged])
+
     non_gc: list[SideRecord] = []
     for record in stops:
-        moment = _record_moment(record, use_wall_clock)
-        if moment is None:
-            return stats
-        stop_start = moment - record.seconds - SAFEPOINT_MATCH_TOLERANCE_SECONDS
-        stop_end = moment + SAFEPOINT_MATCH_TOLERANCE_SECONDS
-        index = bisect_right(starts, stop_end)
-        if index == 0 or reach[index - 1] < stop_start:
+        if record.operation in NON_GC_SAFEPOINT_OPERATIONS:
             non_gc.append(record)
+            continue
+        if record.operation in GC_SAFEPOINT_OPERATIONS:
+            stats.gc_count += 1
+            continue
+        segment = record.segment if record.segment is not None else default_segment
+        matched = False
+        if segment is not None:
+            for wall_clock in (True, False):
+                moment = _record_moment(record, wall_clock)
+                lookup = lookups.get((segment, wall_clock))
+                if moment is None or lookup is None:
+                    continue
+                starts, ends = lookup
+                index = bisect_right(starts, moment + SAFEPOINT_MATCH_TOLERANCE_SECONDS) - 1
+                matched = (
+                    index >= 0
+                    and ends[index] >= moment - record.seconds - SAFEPOINT_MATCH_TOLERANCE_SECONDS
+                )
+                break
+        if matched:
+            stats.gc_count += 1
+        else:
+            stats.unmatched_count += 1
     stats.non_gc_count = len(non_gc)
-    stats.non_gc_total_seconds = sum(r.seconds for r in non_gc)
+    stats.non_gc_total_seconds = sum(record.seconds for record in non_gc)
     if non_gc:
-        worst = max(non_gc, key=lambda r: r.seconds)
+        worst = max(non_gc, key=lambda record: record.seconds)
         stats.longest_non_gc_seconds = worst.seconds
         stats.longest_non_gc_when = worst.when
         stats.longest_non_gc_operation = worst.operation
         stats.longest_non_gc_stopping_seconds = worst.stopping_seconds
         limit = (thresholds or DiagnosticThresholds()).longest_pause_warning_seconds
-        stats.non_gc_over_warning_count = sum(1 for r in non_gc if r.seconds >= limit)
+        stats.non_gc_over_warning_count = sum(record.seconds >= limit for record in non_gc)
     return stats
 
 
@@ -1397,6 +1512,8 @@ def build_comprehensive_summary(
     window_end: datetime | None = None,
     side_records: list[SideRecord] | None = None,
     environment: JVMEnvironment | None = None,
+    observed_bounds: dict[int, tuple[datetime, datetime]] | None = None,
+    max_heap_by_segment: dict[int, int | None] | None = None,
 ) -> GCSummary:
     """Build the analysis summary for one window of events (sorted by time).
 
@@ -1410,44 +1527,65 @@ def build_comprehensive_summary(
     full_events = by_kind["Full"]
     heap_full = [e for e in full_events if is_heap_pressure_full_gc(e)]
 
-    # Window (P1.4): from the start of the first pause to the end of the last one, clipped
-    # to --start/--end. Offsets are seconds from the first event's timestamp; a pause's own
-    # length is added as a float so sums stay exact (datetime only resolves microseconds).
-    origin = events[0].timestamp if events else None
+    origin = events[0].timestamp if events else window_start or window_end
     lower = (window_start - origin).total_seconds() if window_start and origin else None
     upper = (window_end - origin).total_seconds() if window_end and origin else None
-    clipped: list[tuple[float, float]] = []
     event_starts: list[float] = []
-    run_spans: dict[int, tuple[float, float]] = {}  # per JVM run: first pause start, last end
-    time_in_gc = 0.0
+    pauses_by_run: dict[int, list[tuple[float, float]]] = {}
+    run_spans: dict[int, tuple[float, float]] = {}
     for event in events:
         assert origin is not None
         stamp = (event.timestamp - origin).total_seconds()
         pause = event.pause_time_seconds
         start, end = (stamp - pause, stamp) if event.stamp_at_pause_end else (stamp, stamp + pause)
         event_starts.append(start)
-        cut = 0.0
-        if lower is not None and start < lower:
-            cut += min(pause, lower - start)
-        if upper is not None and end > upper:
-            cut += min(pause, end - upper)
-        time_in_gc += max(0.0, pause - cut)
         clipped_start = start if lower is None else max(start, lower)
         clipped_end = end if upper is None else min(end, upper)
         if clipped_end >= clipped_start:
-            clipped.append((clipped_start, clipped_end))
+            pauses_by_run.setdefault(event.segment, []).append((clipped_start, clipped_end))
             low, high = run_spans.get(event.segment, (clipped_start, clipped_end))
             run_spans[event.segment] = (min(low, clipped_start), max(high, clipped_end))
+    for segment, (first, last) in (observed_bounds or {}).items():
+        if origin is None or (lower is None and upper is None):
+            continue
+        first_offset = (first - origin).total_seconds()
+        last_offset = (last - origin).total_seconds()
+        covered_start = first_offset if lower is None else max(lower, first_offset)
+        covered_end = last_offset if upper is None else min(upper, last_offset)
+        if covered_end >= covered_start:
+            run_spans[segment] = (covered_start, covered_end)
     wall_clock = all(e.wall_clock for e in events)
     jvm_run_count = max(1, len(run_spans))
-    # Without wall-clock time every JVM run starts again at uptime 0, so runs analysed
-    # together overlap on the time axis: worst stretches and the timeline cannot be placed.
+    merged_run_spans = merge_intervals(sorted(run_spans.values()))
+    requested_covered: bool | None = None
+    window_basis = "observed pause span"
+    if lower is not None or upper is not None:
+        requested_covered = (
+            bool(observed_bounds)
+            and len(run_spans) == 1
+            and len(merged_run_spans) == 1
+            and (lower is None or merged_run_spans[0][0] == lower)
+            and (upper is None or merged_run_spans[0][1] == upper)
+        )
+        window_basis = "requested window" if requested_covered else "observed log span"
+    if jvm_run_count > 1:
+        window_basis = "combined observed JVM time" if not requested_covered else window_basis
     placeable = jvm_run_count == 1 or wall_clock
-    pause_spans = merge_intervals(clipped) if placeable else []
-    # The window is the time the JVM was running: downtime between runs is not part of it.
-    runtime_seconds = 0.0
-    if len(events) >= 2:
-        runtime_seconds = sum(high - low for low, high in run_spans.values())
+    pause_spans = (
+        merge_intervals(sorted(span for spans in pauses_by_run.values() for span in spans))
+        if placeable
+        else []
+    )
+    time_in_gc = sum(
+        end - start
+        for spans in pauses_by_run.values()
+        for start, end in merge_intervals(sorted(spans))
+    )
+    runtime_seconds = (
+        sum(high - low for low, high in run_spans.values())
+        if len(events) >= 2 or (observed_bounds and requested_covered is not None)
+        else 0.0
+    )
     runtime_hours = runtime_seconds / 3600
     rates_reliable = runtime_hours >= thresholds.min_rate_window_hours and runtime_hours > 0
     rate_hours = runtime_hours if rates_reliable else None
@@ -1479,12 +1617,13 @@ def build_comprehensive_summary(
 
     # Heap-pressure Full GC timing (P1.2, P1.7)
     intervals = [
-        (heap_full[i].timestamp - heap_full[i - 1].timestamp).total_seconds() / 60
-        for i in range(1, len(heap_full))
+        (later.timestamp - earlier.timestamp).total_seconds() / 60
+        for earlier, later in pairwise(heap_full)
+        if earlier.segment == later.segment
     ]
     # Half-versus-half comparisons mislead on a handful of collections: both need enough
     # Full GCs and a monotonic trend (Mann-Kendall) as well as the drop between the halves.
-    enough_full_gcs = len(heap_full) >= thresholds.min_full_gcs_for_trend
+    enough_full_gcs = jvm_run_count == 1 and len(heap_full) >= thresholds.min_full_gcs_for_trend
     full_gc_accelerating = False
     if enough_full_gcs:
         first_half = mean(intervals[: len(intervals) // 2])
@@ -1495,10 +1634,19 @@ def build_comprehensive_summary(
             and s_statistic < 0
             and p_value < thresholds.trend_p_value
         )
-    max_streak = max_back_to_back(
-        [(e.pause_start - events[0].timestamp).total_seconds() for e in heap_full],
-        [(e.pause_end - events[0].timestamp).total_seconds() for e in heap_full],
-        thresholds.full_gc_streak_window_seconds,
+    full_by_run: dict[int, list[GCEvent]] = {}
+    for event in heap_full:
+        full_by_run.setdefault(event.segment, []).append(event)
+    max_streak = max(
+        (
+            max_back_to_back(
+                [(event.pause_start - group[0].timestamp).total_seconds() for event in group],
+                [(event.pause_end - group[0].timestamp).total_seconds() for event in group],
+                thresholds.full_gc_streak_window_seconds,
+            )
+            for group in full_by_run.values()
+        ),
+        default=0,
     )
 
     # Pauses
@@ -1544,33 +1692,67 @@ def build_comprehensive_summary(
 
     # Worst stretches: a whole-window average hides an incident at the end of a long log
     worst_pause_shares: list[PauseShareWindow] = []
-    for window_seconds in PAUSE_SHARE_WINDOWS_SECONDS:
-        worst = worst_pause_share(pause_spans, window_seconds)
-        if worst is None or origin is None:
-            continue
-        paused, offset = worst
-        first_uptime = events[0].uptime_seconds
-        worst_pause_shares.append(
-            PauseShareWindow(
-                window_seconds=window_seconds,
-                paused_seconds=paused,
-                share_percentage=min(100.0, paused / window_seconds * 100),
-                window_start=origin + timedelta(seconds=offset),
-                wall_clock=wall_clock,
-                uptime_seconds=first_uptime + offset if first_uptime is not None else None,
+    if origin is not None and placeable:
+        merged_by_run = {
+            segment: merge_intervals(sorted(spans)) for segment, spans in pauses_by_run.items()
+        }
+        for window_seconds in PAUSE_SHARE_WINDOWS_SECONDS:
+            worst = max(
+                (
+                    result
+                    for segment, spans in merged_by_run.items()
+                    if (
+                        result := worst_pause_share(
+                            spans, window_seconds, bounds=run_spans[segment]
+                        )
+                    )
+                    is not None
+                ),
+                default=None,
             )
-        )
+            if worst is None:
+                continue
+            paused, offset = worst
+            first_uptime = events[0].uptime_seconds if not wall_clock else None
+            worst_pause_shares.append(
+                PauseShareWindow(
+                    window_seconds=window_seconds,
+                    paused_seconds=paused,
+                    share_percentage=paused / window_seconds * 100,
+                    window_start=origin + timedelta(seconds=offset),
+                    wall_clock=wall_clock,
+                    uptime_seconds=first_uptime + offset if first_uptime is not None else None,
+                )
+            )
 
     # Heap vs max (P1.3, P1.5)
     max_heap_kb, max_heap_source = resolve_max_heap(
         jvm_heap_config, max_heap_bytes, max_heap_from_log_bytes
     )
+    capacities = max_heap_by_segment or {}
+    per_run = len(capacities) > 1
     heap = compute_heap_stats(events, max_heap_kb, max_heap_source)
+    if per_run:
+        heap.max_heap_kb = None
+        heap.max_heap_known = False
+        heap.max_heap_source = "see JVM runs"
+        heap.exceeds_max_heap = any(
+            (capacity := capacities.get(event.segment)) is not None
+            and max(event.heap_before_kb, event.heap_after_kb) > capacity
+            for event in events
+        )
     timeline: list[TimelineBucket] = []
     timeline_bucket_seconds = 0.0
     if origin is not None and runtime_seconds > 0 and pause_spans:
         timeline, timeline_bucket_seconds = build_timeline(
-            events, event_starts, pause_spans, origin, heap.max_heap_kb
+            events,
+            event_starts,
+            pause_spans,
+            origin,
+            heap.max_heap_kb,
+            heap_by_segment=capacities if per_run else None,
+            bounds=(merged_run_spans[0][0], merged_run_spans[-1][1]),
+            observed_spans=merged_run_spans,
         )
 
     # Old gen (sawtooth) and floors (P1.1). One denominator for every old-gen percentage:
@@ -1581,18 +1763,62 @@ def build_comprehensive_summary(
     if old_capacity_kb:
         old_pct_basis = "max heap"
     else:
-        old_pct_basis = "committed heap" if is_g1 else "old generation capacity"
+        old_pct_basis = (
+            ("run max heap" if per_run else "committed heap")
+            if is_g1
+            else "old generation capacity"
+        )
 
     def old_pct(event: GCEvent) -> float | None:
+        if is_g1 and per_run:
+            capacity = capacities.get(event.segment)
+            return (
+                event.old_after_kb / capacity * 100
+                if capacity and event.old_after_kb is not None
+                else None
+            )
         if old_capacity_kb and event.old_after_kb is not None:
-            return min(100.0, event.old_after_kb / old_capacity_kb * 100)
+            return event.old_after_kb / old_capacity_kb * 100
         return event.old_used_percentage
 
     old = [pct for pct in (old_pct(e) for e in events) if pct is not None]
-    floor_trend = compute_floor_trend(
-        events, is_g1=is_g1, heap=heap, thresholds=thresholds, side_records=side_records
+    latest_run = max(capacities or {event.segment for event in events}, default=1)
+    latest_events = [event for event in events if event.segment == latest_run]
+    floor_heap = (
+        compute_heap_stats(latest_events, capacities[latest_run], "latest JVM run max heap")
+        if per_run
+        else heap
     )
+    floor_trend = compute_floor_trend(
+        latest_events,
+        is_g1=is_g1,
+        heap=floor_heap,
+        thresholds=thresholds,
+        side_records=side_records,
+    )
+    floor_trend.latest_run_only = jvm_run_count > 1
 
+    old_full = [
+        event
+        for event in full_events
+        if not is_g1 and event.old_used_percentage is not None and event.old_after_kb is not None
+    ]
+    after_warmup = [event for event in old_full if not _in_warmup(event, thresholds)]
+    peak_old_full = max(
+        after_warmup or old_full, key=lambda event: event.old_used_percentage or 0.0, default=None
+    )
+    peak_post_full_old = (
+        FloorPoint(
+            timestamp=peak_old_full.timestamp,
+            uptime_seconds=peak_old_full.uptime_seconds,
+            wall_clock=peak_old_full.wall_clock,
+            value_kb=peak_old_full.old_after_kb or 0,
+            pct_of_capacity=peak_old_full.old_used_percentage,
+            source=f"Full GC ({peak_old_full.cause or 'cause not logged'})",
+        )
+        if peak_old_full
+        else None
+    )
     # Full GC effectiveness on the whole heap. Old-gen deltas mislead: a Full GC moves the
     # surviving young objects into the old generation, so old gen can grow while the
     # collection frees memory.
@@ -1618,19 +1844,30 @@ def build_comprehensive_summary(
         if is_heap_pressure_full_gc(event):
             heap_reclaimed_pcts.append(freed_pct)
             # Freeing little is only a problem when what is left nearly fills the space
-            capacity_kb = heap.max_heap_kb or event.heap_total_kb
-            still_used_pct = (
-                post_pct if post_pct is not None else event.heap_after_kb / capacity_kb * 100
+            capacity_kb = (
+                capacities.get(event.segment)
+                if per_run
+                else (heap.max_heap_kb if heap.max_heap_known else None)
+            )
+            heap_pct = (
+                event.heap_after_kb / capacity_kb * 100
+                if capacity_kb and not heap.exceeds_max_heap
+                else None
+            )
+            old_pct_after = event.old_used_percentage if not is_g1 else None
+            still_used_pct = max(
+                (p for p in (heap_pct, old_pct_after) if p is not None), default=None
             )
             if (
                 freed_pct < thresholds.ineffective_full_gc_reclaim_percentage
+                and still_used_pct is not None
                 and still_used_pct > thresholds.heap_warning_percentage
             ):
                 ineffective_full_gcs += 1
     # Compared as the share of the heap freed: the amount in KB depends on how much garbage
     # happened to be there when the collection ran.
     reclamation_declining = False
-    if len(heap_reclaimed_pcts) >= thresholds.min_full_gcs_for_trend:
+    if jvm_run_count == 1 and len(heap_reclaimed_pcts) >= thresholds.min_full_gcs_for_trend:
         half = len(heap_reclaimed_pcts) // 2
         first_half_r = mean(heap_reclaimed_pcts[:half])
         second_half_r = mean(heap_reclaimed_pcts[half:])
@@ -1652,7 +1889,7 @@ def build_comprehensive_summary(
     total_promoted_kb = sum(promotions)
     alloc_rate, alloc_basis, running_seconds = allocation_rate(events, whole_heap=is_g1)
     if is_g1 and alloc_basis == "whole heap":
-        alloc_basis = "whole heap; includes humongous allocations"
+        alloc_basis = "whole heap; estimates net growth including humongous allocations"
 
     # Early / middle / late
     period_stats: dict[str, PeriodStatistics] = {}
@@ -1678,6 +1915,15 @@ def build_comprehensive_summary(
         first_timestamp=events[0].timestamp if events else None,
         last_timestamp=events[-1].timestamp if events else None,
         wall_clock=wall_clock,
+        window_basis=window_basis,
+        evidence_start=origin + timedelta(seconds=merged_run_spans[0][0])
+        if origin and merged_run_spans
+        else None,
+        evidence_end=origin + timedelta(seconds=merged_run_spans[-1][1])
+        if origin and merged_run_spans
+        else None,
+        requested_window_covered=requested_covered,
+        max_heap_by_segment=capacities,
         rates_reliable=rates_reliable,
         total_event_count=len(events),
         counts_by_kind={k: len(v) for k, v in by_kind.items() if v},
@@ -1734,6 +1980,7 @@ def build_comprehensive_summary(
         avg_old_pct=mean(old) if old else None,
         old_pct_basis=old_pct_basis,
         old_pct_capacity_kb=old_capacity_kb,
+        peak_post_full_old=peak_post_full_old,
         floor_trend=floor_trend,
         full_gc_reducing=reducing,
         full_gc_growing=growing,
@@ -1754,7 +2001,7 @@ def build_comprehensive_summary(
         jvm_heap_config=jvm_heap_config,
         thresholds=thresholds,
     )
-    summary.live_set_bound = compute_live_set_bound(events, heap, thresholds)
+    summary.live_set_bound = compute_live_set_bound(latest_events, floor_heap, thresholds)
     summary.leak = assess_leak(summary, thresholds)
     summary.metaspace_analysis = analyze_metaspace(
         events,
@@ -1782,7 +2029,33 @@ def build_comprehensive_summary(
     summary.jvm_run_count = jvm_run_count
     summary.has_uptime = any(e.uptime_seconds is not None for e in events)
     summary.is_g1 = is_g1
-    summary.concurrent_stats = compute_concurrent_stats(side_records or [], runtime_seconds)
+    concurrent_records = [
+        record
+        for record in side_records or []
+        if record.kind == "concurrent"
+        and (
+            (record.segment is None and lower is None and upper is None)
+            or (
+                origin is not None
+                and (span := run_spans.get(record.segment or latest_run)) is not None
+                and (
+                    (
+                        wall_clock
+                        and record.timestamp is not None
+                        and span[0] <= (record.timestamp - origin).total_seconds() <= span[1]
+                    )
+                    or (
+                        not wall_clock
+                        and record.uptime_seconds is not None
+                        and events
+                        and events[0].uptime_seconds is not None
+                        and span[0] <= record.uptime_seconds - events[0].uptime_seconds <= span[1]
+                    )
+                )
+            )
+        )
+    ]
+    summary.concurrent_stats = compute_concurrent_stats(concurrent_records, runtime_seconds)
     summary.safepoint_stats = compute_safepoint_stats(side_records or [], events, thresholds)
     summary.environment = environment
     summary.health_warnings, summary.data_notes = build_health_warnings(summary, thresholds)
@@ -1870,14 +2143,16 @@ def build_health_warnings(
         )
     if not summary.wall_clock:
         notes.append("Log has no wall-clock time: times are JVM uptime (pass --jvm-start)")
-    if heap.exceeds_max_heap:
+    if heap.exceeds_max_heap and summary.jvm_run_count > 1:
+        notes.append("Observed heap occupancy exceeds the recorded or supplied limit for a JVM run")
+    elif heap.exceeds_max_heap:
+        peak = max(heap.peak_before_gc_kb, heap.peak_after_gc_kb)
         notes.append(
-            f"Heap occupancy in the log ({heap.peak_before_gc_kb // 1024} MB) is above the max "
-            f"heap used for percentages ({(heap.max_heap_kb or 0) // 1024} MB from "
-            f"{heap.max_heap_source}): that value does not belong to this log, and heap "
-            "percentages are capped at 100%"
+            f"Logged heap occupancy ({format_size_kb(peak)}) exceeds the max heap "
+            f"({format_size_kb(heap.max_heap_kb or 0)} from "
+            f"{heap.max_heap_source}). Check that the limit belongs to this JVM run"
         )
-    if not heap.max_heap_known and heap.events_with_heap_data:
+    if not heap.max_heap_known and heap.events_with_heap_data and summary.jvm_run_count == 1:
         notes.append(
             "Max heap (-Xmx) not found in the log: heap percentages are of the committed heap "
             "and can overstate pressure (pass --max-heap)"
@@ -1891,17 +2166,17 @@ def build_health_warnings(
     if summary.peak_old_pct is None:
         notes.append("Old-generation sizes are not in this log; old-gen statistics are limited")
     if not summary.floor_trend.assessed:
-        notes.append(f"Old-gen floor trend not assessed: {summary.floor_trend.reason}")
+        notes.append(f"Post-GC occupancy trend not assessed. {summary.floor_trend.reason}")
     if summary.explicit_full_gc_count:
         notes.append(
             f"{summary.explicit_full_gc_count} explicit Full GC(s) (System.gc() and similar) "
-            "are reported but excluded from Full GC rates, streaks and the leak verdict"
+            "are excluded from heap-pressure rates and streaks. Their post-GC occupancy "
+            "can inform retention"
         )
     if summary.jvm_run_count > 1:
         notes.append(
-            f"{summary.jvm_run_count} JVM runs are analysed together: downtime between runs is "
-            "left out of the window, overhead and rates; the live-set trend uses the latest run "
-            "only, since each run starts with an empty heap"
+            f"{summary.jvm_run_count} JVM runs contribute pause counts and time. Time between "
+            "observed runs is excluded from rates. The occupancy trend uses the latest run"
             + (
                 ""
                 if summary.wall_clock
@@ -1909,27 +2184,28 @@ def build_health_warnings(
                 "stretches are not shown"
             )
         )
-    if heap.min_committed_kb and heap.max_committed_kb >= 1.1 * heap.min_committed_kb:
+    if (
+        summary.jvm_run_count == 1
+        and heap.min_committed_kb
+        and heap.max_committed_kb >= 1.1 * heap.min_committed_kb
+    ):
         notes.append(
             f"The committed heap ranged from {format_size_kb(heap.min_committed_kb)} to "
-            f"{format_size_kb(heap.max_committed_kb)} in this window: the initial heap (-Xms) "
-            "is below the maximum (-Xmx), so the JVM resizes the heap as it runs"
+            f"{format_size_kb(heap.max_committed_kb)} in this window"
         )
     notes.extend(not_assessed_notes(summary))
 
     # ---- health warnings
-    # Memory pressure is judged right after a collection that cleans the old generation (a
-    # Full GC, the end of a G1 mixed cycle, a CMS cycle): that is what the application really
-    # holds. Occupancy after a young GC still includes old-generation garbage, so without
-    # such a collection the live set is unknown and is not judged at all.
+    # Full-GC heap occupancy against that run's maximum is the pressure signal.
     cleaned = cleaned_floors(summary.floor_trend)
     basis = "max heap" if heap.max_heap_known else "committed heap"
     trend = summary.floor_trend
-    if cleaned:
-        fullest = max(cleaned, key=lambda f: f.pct_of_capacity or 0.0)
+    pressures = [(floor, "Heap", "max heap") for floor in cleaned]
+    if summary.peak_post_full_old is not None:
+        pressures.append((summary.peak_post_full_old, "Old generation", "its capacity"))
+    if pressures:
+        fullest, subject, of = max(pressures, key=lambda sample: sample[0].pct_of_capacity or 0.0)
         peak = fullest.pct_of_capacity or 0.0
-        subject = "Old generation" if trend.metric == "old" else "Heap"
-        of = basis if trend.capacity_source != "old generation capacity" else "its capacity"
         where = (
             f"{subject} was {peak:.1f}% of {of} right after {fullest.source} at "
             f"{format_time(fullest.timestamp, fullest.wall_clock, fullest.uptime_seconds)}"
@@ -1938,7 +2214,7 @@ def build_health_warnings(
             warn(
                 "heap_occupancy",
                 f"CRITICAL: {where} (threshold {t.heap_critical_percentage:.0f}%) - "
-                "live data nearly fills it; OOM risk",
+                "high post-Full-GC occupancy",
             )
         elif peak > t.heap_warning_percentage:
             warn(
@@ -1946,11 +2222,15 @@ def build_health_warnings(
                 f"WARNING: {where} (threshold {t.heap_warning_percentage:.0f}%) - "
                 "high memory pressure",
             )
-    elif heap.events_with_heap_data and heap.peak_after_gc_pct > t.heap_warning_percentage:
+    elif (
+        not trend.trend_floors
+        and heap.events_with_heap_data
+        and len(summary.max_heap_by_segment) <= 1
+        and heap.peak_after_gc_pct > t.heap_warning_percentage
+    ):
         notes.append(
             f"Heap after GC peaked at {heap.peak_after_gc_pct:.1f}% of {basis}, but nothing in "
-            "this window cleaned the old generation, so that figure includes garbage and the "
-            "live set is unknown"
+            "this window established comparable post-collection occupancy. The live set is unknown"
         )
     five_minutes = next((w for w in summary.worst_pause_shares if w.window_seconds == 300.0), None)
     if five_minutes is not None:
@@ -1989,8 +2269,9 @@ def build_health_warnings(
             "ineffective_full_gc",
             f"{level}: {summary.ineffective_full_gc_count} of {summary.heap_full_gc_count} "
             "heap-pressure Full GCs freed less than "
-            f"{t.ineffective_full_gc_reclaim_percentage:.0f}% of the heap and left it more than "
-            f"{t.heap_warning_percentage:.0f}% full - live data fills the heap",
+            f"{t.ineffective_full_gc_reclaim_percentage:.0f}% of pre-GC heap occupancy and left "
+            "heap or old-generation occupancy above "
+            f"{t.heap_warning_percentage:.0f}% of its capacity",
         )
     if summary.full_gc_per_hour is not None:
         if summary.full_gc_per_hour > t.full_gc_critical_per_hour:
@@ -2005,13 +2286,14 @@ def build_health_warnings(
                 f"WARNING: {summary.full_gc_per_hour:.1f} heap-pressure Full GCs per hour "
                 f"(threshold {t.full_gc_warning_per_hour:.0f})",
             )
-    if summary.gc_overhead_pct > t.gc_overhead_critical_percentage:
+    overhead = summary.gc_overhead_pct if summary.requested_window_covered is not False else 0.0
+    if overhead > t.gc_overhead_critical_percentage:
         warn(
             "gc_overhead",
             f"CRITICAL: GC overhead {summary.gc_overhead_pct:.1f}% "
             f"(threshold {t.gc_overhead_critical_percentage:.0f}%)",
         )
-    elif summary.gc_overhead_pct > t.gc_overhead_warning_percentage:
+    elif overhead > t.gc_overhead_warning_percentage:
         warn(
             "gc_overhead",
             f"WARNING: GC overhead {summary.gc_overhead_pct:.1f}% "
@@ -2069,7 +2351,7 @@ def build_health_warnings(
         warn(
             "g1_evacuation_failure",
             f"WARNING: {summary.evacuation_failures_after_warmup} G1 evacuation failure(s) "
-            "(to-space exhausted) - heap too full to copy live objects",
+            "reported after JVM start-up",
         )
     if summary.promotion_failure_count:
         warn(
@@ -2108,8 +2390,7 @@ def build_health_warnings(
             "safepoint_slow",
             f"WARNING: {stops.slow_to_stop_count} safepoint(s) needed 1 s or more just to stop "
             f"the application threads (longest {stops.longest_stopping_seconds:.1f} s at "
-            f"{stops.longest_stopping_when}) - the application was frozen for longer than the "
-            "GC pause times show",
+            f"{stops.longest_stopping_when})",
         )
     if stops and stops.longest_non_gc_seconds >= t.longest_pause_warning_seconds:
         critical = stops.longest_non_gc_seconds >= t.longest_pause_critical_seconds
@@ -2127,9 +2408,9 @@ def build_health_warnings(
         )
         warn(
             "safepoint_non_gc",
-            f"{'CRITICAL' if critical else 'WARNING'}: the application was stopped for "
-            f"{stops.longest_non_gc_seconds:.1f} s at {stops.longest_non_gc_when} by a "
-            f"safepoint that was not a GC pause{operation}{waiting}; "
+            f"{'CRITICAL' if critical else 'WARNING'}: a non-GC safepoint took "
+            f"{stops.longest_non_gc_seconds:.1f} s elapsed at {stops.longest_non_gc_when}"
+            f"{operation}{waiting}, "
             f"{stops.non_gc_over_warning_count} such stop(s) of "
             f"{t.longest_pause_warning_seconds:g} s or more",
         )

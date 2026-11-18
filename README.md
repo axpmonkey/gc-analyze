@@ -10,7 +10,7 @@ the terminal, save it as Markdown, or export individual pauses as JSON Lines for
 ## Install and run
 
 You need Git, [uv](https://docs.astral.sh/uv/getting-started/installation/), and a GC log to analyze.
-The application requires **Python 3.15**; the commands below install that version through uv.
+The application supports **Python 3.14 and 3.15**. The setup example uses Python 3.15.
 A Java installation is not required to analyze an existing log.
 
 ### 1. Install uv
@@ -36,12 +36,15 @@ methods, see the [uv installation guide](https://docs.astral.sh/uv/getting-start
 git clone https://github.com/axpmonkey/gc-analyze.git
 cd gc-analyze
 uv python install 3.15
-uv sync --frozen
+uv sync --python 3.15
 uv run --frozen gc-analyze version
 ```
 
-The last command displays the installed application version. Setup downloads Python and the
-project dependencies, so it requires network access.
+The first sync creates the local lockfile. The last command displays the installed application
+version. Setup downloads Python and the project dependencies, so it requires network access.
+
+To use Python 3.14, run `uv python install 3.14` and `uv sync --python 3.14`. Pass
+`--python 3.14` to `uv run` as well to select it explicitly.
 
 ### 3. Analyze a log
 
@@ -115,8 +118,8 @@ uv run --frozen gc-analyze analyze gc.log --segment 1
 uv run --frozen gc-analyze analyze gc.log --segment all
 ```
 
-With `--segment all`, downtime between runs is excluded from rates and overhead. The live-set
-trend uses the latest selected run. Without wall-clock timestamps, combined runs cannot produce
+With `--segment all`, rates use the combined observed JVM time. Heap limits are shown by run,
+and the retention trend uses the latest selected run. Without wall-clock timestamps, combined runs cannot produce
 a timeline or worst-period overhead figures.
 
 ### Investigate a time window
@@ -131,8 +134,11 @@ Either boundary can be used alone. With both boundaries, the report also compare
 24 hours earlier if the supplied logs contain pauses in that earlier window.
 
 A timestamp without an offset uses the log's offset. Log datestamps that omit an offset are
-interpreted as UTC. Pauses overlapping a boundary are retained; only their time inside the window
-contributes to pause overhead.
+interpreted as UTC. A pause counts if it overlaps the interval. Its full duration contributes to
+percentiles and longest-pause statistics, while only the part inside the interval contributes
+to pause share. The report uses the requested duration when log timestamps cover its bounds.
+Otherwise it shows the observed bounds and labels the share accordingly. Timestamp coverage
+does not verify that rotation files or individual records are complete.
 
 For an uptime-only log, provide the actual JVM start time, including its offset:
 
@@ -207,15 +213,16 @@ confidence, and a recommended action with a documentation reference.
 
 | Report item | Meaning |
 |---|---|
-| **Status** | STABLE, WARNING, or CRITICAL, based on the most severe finding. Informational findings do not raise the status. |
+| **Status** | Severity of the assessed JVM signals. The summary lists material measurement gaps. |
 | **Pauses** | Stop-the-world collections and GC phases, grouped by kind, such as Young, Mixed, Full, or Remark. |
 | **P50 / P95 / P99** | Pause durations at the 50th, 95th, and 99th percentiles. P50 is the median; P99 describes the slow end of the distribution. Check the sample count and longest pause as well. |
-| **Time in GC pauses / overhead** | Time stopped for GC and its percentage of the analyzed window. Concurrent GC work is reported separately. |
+| **Time in GC pauses / pause share** | Elapsed time covered by logged GC pauses and its share of the reported time basis. |
 | **Worst 5 minutes** | The five-minute stretch with the highest pause overhead, exposing incidents that a whole-log average can hide. |
 | **Heap after GC** | Memory remaining after a collecting pause. A high value after a young collection can include old garbage that has not yet been collected. |
-| **Fullest after old-gen cleanup** | Occupancy after a collection that cleans the old generation; stronger evidence of live-data pressure than occupancy after a young collection. |
-| **Full GC causes** | Full collections classified as heap pressure, explicit requests, or metaspace pressure. Explicit and metaspace collections are excluded from heap-pressure Full GC rates and streaks. |
-| **Old-Gen Floor Trend** | Changes in memory remaining after old-generation cleanup. A rising floor can indicate increasing retention. |
+| **Highest post-Full-GC occupancy** | Heap remaining after Full GC as a share of that run's maximum, when known. |
+| **Full GC causes** | Heap pressure, explicit requests, metaspace, other known triggers, or unknown. Only recognized heap-pressure causes contribute to heap-pressure rates and streaks. |
+| **Post-GC Occupancy Trend** | A comparison of like collection types in one JVM run. A sustained rise warrants inspecting retention and workload. |
+| **Safepoint Timing** | Total elapsed time, time reaching the safepoint and time at it, where logged. VM operations and GC overlap are used to identify known and unmatched events. |
 | **Timeline** | Counts, overhead, longest pause, Full GCs, and heap occupancy in time slices. |
 | **Data Notes / Parsing Coverage** | Missing measurements, assumptions, and GC lines the parser could not understand. Coverage describes all supplied files, even when a segment or window is selected. |
 
@@ -224,26 +231,21 @@ Per-hour rates are shown only for windows of at least 60 minutes by default; sho
 counts. Heap percentages use the maximum heap when known and committed heap otherwise. The
 report names the basis; old-generation percentages use old-generation capacity where available.
 
-### Interpret the leak verdict
+### Interpret the retention assessment
 
-The **live set** is memory retained after garbage collection. The report gives a verdict with
-evidence rather than a numerical leak score:
+The report evaluates comparable whole-heap samples after Full GC, after a confirmed G1
+Mixed sequence, or old-generation samples after CMS sweep. It fits a trend within one
+measurement type and one run. The default trend needs three samples over at least an hour,
+with a sample in the middle third. The first 10 minutes of uptime are excluded from the trend.
 
-| Verdict | Interpretation |
-|---|---|
-| **Growing** | Memory remaining after cleanup shows a significant, material upward trend. Investigate what the application retains. |
-| **Step change** | The retained memory jumped and stayed higher; investigate a load or retention event. |
-| **Full** | Live data fills the available space, without an established growth trend. |
-| **None detected** | No material growth was observed in the available measurements. |
-| **Not assessed** | The data is insufficient or does not establish a clear trend. |
+Post-Mixed and post-sweep occupancy can include unreclaimed objects. A Mixed sequence that
+ends at the log boundary is marked unconfirmed. Heap remaining after Young GC is an upper
+bound and leaves retention growth unassessed, even if that bound stays flat. G1 region counts
+measure the footprint of the occupied regions.
 
-A floor trend needs at least three suitable measurements spanning at least one hour, with a
-measurement in the middle third of that span. The first 10 minutes of JVM uptime are excluded
-from growth analysis. Where direct floors are unavailable, the report may use the lowest heap
-after GC as an upper bound on the live set and labels that limitation.
-
-A growing live set is a reason to investigate retention; a log alone does not identify the
-objects responsible. Likewise, “none detected” applies to the observed window.
+A sustained rise or a step up is evidence to correlate with workload, deployments, caches
+and retained objects. High occupancy after Full GC can signal heap pressure even with too
+few samples to establish a trend.
 
 ## Exit codes
 
@@ -261,12 +263,12 @@ code and inspect the report; a nonzero code does not necessarily mean the comman
 | Problem | What to check |
 |---|---|
 | `uv` is not found | Restart the terminal and check the uv installer's PATH instructions. |
-| Python version error | Run `uv python install 3.15`, then `uv sync --frozen` from the project directory. Other Python versions are not supported. |
+| Python version error | Run `uv python install 3.14`, then `uv sync --python 3.14` from the project directory. Use `3.15` in both commands if you prefer it. |
 | Unsupported format or no usable GC events | Confirm that the file is an extracted, plain-text GC log for a supported collector. Check any unparsed samples in the error. |
 | Incomplete parse | Review **Parsing Coverage** and its sample lines. Missing records can affect counts and conclusions. Use `--verbose` for per-file parsing details. |
 | Time window or export needs wall-clock time | Supply `--jvm-start` with the actual start time and UTC offset, or use logs containing datestamps. |
 | Heap percentages use committed heap | Supply the configured maximum with `--max-heap`, or include the startup log that records it. |
-| Leak verdict is not assessed | Check **Data Notes** and **Old-Gen Floor Trend**. A longer log with old-generation cleanup cycles may be needed. |
+| Retention trend is not assessed | Check **Data Notes** and **Post-GC Occupancy Trend** for the available samples and why they were insufficient. |
 
 For the full option list:
 

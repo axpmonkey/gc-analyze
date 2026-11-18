@@ -12,8 +12,8 @@ BRIEF_SECTION_IDS: tuple[str, ...] = (
     "header",
     "unparsed",
     "diagnosis",
-    "findings",
     "summary",
+    "findings",
     "timeline",
     "comparison",
     "notes",
@@ -54,6 +54,7 @@ BRIEF_SHRINK_STEPS: tuple[BriefDetail, ...] = (
     BriefDetail(4, 5, True),
     BriefDetail(4, 3, True),
     BriefDetail(4, 3, False),
+    BriefDetail(4, 3, False, data_notes=False),
     BriefDetail(0, 3, False),
     BriefDetail(0, 3, False, timeline_rows=3),
     BriefDetail(0, 3, False, timeline_rows=3, info_findings=False),
@@ -134,13 +135,15 @@ def _paused_share(row: list[str]) -> float:
 def _brief_section(section: Section, detail: BriefDetail) -> Section:
     floors_limit = detail.floors
     if section.id == "findings" and section.findings:
-        # one line each: the case file needs the conclusions; evidence is in the full report
+        # Keep each finding with one piece of evidence. The full report has the rest.
         serious = [f for f in section.findings if f.severity != "info"]
         info = [f for f in section.findings if f.severity == "info"] if detail.info_findings else []
-        shown = (serious + info)[:BRIEF_FINDINGS]
+        shown = serious + info[: max(0, BRIEF_FINDINGS - len(serious))]
         items = [
             f"[{f.severity.upper()}] {f.title}"
-            + (f" ({f.when})" if f.when and detail.finding_times else "")
+            + (f" ({f.when})" if f.when and (detail.finding_times or f.severity != "info") else "")
+            + (f" [{f.confidence} confidence]" if f.confidence else "")
+            + (f". {f.evidence[0]}" if f.evidence and f.evidence[0] != f.title else "")
             for f in shown
         ]
         hidden = len(section.findings) - len(shown)
@@ -154,7 +157,7 @@ def _brief_section(section: Section, detail: BriefDetail) -> Section:
         return Section(
             id=section.id,
             title=(
-                f"{section.title}: the {len(rows)} with the most time paused "
+                f"{section.title}: the {len(rows)} with the highest pause share "
                 f"(of {len(section.table_rows)})"
             ),
             kind=section.kind,
@@ -193,9 +196,10 @@ def _brief_section(section: Section, detail: BriefDetail) -> Section:
 
 
 def render_brief_markdown(sections: list[Section], generated: datetime | None = None) -> str:
-    """Case-file sized summary (P2.4): kept under ~5 KB."""
+    """Target 5 KB while preserving the summary and warning evidence."""
     by_id = {s.id: s for s in sections}
     text = ""
+    chosen: list[Section] = []
     for detail in BRIEF_SHRINK_STEPS:
         chosen = [
             _brief_section(by_id[i], detail)
@@ -209,4 +213,14 @@ def render_brief_markdown(sections: list[Section], generated: datetime | None = 
         )
         if len(text.encode()) <= BRIEF_MAX_BYTES:
             return text
-    return text[:BRIEF_MAX_BYTES].rsplit("\n", 1)[0] + "\n\n_(truncated to 5 KB)_\n"
+    for kept in (
+        {"header", "summary", "findings", "diagnosis", "coverage", "segments"},
+        {"header", "summary", "findings"},
+    ):
+        text = render_markdown(
+            [section for section in chosen if section.id in kept or section.id == "brief_findings"],
+            generated,
+        ).replace("# GC Analysis Report", "# GC Analysis (brief)", 1)
+        if len(text.encode()) <= BRIEF_MAX_BYTES:
+            return text
+    return text

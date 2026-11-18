@@ -88,8 +88,8 @@ def assign_segments(files: list[LoadedFile]) -> tuple[list[GCEvent], list[Segmen
         for index, event in enumerate(loaded.events):
             if previous is not None:
                 restart = not _continues(previous, event)
-                if index > 0 and not restart:
-                    prior_line = loaded.events[index - 1].line_number or 0
+                if not restart:
+                    prior_line = (loaded.events[index - 1].line_number or 0) if index else 0
                     this_line = event.line_number or 0
                     restart = any(prior_line < h < this_line for h in headers)
                 if restart:
@@ -156,5 +156,5 @@ def filter_window(
     return [
         e
         for e in events
-        if (start is None or e.pause_end >= start) and (end is None or e.pause_start <= end)
+        if (start is None or e.pause_end > start) and (end is None or e.pause_start < end)
     ]

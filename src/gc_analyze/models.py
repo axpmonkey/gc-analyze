@@ -8,7 +8,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 type GCKind = Literal["Young", "Mixed", "Full", "Initial Mark", "Remark", "Cleanup"]
-type FullGCCategory = Literal["heap", "explicit", "metadata"]
+type FullGCCategory = Literal["heap", "explicit", "metadata", "other", "unknown"]
 type KilobytesValue = int
 type PercentageValue = float
 type SecondsValue = float
@@ -60,6 +60,7 @@ class GCEvent(BaseModel):
     humongous_detected: bool = False
     evacuation_failed: bool = False
     to_space_exhausted: bool = False
+    evacuation_failure_reason: str | None = None
     # CMS / generational
     concurrent_mode_failure: bool = False
     promotion_failed: bool = False
@@ -417,7 +418,9 @@ class SideRecord(BaseModel):
 
     kind: Literal["concurrent", "safepoint", "mmu"]
     line_number: int  # 1-based
-    seconds: float  # concurrent work duration, or total time the application was stopped
+    seconds: float  # concurrent duration or total safepoint elapsed time
+    at_safepoint_seconds: float | None = None
+    segment: int | None = None
     stopping_seconds: float | None = None  # safepoint: time to bring the threads to a stop
     label: str = ""  # concurrent: what the duration covers
     when: str = ""  # time as written in the log
@@ -453,6 +456,10 @@ class SafepointStats(BaseModel):
     total_stopped_seconds: float
     longest_stopped_seconds: float
     longest_stopped_when: str
+    total_reaching_seconds: float | None = None
+    total_at_safepoint_seconds: float | None = None
+    gc_count: int = 0
+    unmatched_count: int = 0
     # Safepoints where bringing the threads to a stop took a second or more
     slow_to_stop_count: int = 0
     longest_stopping_seconds: float = 0.0
@@ -577,6 +584,8 @@ class FloorPoint(BaseModel):
     source: str  # "Full GC (Allocation Failure)", "end of mixed cycle", "Remark"
     # Taken during JVM start-up (class loading, cache fill): listed, but not part of the trend
     warmup: bool = False
+    measurement: str = ""
+    complete: bool = True
 
 
 class FloorStep(BaseModel):
@@ -600,6 +609,7 @@ class FloorTrend(BaseModel):
     capacity_kb: int | None = None  # denominator for pct_of_capacity
     capacity_source: str | None = None
     floors: list[FloorPoint] = Field(default_factory=list)
+    measurement: str = ""
     span_hours: float = 0.0
     slope_mb_per_hour: float | None = None
     slope_pct_per_hour: float | None = None
@@ -628,15 +638,18 @@ class FloorTrend(BaseModel):
     @property
     def trend_floors(self) -> list[FloorPoint]:
         """Floors the trend is computed from (start-up floors left out)."""
-        return [f for f in self.floors if not f.warmup]
+        return [
+            f
+            for f in self.floors
+            if not f.warmup and f.complete and f.measurement == self.measurement
+        ]
 
 
 class LiveSetBound(BaseModel):
     """Lowest heap after GC in each slice of the window: an upper bound on the live set.
 
     Used when the window has too few floors. It still contains old-generation garbage that
-    no collection has removed yet, so a flat bound rules growth out, while a rising bound
-    proves nothing.
+    no collection has removed yet. Its slope describes the bound itself.
     """
 
     assessed: bool = False
@@ -696,6 +709,7 @@ class SegmentInfo(BaseModel):
     last_uptime_seconds: float | None
     events: int
     files: list[str]
+    max_heap_kb: int | None = None
 
 
 class GCSummary(BaseModel):
@@ -704,6 +718,12 @@ class GCSummary(BaseModel):
     # Window
     runtime_seconds: float
     runtime_hours: float
+    requested_window_covered: bool | None = None
+    window_basis: str = "observed pause span"
+    evidence_start: datetime | None = None
+    evidence_end: datetime | None = None
+    includes_log_tail: bool = True
+    max_heap_by_segment: dict[int, int | None] = Field(default_factory=dict)
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
     wall_clock: bool = True
@@ -720,7 +740,7 @@ class GCSummary(BaseModel):
     remark_gc_count: int = 0
     cleanup_gc_count: int = 0
     promotion_failure_count: int = 0  # any generational collector
-    heap_full_gc_count: int = 0  # Full GCs not explained by System.gc()/metadata
+    heap_full_gc_count: int = 0  # Full GCs with a known heap-pressure cause
     explicit_full_gc_count: int = 0
     metadata_full_gc_count: int = 0
     full_gc_causes: list[FullGCCause] = Field(default_factory=list)
@@ -775,6 +795,7 @@ class GCSummary(BaseModel):
     avg_old_pct: float | None = None
     old_pct_basis: str = "old generation capacity"
     old_pct_capacity_kb: int | None = None  # fixed denominator (G1 with a known max heap)
+    peak_post_full_old: FloorPoint | None = None
     floor_trend: FloorTrend = Field(default_factory=lambda: FloorTrend(assessed=False))
 
     # Full GC effectiveness (all Full GCs: each is a measurement of the live set)

@@ -82,7 +82,7 @@ ADVICE: dict[str, Advice] = {
     "class_histogram": Advice(
         "On a heap this large a dump file is as big as the live data and slow to write and "
         "analyse. Start with jcmd <pid> GC.class_histogram, which prints heap usage per class "
-        "without writing a dump; its impact also depends on the heap size and content",
+        "without writing a dump. HotSpot rates the operation high impact; it can pause a busy JVM",
         JCMD_HISTOGRAM,
     ),
     "heap_dump_on_oom": Advice(
@@ -125,8 +125,9 @@ ADVICE: dict[str, Advice] = {
         TOMCAT_LISTENERS,
     ),
     "g1_full_gc": Advice(
-        "A G1 Full GC means objects that cannot be reclaimed were allocated faster than "
-        "concurrent marking could finish. The documented options: increase the Java heap; "
+        "A G1 Full GC under heap pressure can follow allocation outpacing concurrent marking "
+        "and reclamation. If the logs support that explanation, the documented options include "
+        "increasing the Java heap; "
         "raise -XX:ConcGCThreads; start marking earlier by raising -XX:G1ReservePercent, or by "
         "setting -XX:-G1UseAdaptiveIHOP with a lower -XX:InitiatingHeapOccupancyPercent; and "
         "reduce humongous allocations",
@@ -138,15 +139,29 @@ ADVICE: dict[str, Advice] = {
         JEP_307,
     ),
     "g1_evacuation_failure": Advice(
-        "An evacuation failure means G1 could not find enough free space to copy live objects "
-        "into, and a Full GC typically follows. The documented options are the same as for "
-        "Full GCs: increase the Java heap; start marking earlier by raising "
+        "An Allocation evacuation failure means G1 lacked destination space for some live objects. "
+        "If the failure recurs under heap pressure, consider increasing the Java heap; "
+        "start marking earlier by raising "
         "-XX:G1ReservePercent, or by setting -XX:-G1UseAdaptiveIHOP with a lower "
         "-XX:InitiatingHeapOccupancyPercent; or raise -XX:ConcGCThreads",
         G1_TUNING,
     ),
+    "g1_pinned": Advice(
+        "Pinned means native code held an object in place. Check JNI critical sections and "
+        "correlate their duration with the evacuation failures",
+        "HotSpot G1 Evacuation Failure (JDK 24): "
+        "https://docs.oracle.com/en/java/javase/24/gctuning/garbage-first-g1-garbage-collector1.html",
+    ),
+    "g1_evacuation_unknown": Advice(
+        "Check the surrounding GC phase and evacuation logs for the cause before tuning",
+        G1_TUNING,
+    ),
+    "tool_requested_gc": Advice(
+        "Correlate the logged request with monitoring, diagnostic commands and other tooling",
+        JCMD,
+    ),
     "g1_humongous": Advice(
-        "Objects of half a region or more are humongous: they are allocated straight into the "
+        "Objects larger than half a region are humongous: they are allocated straight into the "
         "old generation as whole contiguous regions. When humongous regions are many compared "
         "with old regions, the documented remedy is to increase -XX:G1HeapRegionSize so fewer "
         "objects are humongous (a power of 2 from 1 to 32 MB), or to increase the heap",
@@ -185,8 +200,8 @@ ADVICE: dict[str, Advice] = {
         G1_TUNING,
     ),
     "explicit_gc_g1": Advice(
-        "A Full GC with a cause other than Allocation Failure is requested by the application "
-        "or an external tool. If the cause is System.gc() and the code cannot be changed, "
+        "For a Full GC logged as System.gc(), check which application code or tool requested it. "
+        "If the caller cannot be changed, "
         "-XX:+ExplicitGCInvokesConcurrent mitigates it, or -XX:+DisableExplicitGC makes the "
         "JVM ignore the calls. Collections forced by external tools can only be removed by "
         "not requesting them",
@@ -199,8 +214,8 @@ ADVICE: dict[str, Advice] = {
         CONSIDERATIONS_8,
     ),
     "rmi_dgc": Advice(
-        "Evenly spaced explicit Full GCs are the signature of RMI distributed garbage "
-        "collection, which forces full collections periodically. The interval is set in "
+        "RMI distributed garbage collection is one possible source of periodic System.gc() calls. "
+        "If RMI is confirmed, its interval is set in "
         "milliseconds with -Dsun.rmi.dgc.client.gcInterval and -Dsun.rmi.dgc.server.gcInterval "
         "(a longer interval can delay reclaiming remote objects)",
         CONSIDERATIONS_8,

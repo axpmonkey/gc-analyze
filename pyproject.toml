@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 name = "gc-analyze"
 version = "6.0.0"
 description = "JVM GC log analyzer: G1, Parallel, CMS and Serial; Java 8 and unified logging"
-requires-python = ">=3.15,<3.16"
+requires-python = ">=3.14,<3.16"
 dependencies = [
     "pydantic>=2.14.3",
     "typer>=0.29.1",
@@ -17,7 +17,7 @@ dependencies = [
 gc-analyze = "gc_analyze.cli:app"
 
 [tool.ruff]
-target-version = "py315"
+target-version = "py314"
 line-length = 100
 
 [tool.ruff.lint]
@@ -35,7 +35,7 @@ ignore = [
 convention = "google"
 
 [tool.basedpyright]
-pythonVersion = "3.15"
+pythonVersion = "3.14"
 typeCheckingMode = "strict"
 reportUnknownParameterType = "error"
 reportUnknownMemberType = "error"

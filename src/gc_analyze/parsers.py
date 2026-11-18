@@ -650,7 +650,8 @@ def parse_unified_prefix_times(line: str) -> tuple[str | None, float | None]:
 UNIFIED_PAUSE_RE: re.Pattern[str] = re.compile(
     r"^GC\((?P<gc_id>\d+)\)\s+Pause\s+(?P<type>Young|Mixed|Full|Initial Mark|Remark|Cleanup)\b"
     rf"\s*(?P<tags>(?:{PAREN_GROUP}\s*)*)"
-    rf"(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\)\s+(?P<pause>{DEC})\s*ms$"
+    rf"(?:(?P<hb>{SIZE})->(?P<ha>{SIZE})\((?P<ht>{SIZE})\)\s+)?"
+    rf"(?P<pause>{DEC})\s*ms$"
 )
 # Tags that describe the young-pause phase, not the cause
 G1_YOUNG_PHASE_TAGS: frozenset[str] = frozenset(
@@ -715,6 +716,7 @@ class UnifiedGCParser:
                     and prefix.uptime < last_uptime - _UPTIME_RESTART_TOLERANCE_SECONDS
                 ):
                     restarted = True
+                    region_size_kb = None
                 last_uptime = prefix.uptime
             if restarted:
                 by_id.clear()
@@ -726,7 +728,9 @@ class UnifiedGCParser:
                     )
                 continue
 
-            if match := UNIFIED_PAUSE_RE.match(message):
+            if (match := UNIFIED_PAUSE_RE.match(message)) and (
+                match.group("ht") or match.group("type") in {"Remark", "Cleanup", "Initial Mark"}
+            ):
                 event = self._pause_event(match, prefix)
                 event.update(line_index=index, line_end=index)
                 gc_id = int(match.group("gc_id"))
@@ -791,7 +795,8 @@ class UnifiedGCParser:
     def _pause_event(self, match: re.Match[str], prefix: UnifiedPrefix) -> RawEvent:
         pause_type = match.group("type")
         tags = paren_contents(match.group("tags"))
-        evacuation_failed = any(tag.startswith("Evacuation Failure") for tag in tags)
+        failure = next((tag for tag in tags if tag.startswith("Evacuation Failure")), None)
+        reason = failure.partition(":")[2].strip() if failure else ""
         cause_tags = [
             tag
             for tag in tags
@@ -814,12 +819,13 @@ class UnifiedGCParser:
             gc_kind=kind,
             cause=cause,
             pause=to_float(match.group("pause")) / 1000,
-            heap_before=parse_size_to_kb(match.group("hb")),
-            heap_after=parse_size_to_kb(match.group("ha")),
-            heap_total=parse_size_to_kb(match.group("ht")),
+            heap_before=parse_size_to_kb(match.group("hb")) if match.group("hb") else None,
+            heap_after=parse_size_to_kb(match.group("ha")) if match.group("ha") else None,
+            heap_total=parse_size_to_kb(match.group("ht")) if match.group("ht") else None,
             humongous_detected=cause is not None and "Humongous" in cause,
-            evacuation_failed=evacuation_failed,
-            to_space_exhausted=False,
+            evacuation_failed=failure is not None,
+            evacuation_failure_reason=reason or None,
+            to_space_exhausted="Allocation" in reason.split("/"),
             # JDK 9-11 "Pause Initial Mark" and JDK 12+ "(Concurrent Start)" start G1 marking
             concurrent_start=self.gc_type_name == "G1 GC"
             and (pause_type == "Initial Mark" or "Concurrent Start" in tags),
@@ -888,6 +894,7 @@ STOPPED_TIME_RE: re.Pattern[str] = re.compile(
 # safepoint), and newer releases append a thread count:
 #   Safepoint "G1CollectForAllocation", Time since last: 1 ns, Reaching safepoint: 2 ns,
 #   Cleanup: 3 ns, At safepoint: 4 ns, Total: 9 ns
+AT_SAFEPOINT_RE = re.compile(r"\bAt safepoint: (\d+) ns")
 SAFEPOINT_RE: re.Pattern[str] = re.compile(
     r'Safepoint "(?P<operation>[^"]+)", Time since last: \d+ ns, '
     r"Reaching safepoint: (?P<reaching>\d+) ns, .*?\bTotal: (?P<total>\d+) ns"
@@ -896,7 +903,7 @@ SAFEPOINT_RE: re.Pattern[str] = re.compile(
 MMU_VIOLATED_RE: re.Pattern[str] = re.compile(rf"MMU target violated: (?P<ms>{DEC})ms")
 
 
-def _line_stamp(line: str) -> tuple[str | None, float | None]:
+def log_line_times(line: str) -> tuple[str | None, float | None]:
     """(datestamp, uptime seconds) of a log line of either family."""
     if line.startswith("["):
         return parse_unified_prefix_times(line)
@@ -905,7 +912,7 @@ def _line_stamp(line: str) -> tuple[str | None, float | None]:
 
 
 def _side_record(kind: str, index: int, line: str, seconds: float, **fields: Any) -> SideRecord:
-    timestamp, uptime = _line_stamp(line)
+    timestamp, uptime = log_line_times(line)
     when = timestamp or (f"uptime {uptime:.3f}s" if uptime is not None else "")
     parsed: datetime | None = None
     if timestamp:
@@ -958,6 +965,7 @@ def scan_side_records(log_lines: list[str]) -> list[SideRecord]:
                 )
             )
         elif 'Safepoint "' in line and (match := SAFEPOINT_RE.search(line)):
+            at_safepoint = AT_SAFEPOINT_RE.search(line)
             records.append(
                 _side_record(
                     "safepoint",
@@ -965,6 +973,7 @@ def scan_side_records(log_lines: list[str]) -> list[SideRecord]:
                     line,
                     int(match.group("total")) / 1e9,
                     stopping_seconds=int(match.group("reaching")) / 1e9,
+                    at_safepoint_seconds=int(at_safepoint[1]) / 1e9 if at_safepoint else None,
                     operation=match.group("operation"),
                 )
             )

@@ -54,7 +54,13 @@ def event_record(event: GCEvent, *, host: str | None, max_heap_kb: int | None) -
         "old_after_kb": event.old_after_kb,
         "uptime_s": event.uptime_seconds,
         "segment": event.segment,
+        "pause_start": event.pause_start.astimezone(UTC).isoformat(),
+        "pause_end": event.pause_end.astimezone(UTC).isoformat(),
     }
+    if event.gc_kind == "Full":
+        attrs["full_gc_category"] = classify_full_gc_cause(event.cause)
+    if event.evacuation_failure_reason:
+        attrs["evacuation_failure_reason"] = event.evacuation_failure_reason
     for flag in (
         "concurrent_mode_failure",
         "promotion_failed",
@@ -86,10 +92,19 @@ def event_record(event: GCEvent, *, host: str | None, max_heap_kb: int | None) -
 
 
 def export_events(
-    events: list[GCEvent], path: Path, *, host: str | None = None, max_heap_kb: int | None = None
+    events: list[GCEvent],
+    path: Path,
+    *,
+    host: str | None = None,
+    max_heap_kb: int | None = None,
+    max_heap_by_segment: dict[int, int | None] | None = None,
 ) -> int:
     """Write events as JSON lines; returns the number written."""
-    records = [event_record(e, host=host, max_heap_kb=max_heap_kb) for e in events]
+    capacities = max_heap_by_segment or {}
+    records = [
+        event_record(event, host=host, max_heap_kb=capacities.get(event.segment, max_heap_kb))
+        for event in events
+    ]
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
             handle.write(json.dumps(record, ensure_ascii=False) + "\n")

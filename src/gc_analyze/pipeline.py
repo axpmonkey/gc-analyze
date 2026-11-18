@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, tzinfo
+from itertools import groupby
 from pathlib import Path
 
-from .analysis import build_comprehensive_summary
+from .analysis import build_comprehensive_summary, resolve_max_heap
 from .coverage import compute_candidate_coverage, merge_coverage
-from .events import normalize_event
+from .events import UPTIME_EPOCH, normalize_event, parse_log_timestamp
 from .jvm_config import parse_jvm_environment, parse_jvm_heap_config, parse_max_heap_from_log
 from .models import (
     CandidateCoverage,
@@ -16,13 +17,16 @@ from .models import (
     FileCoverage,
     GCEvent,
     GCSummary,
+    JVMEnvironment,
+    JVMHeapConfig,
     SegmentInfo,
     SideRecord,
 )
-from .parsers import detect_gc_type_and_create_parser, scan_side_records
+from .parsers import detect_gc_type_and_create_parser, log_line_times, scan_side_records
 from .segments import (
     LoadedFile,
     assign_segments,
+    describe_segments,
     filter_window,
     find_header_lines,
     order_files,
@@ -83,51 +87,104 @@ def load_file(path: Path, jvm_start: datetime | None, label: str | None) -> Load
     return loaded
 
 
-# Lines kept before a JVM start header: the Java 8 version/memory lines and the unified
-# "Heap region size" line are written just above it.
-HEADER_LOOKBACK_LINES = 5
-
-
-def segment_startup_lines(files: list[LoadedFile], events: list[GCEvent]) -> list[str] | None:
-    """Log lines of the JVM run behind the latest analysed segment, from its start header.
-
-    Flags and heap sizes can change between restarts, so the configuration shown must come
-    from the run being analysed. Returns None when that run's header is not in its file
-    (e.g. the header is in an older rotated file).
-    """
-    latest_segment = max(e.segment for e in events)
-    first = next(e for e in events if e.segment == latest_segment)
-    loaded = next((f for f in files if str(f.path) == first.source_file), None)
-    if loaded is None or first.line_number is None:
-        return None
-    line_number = first.line_number
-    headers_before = [h for h in loaded.header_line_numbers if h <= line_number]
-    if not headers_before:
-        return None
-    headers_after = [h for h in loaded.header_line_numbers if h > line_number]
-    start = max(0, headers_before[-1] - 1 - HEADER_LOOKBACK_LINES)
-    end = headers_after[0] - 1 if headers_after else len(loaded.lines)
-    return loaded.lines[start:end]
-
-
-def side_records_between(files: list[LoadedFile], events: list[GCEvent]) -> list[SideRecord]:
-    """Concurrent-work and safepoint records lying between the first and last analysed pause.
-
-    Line position in each file stands in for time, which keeps the records to the analysed
-    JVM run and --start/--end window without needing a timestamp on every line.
-    """
-    bounds: dict[str, tuple[int, int]] = {}
+def run_file_ranges(
+    files: list[LoadedFile], events: list[GCEvent]
+) -> dict[int, list[tuple[LoadedFile, int, int]]]:
+    """Assign line ranges to runs using the startup headers and the segmented pauses."""
+    by_file: dict[str, list[GCEvent]] = {}
     for event in events:
-        if event.source_file is None or event.line_number is None:
-            continue
-        low, high = bounds.get(event.source_file, (event.line_number, event.line_number))
-        bounds[event.source_file] = (min(low, event.line_number), max(high, event.line_number))
-    kept: list[SideRecord] = []
+        if event.source_file:
+            by_file.setdefault(event.source_file, []).append(event)
+    ranges: dict[int, list[tuple[LoadedFile, int, int]]] = {}
     for loaded in files:
-        if str(loaded.path) not in bounds:
-            continue
-        low, high = bounds[str(loaded.path)]
-        kept += [r for r in loaded.side_records if low <= r.line_number <= high]
+        file_events = by_file.get(str(loaded.path), [])
+        previous_line = 0
+        starts: list[tuple[int, int]] = []
+        for segment, group in groupby(file_events, key=lambda event: event.segment):
+            run_events = list(group)
+            first_line = run_events[0].line_number or 1
+            header = max(
+                (h for h in loaded.header_line_numbers if previous_line < h <= first_line),
+                default=first_line,
+            )
+            start = header - 1
+            # Some VM startup fields immediately precede the collector announcement.
+            if header in loaded.header_line_numbers:
+                while start > previous_line and "[gc,init" in loaded.lines[start - 1]:
+                    start -= 1
+            starts.append((segment, start if starts else 0))
+            previous_line = run_events[-1].line_number or first_line
+        for (segment, start), (_, end) in zip(
+            starts, [*starts[1:], (0, len(loaded.lines))], strict=True
+        ):
+            ranges.setdefault(segment, []).append((loaded, start, end))
+    return ranges
+
+
+def observed_wall_bounds(
+    ranges: list[tuple[LoadedFile, int, int]], events: list[GCEvent]
+) -> tuple[datetime, datetime]:
+    """Use each range's first and last timestamped log lines, including non-pause records."""
+    first = min(event.pause_start for event in events)
+    last = max(event.pause_end for event in events)
+    anchor = next(
+        (
+            event.timestamp - timedelta(seconds=event.uptime_seconds)
+            for event in events
+            if event.wall_clock and event.uptime_seconds is not None
+        ),
+        None,
+    )
+    for loaded, start, end in ranges:
+        for indices in (range(start, end), range(end - 1, start - 1, -1)):
+            for index in indices:
+                stamp, uptime = log_line_times(loaded.lines[index])
+                if stamp is not None:
+                    try:
+                        moment = parse_log_timestamp(stamp)
+                    except ValueError:
+                        continue
+                elif anchor is not None and uptime is not None:
+                    moment = anchor + timedelta(seconds=uptime)
+                else:
+                    continue
+                first, last = min(first, moment), max(last, moment)
+                break
+    return first, last
+
+
+def select_side_records(
+    ranges: list[tuple[LoadedFile, int, int]],
+    events: list[GCEvent],
+    segment: int,
+    start: datetime | None,
+    end: datetime | None,
+) -> list[SideRecord]:
+    """Keep records owned by the run and overlapping the requested time bounds."""
+    anchor = next(
+        (
+            event.timestamp - timedelta(seconds=event.uptime_seconds)
+            for event in events
+            if event.wall_clock and event.uptime_seconds is not None
+        ),
+        None,
+    )
+    kept: list[SideRecord] = []
+    for loaded, first, last in ranges:
+        for record in loaded.side_records:
+            if not first < record.line_number <= last:
+                continue
+            moment = record.timestamp
+            if moment is None and anchor is not None and record.uptime_seconds is not None:
+                moment = anchor + timedelta(seconds=record.uptime_seconds)
+            if start or end:
+                if moment is None:
+                    continue
+                if start and moment <= start:
+                    continue
+                if end and moment - timedelta(seconds=record.seconds) >= end:
+                    continue
+            kept.append(record.model_copy(update={"segment": segment, "timestamp": moment}))
     return kept
 
 
@@ -172,40 +229,101 @@ def run_analysis(
         raise NoEventsError(coverage)
     events, segment_label = select_segment(all_events, segments, segment)
 
-    all_lines = [line for f in files for line in f.lines]
-    run_lines = segment_startup_lines(files, events)
-    config = (parse_jvm_heap_config(run_lines) if run_lines else None) or parse_jvm_heap_config(
-        all_lines
-    )
-    log_max_heap = (
-        parse_max_heap_from_log(run_lines) if run_lines else None
-    ) or parse_max_heap_from_log(all_lines)
-
-    environment = (parse_jvm_environment(run_lines) if run_lines else None) or (
-        parse_jvm_environment(all_lines) if len(segments) == 1 else None
-    )
+    if jvm_start is not None and len(segments) > 1:
+        # One supplied anchor can only place the first JVM. Keep genuine datestamps on later runs.
+        all_events = [
+            event.model_copy(
+                update={
+                    "timestamp": event.timestamp - jvm_start + UPTIME_EPOCH,
+                    "wall_clock": False,
+                    "tz_source": None,
+                }
+            )
+            if event.segment > 1
+            and event.timestamp_raw is None
+            and event.uptime_seconds is not None
+            else event
+            for event in all_events
+        ]
+        segments = describe_segments(all_events)
+        events, segment_label = select_segment(all_events, segments, segment)
+    ranges_by_run = run_file_ranges(files, all_events)
+    events_by_run: dict[int, list[GCEvent]] = {}
+    for event in all_events:
+        events_by_run.setdefault(event.segment, []).append(event)
+    configs: dict[int, JVMHeapConfig | None] = {}
+    max_heap_from_log: dict[int, int | None] = {}
+    max_heap_by_run: dict[int, int | None] = {}
+    environments: dict[int, JVMEnvironment | None] = {}
+    observed: dict[int, tuple[datetime, datetime]] = {}
+    for info in segments:
+        ranges = ranges_by_run.get(info.index, [])
+        lines = [
+            line
+            for loaded, start_line, end_line in ranges
+            for line in loaded.lines[start_line:end_line]
+        ]
+        configs[info.index] = parse_jvm_heap_config(lines)
+        max_heap_from_log[info.index] = parse_max_heap_from_log(lines)
+        environments[info.index] = parse_jvm_environment(lines)
+        capacity, _ = resolve_max_heap(
+            configs[info.index], max_heap_bytes, max_heap_from_log[info.index]
+        )
+        max_heap_by_run[info.index] = capacity
+        info.max_heap_kb = capacity
+        if all(event.wall_clock for event in events_by_run[info.index]):
+            observed[info.index] = observed_wall_bounds(ranges, events_by_run[info.index])
 
     def summarize(
         window_events: list[GCEvent],
-        window_start: datetime | None = None,
-        window_end: datetime | None = None,
+        candidate_runs: set[int],
+        window_start: datetime | None,
+        window_end: datetime | None,
     ) -> GCSummary:
-        return build_comprehensive_summary(
+        runs = {event.segment for event in window_events}
+        if window_start or window_end:
+            runs.update(
+                run
+                for run in candidate_runs
+                if run in observed
+                and (window_start is None or observed[run][1] > window_start)
+                and (window_end is None or observed[run][0] < window_end)
+            )
+        single_run = next(iter(runs)) if len(runs) == 1 else None
+        summary = build_comprehensive_summary(
             window_events,
             thresholds,
             gc_type=gc_type,
-            jvm_heap_config=config,
+            jvm_heap_config=configs[single_run] if single_run is not None else None,
             max_heap_bytes=max_heap_bytes,
-            max_heap_from_log_bytes=log_max_heap,
+            max_heap_from_log_bytes=max_heap_from_log[single_run]
+            if single_run is not None
+            else None,
+            max_heap_by_segment={run: max_heap_by_run[run] for run in runs},
             window_start=window_start,
             window_end=window_end,
-            side_records=side_records_between(files, window_events),
-            environment=environment,
+            observed_bounds={run: observed[run] for run in runs if run in observed},
+            side_records=[
+                record
+                for run in sorted(runs)
+                for record in select_side_records(
+                    ranges_by_run.get(run, []), events_by_run[run], run, window_start, window_end
+                )
+            ],
+            environment=environments[single_run] if single_run is not None else None,
         )
+        last_run = all_events[-1].segment
+        summary.includes_log_tail = last_run in runs and (
+            window_end is None or (last_run in observed and window_end >= observed[last_run][1])
+        )
+        return summary
 
+    selected_runs = {event.segment for event in events}
     log_tz = next((e.timestamp.tzinfo for e in all_events if e.wall_clock), None)
     start_dt = parse_time_option(start, "--start", log_tz)
     end_dt = parse_time_option(end, "--end", log_tz)
+    if start_dt is not None and end_dt is not None and end_dt <= start_dt:
+        raise ValueError("--end must be later than --start")
     window_label: str | None = None
     comparison: GCSummary | None = None
     comparison_label = ""
@@ -217,13 +335,35 @@ def run_analysis(
             f"window {start_dt.isoformat() if start_dt else 'start'} to "
             f"{end_dt.isoformat() if end_dt else 'end'}"
         )
-        if not events:
-            raise ValueError(f"No GC pauses in the {window_label}")
+        if (
+            not events
+            and not any(
+                select_side_records(
+                    ranges_by_run.get(run, []), events_by_run[run], run, start_dt, end_dt
+                )
+                for run in selected_runs
+            )
+            and not any(
+                run in observed
+                and start_dt
+                and end_dt
+                and observed[run][0] <= start_dt
+                and observed[run][1] >= end_dt
+                for run in selected_runs
+            )
+        ):
+            raise ValueError(f"No GC pauses or other evidence in the {window_label}")
         if start_dt and end_dt:
             day = timedelta(days=1)
-            previous = filter_window(all_events, start_dt - day, end_dt - day)
-            if previous:
-                comparison = summarize(previous, start_dt - day, end_dt - day)
+            previous = filter_window(
+                [event for event in all_events if event.wall_clock], start_dt - day, end_dt - day
+            )
+            previous_start, previous_end = start_dt - day, end_dt - day
+            if previous or any(
+                first <= previous_start and last >= previous_end
+                for first, last in observed.values()
+            ):
+                comparison = summarize(previous, set(observed), previous_start, previous_end)
                 comparison_label = "the same window 24 h earlier"
 
     file_coverages = [
@@ -244,7 +384,7 @@ def run_analysis(
         segments=segments,
         events=sorted(events, key=lambda e: e.timestamp),
         segment_label=segment_label,
-        summary=summarize(events, start_dt, end_dt),
+        summary=summarize(events, selected_runs, start_dt, end_dt),
         window_label=window_label,
         comparison=comparison,
         comparison_label=comparison_label,

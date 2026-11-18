@@ -108,6 +108,8 @@ def normalize_event(
         humongous_detected=raw_event.get("humongous_detected", False),
         evacuation_failed=raw_event.get("evacuation_failed", False),
         to_space_exhausted=raw_event.get("to_space_exhausted", False),
+        evacuation_failure_reason=raw_event.get("evacuation_failure_reason")
+        or ("Allocation" if raw_event.get("to_space_exhausted") else None),
         concurrent_mode_failure=raw_event.get("concurrent_mode_failure", False),
         promotion_failed=raw_event.get("promotion_failed", False),
         metaspace_before_kb=raw_event.get("metaspace_before"),

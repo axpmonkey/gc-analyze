@@ -225,7 +225,11 @@ def analyze(
         if export_events_path is not None:
             max_heap_kb = summary.heap.max_heap_kb if summary.heap.max_heap_known else None
             written = export_events(
-                ctx.events, export_events_path, host=host, max_heap_kb=max_heap_kb
+                ctx.events,
+                export_events_path,
+                host=host,
+                max_heap_kb=max_heap_kb,
+                max_heap_by_segment=summary.max_heap_by_segment,
             )
             console.print(f"[success]✓ {written} events exported to {export_events_path}[/success]")
 
