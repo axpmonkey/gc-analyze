@@ -1113,7 +1113,7 @@ def describe_floor_trend(summary: GCSummary) -> str:
     trend = summary.floor_trend
     floors = trend.trend_floors
     if not floors:
-        return f"Post-GC occupancy trend not assessed. {trend.reason}."
+        return f"Post-GC occupancy trend not assessed: {trend.reason}."
     what = trend.measurement.capitalize()
     first_last = f"{format_kb(floors[0].value_kb)} → {format_kb(floors[-1].value_kb)}"
     step = f" {describe_floor_step(trend)}." if trend.step_change is not None else ""
@@ -1407,7 +1407,7 @@ def build_sections(ctx: ReportContext) -> list[Section]:
     if s.timeline:
         timeline = _table(
             "timeline",
-            f"Timeline ({format_duration(s.timeline_bucket_seconds)} slices)",
+            f"Timeline ({window_name(s.timeline_bucket_seconds)} slices)",
             build_timeline_table(s),
         )
         timeline.row_weights = [bucket.paused_percentage for bucket in s.timeline]

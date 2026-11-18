@@ -237,8 +237,14 @@ def format_duration(seconds: float) -> str:
 
 
 def window_name(seconds: float) -> str:
-    """A fixed window's name: '60 s', '5 min', '60 min'."""
-    return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
+    """A fixed window's or slice's name: '30 s', '5 min', '1 h', '6 h', '2 d'."""
+    if seconds >= 86400 and seconds % 86400 == 0:
+        return f"{seconds / 86400:.0f} d"
+    if seconds >= 3600 and seconds % 3600 == 0:
+        return f"{seconds / 3600:.0f} h"
+    if seconds >= 60:
+        return f"{seconds / 60:.0f} min"
+    return f"{seconds:.0f} s"
 
 
 # ============================================================
@@ -2365,7 +2371,7 @@ def build_health_warnings(
     if summary.peak_old_pct is None:
         notes.append("Old-generation sizes are not in this log; old-gen statistics are limited")
     if not summary.floor_trend.assessed:
-        notes.append(f"Post-GC occupancy trend not assessed. {summary.floor_trend.reason}")
+        notes.append(f"Post-GC occupancy trend not assessed: {summary.floor_trend.reason}")
     if summary.explicit_full_gc_count:
         notes.append(
             f"{summary.explicit_full_gc_count} explicit Full GC(s) (System.gc() and similar) "

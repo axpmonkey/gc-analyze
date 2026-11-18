@@ -5,19 +5,22 @@ from __future__ import annotations
 import cProfile
 import pstats
 import sys
+from collections.abc import Generator
+from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
+from typer.core import TyperGroup
 
 from . import __version__
 from .atomic import write_text_atomic
 from .export import ExportError, export_events
 from .jvm_config import parse_size_argument
 from .models import DiagnosticThresholds
-from .outputs import build_report, exit_code
+from .outputs import EXIT_CANNOT_ANALYZE, build_report, exit_code
 from .pipeline import NoEventsError, parse_time_option, run_analysis
 from .report import GC_ANALYZE_THEME, console, render_rich
 
@@ -27,7 +30,33 @@ status_console = Console(theme=GC_ANALYZE_THEME, stderr=True)
 
 __all__ = ["app", "exit_code"]
 
+
+@contextmanager
+def _cannot_analyze_on_usage_error() -> Generator[None]:
+    try:
+        yield
+    except typer.TyperException as exc:
+        exc.exit_code = EXIT_CANNOT_ANALYZE
+        raise
+
+
+class CommandLineErrorsCannotAnalyze(TyperGroup):
+    """Command-line errors exit with EXIT_CANNOT_ANALYZE.
+
+    Typer's own code for a usage error is 2, which here means critical findings.
+    """
+
+    def make_context(self, *args: Any, **kwargs: Any) -> Any:
+        with _cannot_analyze_on_usage_error():
+            return super().make_context(*args, **kwargs)
+
+    def invoke(self, *args: Any, **kwargs: Any) -> Any:
+        with _cannot_analyze_on_usage_error():
+            return super().invoke(*args, **kwargs)
+
+
 app = typer.Typer(
+    cls=CommandLineErrorsCannotAnalyze,
     name="gc-analyze",
     help="JVM GC log analyzer: G1, Parallel, CMS and Serial; Java 8 and unified (JDK 9+) logs",
     add_completion=False,
@@ -116,20 +145,26 @@ def analyze(
         int,
         typer.Option(
             "--full-gc-streak",
-            help="Back-to-back heap-pressure Full GCs (within 5 minutes) that count as thrashing",
+            help="Heap-pressure Full GCs within 5 minutes that make a streak finding",
             min=2,
         ),
     ] = 3,
     heap_warning: Annotated[
         float,
         typer.Option(
-            "--heap-warning", help="Heap-after-GC % that triggers a warning", min=0.0, max=100.0
+            "--heap-warning",
+            help="Occupancy % right after a Full GC (or comparable collection) that warns",
+            min=0.0,
+            max=100.0,
         ),
     ] = 80.0,
     heap_critical: Annotated[
         float,
         typer.Option(
-            "--heap-critical", help="Heap-after-GC % that is critical", min=0.0, max=100.0
+            "--heap-critical",
+            help="Occupancy % right after a Full GC (or comparable collection) that is critical",
+            min=0.0,
+            max=100.0,
         ),
     ] = 95.0,
     workload: Annotated[
@@ -151,7 +186,8 @@ def analyze(
 ) -> None:
     """Analyze JVM GC log file(s).
 
-    Exit codes: 0 = clean, 1 = warning findings or incomplete parse, 2 = critical findings.
+    Exit codes: 0 = OK, 1 = warning findings or incomplete parse, 2 = critical findings,
+    3 = could not analyze (usage error, unreadable or unsupported log, failed output).
     """
     profiler = cProfile.Profile() if profile else None
     if profiler:
@@ -190,7 +226,7 @@ def analyze(
             )
             for sample in exc.coverage.unparsed_samples:
                 console.print(f"  Unparsed sample {sample}", markup=False, highlight=False)
-            sys.exit(1)
+            sys.exit(EXIT_CANNOT_ANALYZE)
         report_on_stdout = (json_output is not None and str(json_output) == "-") or (
             brief and output is None
         )
@@ -242,9 +278,9 @@ def analyze(
         if code:
             sys.exit(code)
 
-    except (ValueError, ExportError) as exc:
+    except (ValueError, ExportError, OSError) as exc:  # OSError: a log or output file
         console.print(f"[critical]ERROR: {exc}[/critical]")
-        sys.exit(1)
+        sys.exit(EXIT_CANNOT_ANALYZE)
 
 
 @app.command()

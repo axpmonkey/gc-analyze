@@ -50,17 +50,25 @@ class ReportDocument(BaseModel):
     file_coverages: list[FileCoverage]
 
 
+# Exit codes follow the monitoring-plugin convention (OK, WARNING, CRITICAL, UNKNOWN), so a
+# monitoring system can run the command as a check
+EXIT_OK = 0
+EXIT_WARNING = 1  # warning findings, or too many GC lines not understood
+EXIT_CRITICAL = 2  # critical findings
+EXIT_CANNOT_ANALYZE = 3  # usage error, unreadable or unsupported log, failed output
+
+
 def exit_code(findings: list[Finding], unparsed_pct: float) -> int:
-    """0 clean, 1 warning findings or incomplete parse, 2 critical findings.
+    """EXIT_OK, EXIT_WARNING or EXIT_CRITICAL for a completed analysis.
 
     The same findings the report lists decide the code: informational findings do not count.
     """
     status = overall_status(findings)
     if status == "critical":
-        return 2
+        return EXIT_CRITICAL
     if status == "warning" or unparsed_pct > UNPARSED_WARNING_THRESHOLD_PCT:
-        return 1
-    return 0
+        return EXIT_WARNING
+    return EXIT_OK
 
 
 @dataclass
