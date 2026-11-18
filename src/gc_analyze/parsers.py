@@ -541,6 +541,8 @@ class GenerationalGCParser(_LegacyParserBase):
             event.old_before = int(match.group("ob"))
             event.old_after = int(match.group("oa"))
             event.old_total = int(match.group("ot"))
+            if young is not None:
+                event.young_after = young_after_full_collection(heap, young, event.old_after)
         elif young is not None:
             event.old_before, event.old_after, event.old_total = old_gen_from_heap_and_young(
                 heap, young
@@ -1318,6 +1320,21 @@ def detect_gc_type_and_create_parser(log_lines: LineSource) -> GCParser:
 
 
 YOUNG_ABOVE_HEAP = "young generation above the whole heap"
+
+
+def young_after_full_collection(
+    heap: tuple[int, int, int], young: tuple[int, int, int], old_after: int
+) -> int:
+    """Young generation after a pause that also collected the old generation.
+
+    A young collection that escalates ("[ParNew: 34944K->34944K(39296K), ...][CMS: ...]",
+    "[DefNew: ...][Tenured: ...]") logs its young step before the full collection empties
+    the young generation, so the young size after the whole pause is the heap after it
+    minus the old generation after it. Parallel logs that same figure. The young step's own
+    figure is kept when the heap and old sizes do not add up.
+    """
+    remaining = heap[1] - old_after
+    return remaining if 0 <= remaining <= young[2] else young[1]
 
 
 def old_gen_from_heap_and_young(

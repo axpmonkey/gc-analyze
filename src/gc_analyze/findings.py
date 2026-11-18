@@ -25,6 +25,7 @@ from .analysis import (
     format_size_kb,
     format_time,
     is_heap_pressure_full_gc,
+    window_name,
 )
 from .models import (
     CandidateCoverage,
@@ -279,8 +280,8 @@ def build_findings(
                 label = f"{event.gc_kind} ({event.cause or 'cause not logged'})"
                 by_kind[label] = by_kind.get(label, 0.0) + overlap
         evidence = [
-            f"Worst {format_duration(w.window_seconds)}: {w.share_percentage:.1f}% paused "
-            f"({w.paused_seconds:.0f} s) from "
+            f"Worst {window_name(w.window_seconds)}: {w.share_percentage:.1f}% paused "
+            f"({format_duration(w.paused_seconds)}) from "
             f"{format_time(w.window_start, w.wall_clock, w.uptime_seconds)}"
             for w in summary.worst_pause_shares
         ]
@@ -615,7 +616,7 @@ def build_findings(
                     f"GC pauses take {summary.gc_overhead_pct:.1f}% of the {summary.window_basis}"
                 ),
                 evidence=[
-                    f"{summary.total_gc_time_sec:.0f} s paused in "
+                    f"{format_duration(summary.total_gc_time_sec)} paused in "
                     f"{format_duration(summary.runtime_seconds)}"
                 ],
                 action=(
@@ -690,11 +691,26 @@ def build_findings(
     promotion = warnings.claim("promotion_failure")
     cms_failure = warnings.claim("cms_concurrent_mode_failure")
     if cms_failure or (promotion and "CMS" in gc_type):
+        # A Java 8 CMS young collection that escalates logs its ParNew step and then the
+        # CMS step in the same record; a "[Full GC" record has no young step. (Unified logs
+        # give every pause young sizes from the heap lines, so they cannot show this.)
+        escalated = sum(
+            1
+            for e in events
+            if e.gc_kind == "Full" and e.young_before_kb is not None and not e.stamp_at_pause_end
+        )
+        young_attempts = escalated + sum(1 for e in events if e.gc_kind == "Young")
+        evidence = [w.text for w in cms_failure + promotion]
+        if escalated:
+            evidence.append(
+                f"{escalated} of {young_attempts} young collections ended as a stop-the-world "
+                "collection of the whole heap"
+            )
         findings.append(
             Finding(
                 severity=_severity(cms_failure + promotion),
                 title="CMS fell back to stop-the-world collections",
-                evidence=[w.text for w in cms_failure + promotion],
+                evidence=evidence,
                 action=advice_for("cms_concurrent_mode_failure", major).text,
                 source=advice_for("cms_concurrent_mode_failure", major).source,
                 role="symptom" if exhausted else "",

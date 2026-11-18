@@ -224,12 +224,21 @@ def format_time(timestamp: datetime, wall_clock: bool, uptime: float | None) -> 
 
 
 def format_duration(seconds: float) -> str:
-    """'45 s', '12.5 min', '3.2 h'."""
+    """'0.120 s', '6.05 s', '45.3 s', '12.5 min', '3.2 h': three significant digits."""
+    if seconds < 1:
+        return f"{seconds:.3f} s"
+    if seconds < 10:
+        return f"{seconds:.2f} s"
     if seconds < 120:
-        return f"{seconds:.0f} s"
+        return f"{seconds:.1f} s"
     if seconds < 2 * 3600:
         return f"{seconds / 60:.1f} min"
     return f"{seconds / 3600:.1f} h"
+
+
+def window_name(seconds: float) -> str:
+    """A fixed window's name: '60 s', '5 min', '60 min'."""
+    return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
 
 
 # ============================================================
@@ -897,6 +906,15 @@ def analyze_metaspace(
     )
 
 
+def in_run_order(events: list[GCEvent]) -> list[GCEvent]:
+    """Events by JVM run, then time: for comparing each pause with the one before it.
+
+    Runs logged with uptime only all start at uptime 0, so a plain time order would
+    interleave their pauses.
+    """
+    return sorted(events, key=lambda e: (e.segment, e.timestamp))
+
+
 def humongous_allocation_kb(events: list[GCEvent]) -> int:
     """Humongous allocation between pauses: regions only appear by allocation.
 
@@ -904,7 +922,7 @@ def humongous_allocation_kb(events: list[GCEvent]) -> int:
     Cleanup, Full GC), so growth from one pause's "after" to the next pause's "before" is
     what the application allocated as humongous objects in between.
     """
-    series = [e for e in events if e.humongous_before_kb is not None]
+    series = in_run_order([e for e in events if e.humongous_before_kb is not None])
     return sum(
         max(0, (later.humongous_before_kb or 0) - (earlier.humongous_after_kb or 0))
         for earlier, later in pairwise(series)
@@ -1476,6 +1494,7 @@ def allocation_rate(
     (``whole_heap``): it only frees memory inside pauses, and its young sizes leave out
     humongous objects, which are allocated straight into old regions.
     """
+    events = in_run_order(events)
     young = [e for e in events if e.young_before_kb is not None and e.young_after_kb is not None]
     if len(young) >= 2 and not whole_heap:
         series, basis = young, "young generation"
@@ -1814,7 +1833,7 @@ def build_comprehensive_summary(
     # Heap-pressure Full GC timing
     intervals = [
         (later.timestamp - earlier.timestamp).total_seconds() / 60
-        for earlier, later in pairwise(heap_full)
+        for earlier, later in pairwise(in_run_order(heap_full))
         if earlier.segment == later.segment
     ]
     # Half-versus-half comparisons mislead on a handful of collections: both need enough

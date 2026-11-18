@@ -26,6 +26,7 @@ from .analysis import (
     format_duration,
     format_mb_per_hour,
     format_time,
+    window_name,
 )
 from .coverage import build_unparsed_warning
 from .findings import build_diagnosis, build_findings, overall_status
@@ -249,16 +250,12 @@ def describe_p99(summary: GCSummary) -> str:
 
 
 def format_pause_share(window: PauseShareWindow) -> str:
-    """'98.7% paused (296 s of 300 s) from 2026-01-07T10:04:55.428+02:00'."""
+    """'98.7% paused (4.9 min of 5 min) from 2026-01-07T10:04:55.428+02:00'."""
     return (
-        f"{window.share_percentage:.1f}% paused ({window.paused_seconds:.1f} s of "
-        f"{window.window_seconds:.0f} s) from "
+        f"{window.share_percentage:.1f}% paused ({format_duration(window.paused_seconds)} of "
+        f"{window_name(window.window_seconds)}) from "
         f"{format_time(window.window_start, window.wall_clock, window.uptime_seconds)}"
     )
-
-
-def _window_name(seconds: float) -> str:
-    return f"{seconds / 60:.0f} min" if seconds >= 60 else f"{seconds:.0f} s"
 
 
 def _overhead_text(summary: GCSummary) -> str:
@@ -343,13 +340,16 @@ def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
         rows.append(("Metaspace-triggered Full GCs", str(summary.metadata_full_gc_count)))
     if summary.avg_full_gc_interval_min is not None:
         rows.append(
-            ("Avg time between heap Full GCs", f"{summary.avg_full_gc_interval_min:.1f} minutes")
+            (
+                "Avg time between heap Full GCs",
+                format_duration(summary.avg_full_gc_interval_min * 60),
+            )
         )
     if summary.min_full_gc_interval_min is not None:
         rows.append(
             (
                 "Shortest gap between heap Full GCs",
-                f"{summary.min_full_gc_interval_min:.1f} minutes",
+                format_duration(summary.min_full_gc_interval_min * 60),
             )
         )
     if summary.time_to_first_full_gc_hours is not None:
@@ -361,7 +361,7 @@ def build_frequency_rows(summary: GCSummary) -> list[tuple[str, str]]:
         rows.append(
             (
                 "First heap Full GC",
-                f"{summary.time_to_first_full_gc_hours:.2f} hours {origin}",
+                f"{format_duration(summary.time_to_first_full_gc_hours * 3600)} {origin}",
             )
         )
     if summary.max_full_gc_streak > 1:
@@ -421,7 +421,7 @@ def build_overhead_rows(summary: GCSummary) -> list[tuple[str, str]]:
     else:
         rows.append(("GC overhead", "n/a (single pause: no elapsed time to measure against)"))
     rows += [
-        (f"Worst {_window_name(w.window_seconds)}", format_pause_share(w))
+        (f"Worst {window_name(w.window_seconds)}", format_pause_share(w))
         for w in summary.worst_pause_shares
     ]
     return rows
@@ -649,21 +649,29 @@ def build_floor_rows(summary: GCSummary) -> list[tuple[str, str]]:
 
 
 def build_floor_table(summary: GCSummary, limit: int = 30) -> tuple[list[str], list[list[str]]]:
-    """Individual floors so the reader can see the trend themselves."""
-    headers = ["Time", "After", "Occupancy", "% of capacity"]
+    """Individual floors so the reader can see the trend themselves.
+
+    CMS samples measure the old generation and the others the whole heap, so each row names
+    what it measured and what its percentage is of.
+    """
+    headers = ["Time", "After", "Occupancy", "Share"]
     floors = summary.floor_trend.floors
     if len(floors) > limit:  # keep first, last and an even spread
         step = (len(floors) - 1) / (limit - 1)
         floors = [floors[round(i * step)] for i in range(limit)]
-    rows = [
-        [
-            format_time(f.timestamp, f.wall_clock, f.uptime_seconds),
-            f"{f.source} (start-up, not in trend)" if f.warmup else f.source,
-            format_kb(f.value_kb),
-            f"{f.pct_of_capacity:.1f}%" if f.pct_of_capacity is not None else "—",
-        ]
-        for f in floors
-    ]
+    rows: list[list[str]] = []
+    for f in floors:
+        old_gen = f.measurement.startswith("old-generation")
+        rows.append(
+            [
+                format_time(f.timestamp, f.wall_clock, f.uptime_seconds),
+                f"{f.source} (start-up, not in trend)" if f.warmup else f.source,
+                f"{format_kb(f.value_kb)} {'old gen' if old_gen else 'heap'}",
+                f"{f.pct_of_capacity:.1f}% of {'old generation' if old_gen else 'max heap'}"
+                if f.pct_of_capacity is not None
+                else "—",
+            ]
+        )
     return headers, rows
 
 
@@ -829,7 +837,10 @@ def build_concurrent_rows(summary: GCSummary) -> list[tuple[str, str]]:
         ("Measured", stats.label),
         ("Count", str(stats.cycles)),
         ("Total time", f"{format_duration(stats.total_seconds)}{share}"),
-        ("Average / longest", f"{stats.average_seconds:.1f} s / {stats.longest_seconds:.1f} s"),
+        (
+            "Average / longest",
+            f"{format_duration(stats.average_seconds)} / {format_duration(stats.longest_seconds)}",
+        ),
     ]
     if stats.cycles > 1 and summary.runtime_seconds:
         # an average only describes cycles that are spread over the window

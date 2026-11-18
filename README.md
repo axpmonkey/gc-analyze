@@ -61,17 +61,94 @@ Start with **Findings** and **Summary**, then check **Data Notes** and **Parsing
 understand the limits of the analysis. A nonzero exit code can indicate a problem found in the
 log even when the report was generated successfully; see [Exit codes](#exit-codes).
 
-## Supported logs
+## Supported Java versions and collectors
 
-The application detects the format and collector automatically.
+The application reads GC logs from HotSpot-based JDKs: Oracle JDK and OpenJDK builds such as
+Eclipse Temurin, Amazon Corretto, Azul Zulu, and the Red Hat build of OpenJDK. It supports
+**Java 8** and **JDK 9 and later**, and detects the log format and the collector automatically.
 
-| Log format | Supported collectors |
+### Collectors (GC policies)
+
+| Collector | Selected by | Java 8 | JDK 9 and later |
+|---|---|---|---|
+| G1 | `-XX:+UseG1GC` | Supported | Supported |
+| Parallel | `-XX:+UseParallelGC` | Supported | Supported |
+| Parallel with Serial Old | `-XX:+UseParallelGC -XX:-UseParallelOldGC` | Supported | Supported through JDK 14 (removed in JDK 15) |
+| CMS (ParNew with Concurrent Mark Sweep) | `-XX:+UseConcMarkSweepGC` | Supported | Supported through JDK 13 (removed in JDK 14) |
+| Serial | `-XX:+UseSerialGC` | Supported | Supported |
+| ParNew with Serial Old | `-XX:+UseParNewGC` | Supported | Not available (removed in JDK 9) |
+
+If no collector is selected, the JVM chooses one. With at least 2 CPUs and 1792 MB of memory,
+Java 8 chooses Parallel and JDK 9 and later choose G1. With less, both choose Serial.
+
+The JVM counts only the CPUs and memory a container is limited to. A Tomcat container limited
+to one CPU therefore runs Serial unless a collector is selected.
+
+### Log formats
+
+| JDK | Logging | Supported options |
+|---|---|---|
+| Java 8 | `-Xloggc:<file>` with `-XX:+PrintGCDetails`, or `-XX:+PrintGC` alone; without `-Xloggc`, GC records go to standard output (for Tomcat, `catalina.out`) | `-XX:+PrintGCDateStamps`, `-XX:+PrintGCTimeStamps`, `-XX:+UseGCLogFileRotation`, `-XX:+PrintGCApplicationStoppedTime`, `-XX:+PrintHeapAtGC`, `-XX:+PrintTenuringDistribution`, `-XX:+PrintAdaptiveSizePolicy`, `-XX:+PrintCommandLineFlags` |
+| JDK 9 and later | Unified logging: `-Xlog:gc*`, or `-Xlog:gc` for less detail | Any decorators: `time`, `utctime`, `uptime`, `uptimemillis`, `uptimenanos`, `timemillis`, `timenanos`, `pid`, `tid`, `level`, `tags`; file rotation (`filecount`, `filesize`); `safepoint` |
+
+A `-XX:+PrintGC` log without `-XX:+PrintGCDetails` gives pause and heap figures, but often does
+not identify the collector and lacks generation sizes.
+
+For the most complete report, enable these options. Adjust the paths and rotation sizes to suit.
+
+Java 8:
+
+```text
+-Xloggc:/path/to/gc.log -XX:+PrintGCDetails -XX:+PrintGCDateStamps -XX:+PrintGCTimeStamps
+-XX:+PrintGCApplicationStoppedTime -XX:+PrintCommandLineFlags
+-XX:+UseGCLogFileRotation -XX:NumberOfGCLogFiles=10 -XX:GCLogFileSize=50M
+```
+
+JDK 9 and later:
+
+```text
+-Xlog:gc*,safepoint:file=/path/to/gc.log:time,uptime,level,tags:filecount=10,filesize=50m
+```
+
+The datestamps (`-XX:+PrintGCDateStamps` or the `time` decorator) give a clock time for each pause.
+Stopped-time and safepoint lines show stops that are not GC pauses. `-XX:+PrintCommandLineFlags`
+records the maximum heap and marks each JVM start. On Java 8, add `-XX:+PrintHeapAtGC` to
+measure survivor-space overflow.
+
+### Not supported
+
+| Log | Result |
 |---|---|
-| Java 8: `-XX:+PrintGC` or `-XX:+PrintGCDetails` | G1, Parallel, CMS, Serial, and ParNew with Serial Old |
-| JDK 9 and later: unified `-Xlog:gc*` logging | G1, Parallel, CMS, and Serial, where available in that JDK |
+| ZGC, including Generational ZGC | Rejected with an error naming the collector |
+| Shenandoah | Rejected with an error naming the collector |
+| Epsilon | Rejected with an error naming the collector, when the log's startup lines name it |
+| Eclipse OpenJ9 and IBM Semeru verbose GC logs (`-Xverbosegclog`, XML) | Not recognized as a GC log |
+| Java 7 and earlier | Not tested; do not rely on the results |
 
-ZGC, Shenandoah, and Epsilon logs are not supported. Basic Java 8 `PrintGC` logs can provide
-pause and heap statistics without identifying the collector or exposing all diagnostic data.
+### How support is verified
+
+Besides tests with sample logs, the maintainer's test suite includes logs written by real
+Eclipse Temurin JVMs on Linux. For each log, the JVM also recorded every collection it performed
+and the memory its threads allocated. The tests check the analyzer's counts, Full GC causes,
+JVM runs, maximum heap, and allocation rate against that record.
+
+| JDK | Collectors run |
+|---|---|
+| Java 8 | G1, Parallel, Parallel with Serial Old, CMS, Serial, ParNew with Serial Old |
+| JDK 11 | G1, Parallel, Parallel with Serial Old, CMS, Serial |
+| JDK 17, 21, 25 | G1, Parallel, Serial |
+
+The logs also include:
+
+- **Java 8:** `PrintGC`-only logs, rotated files, and GC output mixed into `catalina.out`.
+- **CMS under stress:** concurrent mode failures, promotion failures, and young collections that escalated to Full GCs.
+- **Unified logging:** several decorator sets and rotated files.
+- **Any version:** two JVM runs in one file, logs cut off mid-record, and a ZGC log (rejected).
+
+JDKs 9, 10, 12 to 16, 18 to 20, and 22 to 24 use the same unified logging and are supported,
+but their logs were not part of these tests.
+
+## Supplying logs
 
 Supply log files from **one JVM**, including its rotated files if needed. Files with different
 collectors must be analyzed separately. Gzip-compressed files (for example `gc.log.3.gz`) are
@@ -298,7 +375,7 @@ code and inspect the report; a nonzero code does not necessarily mean the comman
 |---|---|
 | `uv` is not found | Restart the terminal and check the uv installer's PATH instructions. |
 | Python version error | Run `uv python install 3.14`, then `uv sync --python 3.14` from the project directory. Use `3.15` in both commands if you prefer it. |
-| Unsupported format or no usable GC events | Confirm that the file is an extracted, plain-text GC log for a supported collector. Check any unparsed samples in the error. |
+| Unsupported format or no usable GC events | Confirm that the file is an extracted, plain-text GC log from a collector and JDK listed in [Supported Java versions and collectors](#supported-java-versions-and-collectors). Check any unparsed samples in the error. |
 | Incomplete parse | Review **Parsing Coverage** and its sample lines. Missing records can affect counts and conclusions. Use `--verbose` for per-file parsing details. |
 | Time window or export needs wall-clock time | Supply `--jvm-start` with the actual start time and UTC offset, or use logs containing datestamps. |
 | Heap percentages use committed heap | Supply the configured maximum with `--max-heap`, or include the startup log that records it. |
