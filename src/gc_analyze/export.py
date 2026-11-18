@@ -1,4 +1,4 @@
-"""--export-events: one JSON line per GC pause in the shared events.jsonl format (P2.1).
+"""--export-events: one JSON line per GC pause in the shared events.jsonl format.
 
 Field rules follow work-tools/00-architecture.md: ``ts`` is UTC ISO-8601 with millisecond
 precision, ``ts_raw`` keeps what the log said, ``tz_source`` records how the zone was known,
@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from .analysis import classify_full_gc_cause
+from .atomic import write_text_atomic
 from .models import GCEvent
 
 
@@ -105,7 +106,7 @@ def export_events(
         event_record(event, host=host, max_heap_kb=capacities.get(event.segment, max_heap_kb))
         for event in events
     ]
-    with path.open("w", encoding="utf-8") as handle:
-        for record in records:
-            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    write_text_atomic(
+        path, "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in records)
+    )
     return len(records)

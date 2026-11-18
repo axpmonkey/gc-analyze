@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, tzinfo
 from itertools import groupby
 from pathlib import Path
 
 from .analysis import build_comprehensive_summary, resolve_max_heap
-from .coverage import compute_candidate_coverage, merge_coverage
+from .coverage import coverage_from_scan, merge_coverage
 from .events import UPTIME_EPOCH, normalize_event, parse_log_timestamp
-from .jvm_config import parse_jvm_environment, parse_jvm_heap_config, parse_max_heap_from_log
+from .jvm_config import (
+    ENVIRONMENT_HEADER_LINES,
+    parse_jvm_environment,
+    parse_jvm_heap_config,
+    parse_max_heap_from_log,
+)
 from .models import (
     CandidateCoverage,
     DiagnosticThresholds,
@@ -22,16 +27,20 @@ from .models import (
     SegmentInfo,
     SideRecord,
 )
-from .parsers import detect_gc_type_and_create_parser, log_line_times, scan_side_records
+from .parsers import detect_gc_type_and_create_parser, log_line_times
+from .reader import LineWindow, open_log, read_lines_at
+from .scan import FileScan
 from .segments import (
     LoadedFile,
     assign_segments,
     describe_segments,
     filter_window,
-    find_header_lines,
     order_files,
     select_segment,
 )
+
+# The startup header is read from this many lines at the start of each run
+RUN_HEADER_LINES = ENVIRONMENT_HEADER_LINES
 
 
 class NoEventsError(ValueError):
@@ -61,30 +70,38 @@ class AnalysisResult:
 
 
 def load_file(path: Path, jvm_start: datetime | None, label: str | None) -> LoadedFile:
-    """Read, detect, parse and normalize one log file."""
-    with path.open(encoding="utf-8", errors="replace") as handle:
-        lines = handle.readlines()
-    try:
-        parser = detect_gc_type_and_create_parser(lines)
-    except ValueError as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-    raw_events = parser.parse(lines)
-    loaded = LoadedFile(
-        path=path,
-        lines=lines,
-        parser=parser,
-        raw_events=raw_events,
-        coverage=compute_candidate_coverage(lines, raw_events, label),
-        header_line_numbers=find_header_lines(lines),
-        side_records=[
-            record.model_copy(update={"source_file": str(path)})
-            for record in scan_side_records(lines)
-        ],
+    """Read one log file in a single streaming pass: detect, parse, scan, normalize.
+
+    Memory depends on the number of pauses, not the size of the file: the parser sees a
+    bounded window of lines and every other scanner takes each line once as it is read.
+    """
+    facts = FileScan(str(path))
+    with open_log(path) as handle:
+        window = LineWindow(handle, on_line=facts.on_line)
+        try:
+            parser = detect_gc_type_and_create_parser(window)
+        except ValueError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
+        records = parser.parse(window)
+        window.read_to_end()
+    facts.finish()
+    coverage = coverage_from_scan(
+        facts.candidate_lines,
+        facts.tail,
+        facts.total_lines,
+        records,
+        lambda wanted: read_lines_at(path, wanted),
+        label,
     )
-    for raw in raw_events:
-        if event := normalize_event(raw, jvm_start, source_file=str(path)):
-            loaded.events.append(event)
-    return loaded
+    facts.candidate_lines = []  # only needed for coverage
+    facts.tail.clear()
+    return LoadedFile(
+        path=path,
+        parser=parser,
+        coverage=coverage,
+        facts=facts,
+        events=[normalize_event(record, jvm_start, source_file=str(path)) for record in records],
+    )
 
 
 def run_file_ranges(
@@ -110,12 +127,13 @@ def run_file_ranges(
             start = header - 1
             # Some VM startup fields immediately precede the collector announcement.
             if header in loaded.header_line_numbers:
-                while start > previous_line and "[gc,init" in loaded.lines[start - 1]:
+                gc_init = set(loaded.facts.gc_init_line_numbers)
+                while start > previous_line and start in gc_init:  # line ``start`` is 1-based
                     start -= 1
             starts.append((segment, start if starts else 0))
             previous_line = run_events[-1].line_number or first_line
         for (segment, start), (_, end) in zip(
-            starts, [*starts[1:], (0, len(loaded.lines))], strict=True
+            starts, [*starts[1:], (0, loaded.total_lines)], strict=True
         ):
             ranges.setdefault(segment, []).append((loaded, start, end))
     return ranges
@@ -136,21 +154,91 @@ def observed_wall_bounds(
         None,
     )
     for loaded, start, end in ranges:
-        for indices in (range(start, end), range(end - 1, start - 1, -1)):
-            for index in indices:
-                stamp, uptime = log_line_times(loaded.lines[index])
-                if stamp is not None:
-                    try:
-                        moment = parse_log_timestamp(stamp)
-                    except ValueError:
-                        continue
-                elif anchor is not None and uptime is not None:
-                    moment = anchor + timedelta(seconds=uptime)
-                else:
-                    continue
-                first, last = min(first, moment), max(last, moment)
-                break
+        for moment in range_time_bounds(loaded, start, end, anchor):
+            first, last = min(first, moment), max(last, moment)
     return first, last
+
+
+def range_time_bounds(
+    loaded: LoadedFile, start: int, end: int, anchor: datetime | None
+) -> list[datetime]:
+    """Times of the first and last timed lines among lines ``start`` up to ``end`` (0-based).
+
+    A datestamped line is timed; an uptime-only line is timed when ``anchor`` (the run's JVM
+    start) is known. Read from the time markers the scan left at every position where a
+    range can begin or end; a position without one is read from the file again.
+    """
+    marks = loaded.facts.time_marks
+    opening, closing = marks.get(start), marks.get(end)
+    if opening is None or closing is None:  # pragma: no cover - ranges start and end at marks
+        return _range_time_bounds_from_file(loaded.path, start, end, anchor)
+    first_options: list[tuple[int, datetime]] = []
+    last_options: list[tuple[int, datetime]] = []
+    try:
+        if opening.stamp_from is not None:
+            index, stamp = opening.stamp_from
+            first_options.append((index, parse_log_timestamp(stamp)))
+        if closing.stamp_before is not None:
+            index, stamp = closing.stamp_before
+            last_options.append((index, parse_log_timestamp(stamp)))
+    except ValueError:
+        # an unreadable datestamp: the nearest readable one is further in, so read the range
+        return _range_time_bounds_from_file(loaded.path, start, end, anchor)
+    if anchor is not None:
+        if opening.uptime_from is not None:
+            index, uptime = opening.uptime_from
+            first_options.append((index, anchor + timedelta(seconds=uptime)))
+        if closing.uptime_before is not None:
+            index, uptime = closing.uptime_before
+            last_options.append((index, anchor + timedelta(seconds=uptime)))
+    bounds: list[datetime] = []
+    first = min((option for option in first_options if option[0] < end), default=None)
+    last = max((option for option in last_options if option[0] >= start), default=None)
+    if first is not None:
+        bounds.append(first[1])
+    if last is not None:
+        bounds.append(last[1])
+    return bounds
+
+
+def _range_time_bounds_from_file(
+    path: Path, start: int, end: int, anchor: datetime | None
+) -> list[datetime]:
+    moments: list[datetime] = []
+    with open_log(path) as handle:
+        for index, line in enumerate(handle):
+            if index >= end:
+                break
+            if index < start:
+                continue
+            stamp, uptime = log_line_times(line)
+            if stamp is not None:
+                try:
+                    moments.append(parse_log_timestamp(stamp))
+                except ValueError:
+                    continue
+            elif anchor is not None and uptime is not None:
+                moments.append(anchor + timedelta(seconds=uptime))
+    return [moments[0], moments[-1]] if moments else []
+
+
+def run_config_lines(ranges: list[tuple[LoadedFile, int, int]]) -> tuple[list[str], list[str]]:
+    """The run's configuration lines, and those among its first ``RUN_HEADER_LINES`` lines.
+
+    The startup header (max heap, JVM version, host memory) is only looked for near the
+    start of the run, as when the run's lines were read in full.
+    """
+    lines: list[str] = []
+    head: list[str] = []
+    offset = 0  # position of the range's first line within the run
+    for loaded, start, end in ranges:
+        for index, line in loaded.facts.config_lines:
+            if start <= index < end:
+                lines.append(line)
+                if offset + index - start < RUN_HEADER_LINES:
+                    head.append(line)
+        offset += end - start
+    return lines, head
 
 
 def select_side_records(
@@ -231,20 +319,21 @@ def run_analysis(
 
     if jvm_start is not None and len(segments) > 1:
         # One supplied anchor can only place the first JVM. Keep genuine datestamps on later runs.
-        all_events = [
-            event.model_copy(
-                update={
-                    "timestamp": event.timestamp - jvm_start + UPTIME_EPOCH,
-                    "wall_clock": False,
-                    "tz_source": None,
-                }
-            )
-            if event.segment > 1
-            and event.timestamp_raw is None
-            and event.uptime_seconds is not None
-            else event
-            for event in all_events
-        ]
+        for loaded in files:
+            loaded.events = [
+                replace(
+                    event,
+                    timestamp=event.timestamp - jvm_start + UPTIME_EPOCH,
+                    wall_clock=False,
+                    tz_source=None,
+                )
+                if event.segment > 1
+                and event.timestamp_raw is None
+                and event.uptime_seconds is not None
+                else event
+                for event in loaded.events
+            ]
+        all_events = [event for loaded in files for event in loaded.events]
         segments = describe_segments(all_events)
         events, segment_label = select_segment(all_events, segments, segment)
     ranges_by_run = run_file_ranges(files, all_events)
@@ -258,14 +347,10 @@ def run_analysis(
     observed: dict[int, tuple[datetime, datetime]] = {}
     for info in segments:
         ranges = ranges_by_run.get(info.index, [])
-        lines = [
-            line
-            for loaded, start_line, end_line in ranges
-            for line in loaded.lines[start_line:end_line]
-        ]
+        lines, head = run_config_lines(ranges)
         configs[info.index] = parse_jvm_heap_config(lines)
-        max_heap_from_log[info.index] = parse_max_heap_from_log(lines)
-        environments[info.index] = parse_jvm_environment(lines)
+        max_heap_from_log[info.index] = parse_max_heap_from_log(head)
+        environments[info.index] = parse_jvm_environment(head)
         capacity, _ = resolve_max_heap(
             configs[info.index], max_heap_bytes, max_heap_from_log[info.index]
         )
@@ -373,6 +458,7 @@ def run_analysis(
             coverage=f.coverage,
             events=len(f.events),
             events_without_heap_data=sum(1 for e in f.events if not e.has_heap_data),
+            events_with_inconsistent_data=sum(1 for e in f.events if e.data_inconsistencies),
         )
         for f in files
     ]

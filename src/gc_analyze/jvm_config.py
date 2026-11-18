@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from .jvm_runs import PRINTED_FLAGS_LINE
 from .models import JVMEnvironment, JVMHeapConfig
 
 
@@ -43,6 +44,7 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
     """
     # Pattern to match CommandLine flags line
     commandline_pattern = re.compile(r"CommandLine flags:\s*(.+)")
+    printed_flags_pattern = re.compile(PRINTED_FLAGS_LINE)  # -XX:+PrintCommandLineFlags
 
     # Heap-related flag patterns (byte values)
     byte_patterns = {
@@ -121,6 +123,11 @@ def parse_jvm_heap_config(log_lines: list[str]) -> JVMHeapConfig | None:
     for line in log_lines:
         if match := commandline_pattern.search(line):
             flags_str = match.group(1)
+        elif printed_flags_pattern.match(line):
+            flags_str = line.strip()
+        else:
+            flags_str = None
+        if flags_str is not None:
             config_dict: dict[str, Any] = {}
 
             # Parse byte-value flags

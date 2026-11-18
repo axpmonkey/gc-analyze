@@ -10,17 +10,22 @@ from pathlib import Path
 from typing import Annotated
 
 import typer
+from rich.console import Console
 
-from .coverage import UNPARSED_WARNING_THRESHOLD_PCT
+from . import __version__
+from .atomic import write_text_atomic
 from .export import ExportError, export_events
-from .findings import build_findings, overall_status
 from .jvm_config import parse_size_argument
-from .markdown import render_brief_markdown, render_markdown
-from .models import DiagnosticThresholds, Finding
+from .models import DiagnosticThresholds
+from .outputs import build_report, exit_code
 from .pipeline import NoEventsError, parse_time_option, run_analysis
-from .report import ReportContext, build_sections, console, render_rich
+from .report import GC_ANALYZE_THEME, console, render_rich
 
-__version__ = "6.0.0"
+# Status messages when the report itself is written to stdout (--json -, --brief): kept off
+# stdout so the report can be piped
+status_console = Console(theme=GC_ANALYZE_THEME, stderr=True)
+
+__all__ = ["app", "exit_code"]
 
 app = typer.Typer(
     name="gc-analyze",
@@ -28,19 +33,6 @@ app = typer.Typer(
     add_completion=False,
     rich_markup_mode="rich",
 )
-
-
-def exit_code(findings: list[Finding], unparsed_pct: float) -> int:
-    """0 clean, 1 warning findings or incomplete parse, 2 critical findings.
-
-    The same findings the report lists decide the code: informational findings do not count.
-    """
-    status = overall_status(findings)
-    if status == "critical":
-        return 2
-    if status == "warning" or unparsed_pct > UNPARSED_WARNING_THRESHOLD_PCT:
-        return 1
-    return 0
 
 
 @app.command()
@@ -66,6 +58,14 @@ def analyze(
             help="Case-file summary (<= ~5 KB Markdown): to --output, or stdout without it",
         ),
     ] = False,
+    json_output: Annotated[
+        Path | None,
+        typer.Option(
+            "--json",
+            help="Write the report as JSON to this file ('-' for stdout, without the "
+            "terminal report)",
+        ),
+    ] = None,
     export_events_path: Annotated[
         Path | None,
         typer.Option(
@@ -191,59 +191,54 @@ def analyze(
             for sample in exc.coverage.unparsed_samples:
                 console.print(f"  Unparsed sample {sample}", markup=False, highlight=False)
             sys.exit(1)
+        report_on_stdout = (json_output is not None and str(json_output) == "-") or (
+            brief and output is None
+        )
+        notify = status_console if report_on_stdout else console
         if verbose:
             for f in result.files:
-                console.print(
+                notify.print(
                     f"[info]{f.path}: {f.parser.gc_type_name} ({f.parser.log_family}), "
-                    f"{len(f.lines)} lines, {len(f.events)} pauses[/info]"
+                    f"{f.total_lines} lines, {len(f.events)} pauses[/info]"
                 )
         summary = result.summary
-        ctx = ReportContext(
-            summary=summary,
-            gc_type=result.gc_type,
-            events=result.events,
-            coverage=result.coverage,
-            file_coverages=result.file_coverages,
-            segments=result.segments,
-            segment_label=result.segment_label,
-            window_label=result.window_label,
-            comparison=result.comparison,
-            comparison_label=result.comparison_label,
-            inputs=[str(f.path) for f in result.files],
-            findings=build_findings(summary, result.gc_type, result.events, result.coverage),
-        )
-        sections = build_sections(ctx)
+        report = build_report(result)
+        json_to_stdout = json_output is not None and str(json_output) == "-"
 
-        if brief and output is None:
-            sys.stdout.write(render_brief_markdown(sections))
+        if json_to_stdout:
+            sys.stdout.write(report.json())
+        elif brief and output is None:
+            sys.stdout.write(report.markdown(brief=True))
         else:
-            render_rich(sections)
+            render_rich(report.sections)
         if output is not None:
-            text = render_brief_markdown(sections) if brief else render_markdown(sections)
-            output.write_text(text, encoding="utf-8")
-            console.print(f"\n[success]✓ Summary exported to {output}[/success]")
+            write_text_atomic(output, report.markdown(brief=brief))
+            notify.print(f"\n[success]✓ Summary exported to {output}[/success]")
+        if json_output is not None and not json_to_stdout:
+            write_text_atomic(json_output, report.json())
+            notify.print(f"[success]✓ JSON report written to {json_output}[/success]")
         if export_events_path is not None:
             max_heap_kb = summary.heap.max_heap_kb if summary.heap.max_heap_known else None
             written = export_events(
-                ctx.events,
+                result.events,
                 export_events_path,
                 host=host,
                 max_heap_kb=max_heap_kb,
                 max_heap_by_segment=summary.max_heap_by_segment,
             )
-            console.print(f"[success]✓ {written} events exported to {export_events_path}[/success]")
+            notify.print(f"[success]✓ {written} events exported to {export_events_path}[/success]")
 
         if profiler:
             profiler.disable()
             if profile_output:
                 profiler.dump_stats(str(profile_output))
-                console.print(f"\n[info]Profiling data saved to {profile_output}[/info]")
+                notify.print(f"\n[info]Profiling data saved to {profile_output}[/info]")
             stream = StringIO()
             stats = pstats.Stats(profiler, stream=stream)
             stats.strip_dirs().sort_stats("cumulative").print_stats(20)
-            console.print(stream.getvalue())
+            notify.print(stream.getvalue())
 
-        code = exit_code(ctx.findings or [], result.coverage.unparsed_percentage)
+        code = report.exit_code
         if code:
             sys.exit(code)
 

@@ -56,6 +56,20 @@ G1_GUIDE = (
     "HotSpot GC Tuning Guide (JDK 17), Garbage-First (G1) Garbage Collector - Determining "
     f"Initiating Heap Occupancy: {GC_TUNING_17}/garbage-first-g1-garbage-collector1.html"
 )
+# Java 8 sources (read 2026-11-17)
+JCMD_8 = (
+    "Java SE 8 Troubleshooting Guide, The jcmd Utility: "
+    "https://docs.oracle.com/javase/8/docs/technotes/guides/troubleshoot/tooldescr006.html"
+)
+JAVA_8 = (
+    "java command reference (Java 8): "
+    "https://docs.oracle.com/javase/8/docs/technotes/tools/unix/java.html"
+)
+SIZING_8 = f"HotSpot GC Tuning Guide (Java 8), Sizing the Generations: {GC_TUNING_8}/sizing.html"
+G1_TUNING_8 = (
+    "HotSpot GC Tuning Guide (Java 8), Garbage-First Garbage Collector Tuning: "
+    f"{GC_TUNING_8}/g1_gc_tuning.html"
+)
 TOMCAT_LISTENERS = (
     "Apache Tomcat 9 Configuration Reference, JRE Memory Leak Prevention Listener: "
     "https://tomcat.apache.org/tomcat-9.0-doc/config/listeners.html"
@@ -260,6 +274,72 @@ ADVICE: dict[str, Advice] = {
         JEP_423,
     ),
 }
+
+# Java 8 wording of entries whose JDK 17 text names flags Java 8 lacks (G1UseAdaptiveIHOP,
+# ReferencesPerThread: JDK 9+), describes JDK 9+ behaviour (adaptive IHOP), or whose source
+# has a Java 8 edition. Each restates the cited Java 8 page; where a statement only has a JDK
+# 17 source (jcmd impact ratings), that source stays cited beside the Java 8 one.
+JAVA8_ADVICE: dict[str, Advice] = {
+    "heap_dump": Advice(ADVICE["heap_dump"].text, f"{JCMD_8}; {JCMD}"),
+    "class_histogram": Advice(ADVICE["class_histogram"].text, f"{JCMD_8}; {JCMD_HISTOGRAM}"),
+    "tool_requested_gc": Advice(ADVICE["tool_requested_gc"].text, JCMD_8),
+    "heap_dump_on_oom": Advice(ADVICE["heap_dump_on_oom"].text, JAVA_8),
+    "survivor_overflow_parallel": Advice(ADVICE["survivor_overflow_parallel"].text, JAVA_8),
+    "old_gen_slack": Advice(ADVICE["old_gen_slack"].text, SIZING_8),
+    "survivor_overflow": Advice(
+        "If survivor spaces are too small, the copying collection overflows directly into the "
+        "old generation. Survivor size is set relative to eden with -XX:SurvivorRatio (a lower "
+        "ratio gives larger survivors); the young generation itself is bounded by -XX:NewSize "
+        "and -XX:MaxNewSize",
+        SIZING_8,
+    ),
+    "g1_full_gc": Advice(
+        "A G1 Full GC under heap pressure can follow allocation outpacing concurrent marking "
+        "and reclamation. If the logs support that explanation, the Java 8 guide's adjustments "
+        "are to raise -XX:G1ReservePercent (and the total heap with it); start marking earlier "
+        "by lowering -XX:InitiatingHeapOccupancyPercent (on Java 8 a fixed share of the whole "
+        "heap, 45% by default); and raise -XX:ConcGCThreads",
+        G1_TUNING_8,
+    ),
+    "g1_evacuation_failure": Advice(
+        "An Allocation evacuation failure (to-space exhausted) means G1 lacked destination "
+        "space for some live objects. If the failure recurs under heap pressure, the Java 8 "
+        "guide's adjustments are to raise -XX:G1ReservePercent (and the total heap with it); "
+        "start marking earlier by lowering -XX:InitiatingHeapOccupancyPercent (45% of the "
+        "whole heap by default); or raise -XX:ConcGCThreads",
+        G1_TUNING_8,
+    ),
+    "g1_evacuation_unknown": Advice(ADVICE["g1_evacuation_unknown"].text, G1_TUNING_8),
+    "g1_humongous": Advice(ADVICE["g1_humongous"].text, G1_TUNING_8),
+    "g1_marking_threshold": Advice(
+        "On Java 8, G1 starts a marking cycle when occupancy of the whole heap reaches "
+        "-XX:InitiatingHeapOccupancyPercent, a fixed threshold (45% by default) that G1 does "
+        "not adjust. When the live data alone sits close to that threshold, every cycle ends "
+        "with occupancy still near it and the next one starts almost at once. That costs CPU "
+        "on the concurrent GC threads, not pause time. A larger heap puts room between the "
+        "live data and the threshold",
+        f"{G1_TUNING_8}; {JAVA_8}",
+    ),
+    "g1_remark": Advice(
+        "The Remark pause completes marking and performs reference processing. On Java 8 "
+        "parallel reference processing is off by default; -XX:+ParallelRefProcEnabled turns "
+        "it on. This tool does not read the phase breakdown",
+        f"{G1_TUNING_8}; {JAVA_8}",
+    ),
+    "g1_young_pause": Advice(
+        f"{ADVICE['g1_young_pause'].text}. On Java 8 both flags are experimental and need "
+        "-XX:+UnlockExperimentalVMOptions",
+        f"{G1_TUNING}; {G1_TUNING_8}",
+    ),
+}
+
+
+def advice_for(key: str, major: int | None) -> Advice:
+    """The advice entry for ``key``, in its Java 8 wording for a Java 8 (or older) JVM."""
+    if major is not None and major <= 8 and key in JAVA8_ADVICE:
+        return JAVA8_ADVICE[key]
+    return ADVICE[key]
+
 
 _VERSION_LEGACY = re.compile(r"^1\.(\d+)\.")
 _VERSION_MODERN = re.compile(r"^(\d+)(?:[.+\-]|$)")

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gc-analyze"
-version = "6.0.0"
+version = "7.0.0"
 description = "JVM GC log analyzer: G1, Parallel, CMS and Serial; Java 8 and unified logging"
 requires-python = ">=3.14,<3.16"
 dependencies = [
@@ -42,13 +42,6 @@ reportUnknownMemberType = "error"
 reportUnknownVariableType = "error"
 reportMissingTypeArgument = "error"
 reportUnnecessaryTypeIgnoreComment = "error"
-
-[dependency-groups]
-dev = [
-    "pip-audit>=2.10.1",
-    "pytest>=9.2.0",
-    "pytest-cov>=7.1.0",
-]
 
 [project.optional-dependencies]
 dev = [

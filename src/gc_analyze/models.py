@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Literal
 
@@ -17,10 +18,71 @@ type SecondsValue = float
 GC_KINDS: tuple[GCKind, ...] = ("Young", "Mixed", "Full", "Initial Mark", "Remark", "Cleanup")
 
 
-class GCEvent(BaseModel):
-    """One stop-the-world GC pause, normalized across collectors and log formats."""
+@dataclass(slots=True, kw_only=True)
+class PauseRecord:
+    """One pause as a parser read it, before ``events.normalize_event`` turns it into GCEvent.
 
-    model_config = ConfigDict(frozen=True)
+    Sizes are KB as logged (None when the log does not give them); ``pause`` is seconds.
+    Parsers fill it in as they read the record and its detail lines.
+    """
+
+    gc_kind: GCKind
+    pause: float
+    cause: str | None = None
+    timestamp: str | None = None  # datestamp exactly as logged
+    uptime: float | None = None  # seconds since JVM start
+    pid: int | None = None  # unified logs with both pid and tid decorators
+    stamp_at_pause_end: bool = False  # unified logging stamps the pause line when it ends
+    line_index: int | None = None  # 0-based first line of the record
+    line_end: int | None = None  # 0-based last line of the record
+    gc_id: int | None = None
+
+    heap_before: int | None = None
+    heap_after: int | None = None
+    heap_total: int | None = None
+    young_before: int | None = None
+    young_after: int | None = None
+    old_before: int | None = None
+    old_after: int | None = None
+    old_total: int | None = None
+    metaspace_before: int | None = None
+    metaspace_after: int | None = None
+    humongous_before: int | None = None
+    humongous_after: int | None = None
+    promoted: int | None = None
+    # G1 unified "<Kind> regions: before->after(total)" lines, keyed "eden_before" etc.
+    region_counts: dict[str, int] = field(default_factory=dict[str, int])
+    region_size_kb: int | None = None
+
+    humongous_detected: bool = False
+    evacuation_failed: bool = False
+    to_space_exhausted: bool = False
+    evacuation_failure_reason: str | None = None
+    concurrent_mode_failure: bool = False
+    promotion_failed: bool = False
+    concurrent_start: bool = False
+
+    cpu_user: float | None = None
+    cpu_sys: float | None = None
+    cpu_real: float | None = None
+    survivor_capacity: int | None = None
+    survivor_used_pct: float | None = None
+    # Logged values that cannot all be true (see GCEvent.data_inconsistencies)
+    data_inconsistencies: list[str] = field(default_factory=list[str])
+
+    def note_inconsistency(self, problem: str) -> None:
+        """Record ``problem`` once."""
+        if problem not in self.data_inconsistencies:
+            self.data_inconsistencies.append(problem)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class GCEvent:
+    """One stop-the-world GC pause, normalized across collectors and log formats.
+
+    A frozen slots dataclass, not a pydantic model: a long log holds hundreds of thousands
+    of these, and every field is already typed by the parser that produced it.
+    """
 
     timestamp: datetime
     # None for datestamp-only legacy logs (no -XX:+PrintGCTimeStamps)
@@ -45,11 +107,9 @@ class GCEvent(BaseModel):
     heap_before_kb: KilobytesValue
     heap_after_kb: KilobytesValue
     heap_total_kb: KilobytesValue
-    heap_used_percentage: PercentageValue
 
     young_before_kb: KilobytesValue | None = None
     young_after_kb: KilobytesValue | None = None
-    young_total_kb: KilobytesValue | None = None
 
     old_before_kb: KilobytesValue | None = None
     old_after_kb: KilobytesValue | None = None
@@ -77,7 +137,6 @@ class GCEvent(BaseModel):
     # Metaspace
     metaspace_before_kb: KilobytesValue | None = None
     metaspace_after_kb: KilobytesValue | None = None
-    metaspace_total_kb: KilobytesValue | None = None
 
     # CPU time of the collection ("[Times: user= sys= real=]", unified gc,cpu), when logged
     cpu_user_seconds: float | None = None
@@ -92,6 +151,10 @@ class GCEvent(BaseModel):
     source_file: str | None = None
     line_number: int | None = None  # 1-based, first line of the record
     segment: int = 1  # JVM run within the input (1-based); see segments.py
+    # Logged values that cannot all be true; the affected figures are left out (None or
+    # has_heap_data=False), never clamped. See events.normalize_event.
+    data_inconsistencies: tuple[str, ...] = ()
+    pid: int | None = None  # JVM process id, when the unified log has pid and tid decorators
 
     @property
     def pause_start(self) -> datetime:
@@ -113,7 +176,6 @@ class DiagnosticThresholds(BaseModel):
 
     heap_critical_percentage: float = 95.0
     heap_warning_percentage: float = 80.0
-    heap_minimum_headroom_percentage: float = 5.0
 
     full_gc_critical_per_hour: float = 10.0
     full_gc_warning_per_hour: float = 1.0
@@ -139,12 +201,12 @@ class DiagnosticThresholds(BaseModel):
     # A significant floor trend only matters when it moves the floor this far over the span
     trend_min_growth_capacity_percentage: float = 5.0
 
-    # P1.4: per-hour rates and rate-based warnings need at least this much log
+    # per-hour rates and rate-based warnings need at least this much log
     min_rate_window_hours: float = 1.0
-    # P1.7: this many heap-pressure Full GCs inside the window is a thrashing streak
+    # this many heap-pressure Full GCs inside the window is a thrashing streak
     full_gc_streak_count: int = 3
     full_gc_streak_window_seconds: float = 300.0
-    # P1.1: the old-gen floor trend needs this many floors spanning this long
+    # the old-gen floor trend needs this many floors spanning this long
     min_floor_count: int = 3
     min_floor_span_hours: float = 1.0
     # Share of wall-clock time paused inside the worst 5-minute stretch
@@ -386,6 +448,7 @@ class FileCoverage(BaseModel):
     coverage: CandidateCoverage
     events: int
     events_without_heap_data: int
+    events_with_inconsistent_data: int = 0
 
 
 class PauseStats(BaseModel):
@@ -665,7 +728,7 @@ class LiveSetBound(BaseModel):
 
 
 class HeapStats(BaseModel):
-    """Heap occupancy before/after GC against the max heap (P1.3)."""
+    """Heap occupancy before/after GC against the max heap."""
 
     events_with_heap_data: int = 0
     max_heap_kb: int | None = None
@@ -712,6 +775,57 @@ class SegmentInfo(BaseModel):
     max_heap_kb: int | None = None
 
 
+class PauseMoment(BaseModel):
+    """When a pause was logged, with what is needed to show it (date or uptime)."""
+
+    timestamp: datetime
+    wall_clock: bool
+    uptime_seconds: float | None = None
+
+
+class TopPause(BaseModel):
+    """One of the longest pauses, with every figure the report shows for it."""
+
+    at: PauseMoment
+    stamp_at_pause_end: bool
+    pause_seconds: float
+    description: str  # kind (cause; failure flags)
+    has_heap_data: bool
+    heap_before_kb: int
+    heap_after_kb: int
+    heap_total_kb: int
+    old_after_kb: int | None = None
+    # old generation after the pause as % of ``GCSummary.old_pct_basis`` (None: unknown)
+    old_pct: float | None = None
+    cpu_user_seconds: float | None = None
+    cpu_sys_seconds: float | None = None
+    cpu_real_seconds: float | None = None
+    segment: int = 1
+    source_file: str | None = None
+    line_number: int | None = None
+
+
+class PauseClustering(BaseModel):
+    """Whether the longest pauses happen close together."""
+
+    longest_count: int  # how many of the longest pauses were compared
+    window_seconds: float  # "together" means within this long
+    clustered_count: int  # most of them within one window (< 3: spread out)
+    span_seconds: float = 0.0  # from the first to the last pause of that cluster
+    first: PauseMoment | None = None
+    last: PauseMoment | None = None
+
+
+class RunHeapPeak(BaseModel):
+    """Peak heap after a collecting pause in one JVM run, against that run's max heap."""
+
+    run: int
+    peak_after_gc_kb: int
+    max_heap_kb: int | None = None
+    # peak as a fraction of max heap; None when unknown or the logged heap exceeds it
+    fraction_of_max: float | None = None
+
+
 class GCSummary(BaseModel):
     """Complete GC analysis summary for one analysis window."""
 
@@ -727,7 +841,7 @@ class GCSummary(BaseModel):
     first_timestamp: datetime | None = None
     last_timestamp: datetime | None = None
     wall_clock: bool = True
-    # P1.4: per-hour rates are only computed when the window is long enough
+    # per-hour rates are only computed when the window is long enough
     rates_reliable: bool = False
 
     # Counts
@@ -758,6 +872,8 @@ class GCSummary(BaseModel):
     # Most heap-pressure Full GCs with the last starting within the streak window of the
     # first one finishing
     max_full_gc_streak: int = 0
+    # the same, leaving out JVM start-up (DiagnosticThresholds.warmup_seconds of uptime)
+    max_full_gc_streak_after_warmup: int = 0
 
     # Overhead (pause time inside the window / window length)
     total_gc_time_sec: float = 0.0
@@ -787,7 +903,7 @@ class GCSummary(BaseModel):
     pauses_over_30s: int = 0
     pauses_over_60s: int = 0
 
-    # Heap (P1.3, P1.5)
+    # Heap
     heap: HeapStats = Field(default_factory=HeapStats)
 
     # Old gen. old_pct_basis names the denominator of every old-gen percentage
@@ -810,7 +926,7 @@ class GCSummary(BaseModel):
     heap_full_gc_reclaimed_pcts: list[float] = Field(default_factory=list)
     ineffective_full_gc_count: int = 0
 
-    # Allocation (P1.8)
+    # Allocation
     avg_promotion_kb: float = 0.0
     total_promoted_kb: int = 0
     promotion_rate_mb_sec: float | None = None
@@ -848,3 +964,14 @@ class GCSummary(BaseModel):
     health_warnings: list[HealthWarning] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     data_notes: list[str] = Field(default_factory=list)
+
+    # What the report shows about individual pauses, computed here so no output format
+    # does arithmetic of its own
+    top_pauses: list[TopPause] = Field(default_factory=list[TopPause])
+    pause_clustering: PauseClustering | None = None
+    run_heap_peaks: list[RunHeapPeak] = Field(default_factory=list[RunHeapPeak])
+    # pauses with logged sizes that cannot all be true (see GCEvent.data_inconsistencies)
+    events_with_inconsistent_data: int = 0
+    # which end of each pause its time marks: unified logs stamp the end, Java 8 the start
+    pause_stamps: Literal["end", "start", "mixed"] | None = None
+    cpu_times_logged: bool = False  # any pause logged user/sys/real CPU times

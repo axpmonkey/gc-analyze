@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import heapq
 import math
-from bisect import bisect_right
+from bisect import bisect_right, insort
 from collections import Counter
 from datetime import datetime, timedelta
 from itertools import pairwise
@@ -31,17 +32,21 @@ from .models import (
     LeakVerdict,
     LiveSetBound,
     MetaspaceAnalysis,
+    PauseClustering,
+    PauseMoment,
     PauseShareWindow,
     PauseStats,
     PeriodStatistics,
+    RunHeapPeak,
     SafepointStats,
     SideRecord,
     SurvivorOverflow,
     TimelineBucket,
+    TopPause,
 )
 
 # ============================================================
-# FULL GC CAUSES (P1.2)
+# FULL GC CAUSES
 # ============================================================
 
 # Full GCs requested by code, tooling or a timer, not by Java-heap pressure (e.g. Tomcat's
@@ -228,7 +233,7 @@ def format_duration(seconds: float) -> str:
 
 
 # ============================================================
-# HEAP (P1.3, P1.5)
+# HEAP
 # ============================================================
 
 
@@ -297,7 +302,7 @@ def compute_heap_stats(events: list[GCEvent], max_heap_kb: int | None, source: s
 
 
 # ============================================================
-# OLD-GEN FLOOR TREND (P1.1)
+# OLD-GEN FLOOR TREND
 # ============================================================
 
 
@@ -338,9 +343,11 @@ def find_floor_step(
     """
     best: FloorStep | None = None
     best_rise = 0
+    earlier = sorted(f.value_kb for f in floors[:1])  # floors before ``index``, kept sorted
     for index in range(1, len(floors)):
         before, after = floors[index - 1], floors[index]
-        baseline = median(f.value_kb for f in floors[:index])
+        baseline = median(earlier)  # already sorted: linear, not a fresh sort of the prefix
+        insort(earlier, after.value_kb)
         rise = after.value_kb - before.value_kb
         if after.value_kb < thresholds.floor_step_factor * baseline or rise <= best_rise:
             continue
@@ -618,7 +625,7 @@ def compute_live_set_bound(
         for e in events
         if e.has_heap_data and e.gc_kind in COLLECTING_KINDS and not _in_warmup(e, thresholds)
     ]
-    if usable:  # S9: the latest JVM run only
+    if usable:  # the latest JVM run only
         last_run = max(e.segment for e in usable)
         usable = [e for e in usable if e.segment == last_run]
     if len(usable) < LIVE_SET_BOUND_MIN_SLICES:
@@ -1011,7 +1018,7 @@ def calculate_g1_metrics(
 
 
 def calculate_cms_metrics(events: list[GCEvent], runtime_hours: float | None) -> CMSMetrics:
-    """CMS cycles (= Initial Mark pauses) and the two CMS failure modes (P1.6)."""
+    """CMS cycles (= Initial Mark pauses) and the two CMS failure modes."""
     initial_marks = [e for e in events if e.gc_kind == "Initial Mark"]
     remarks = [e for e in events if e.gc_kind == "Remark"]
     return CMSMetrics(
@@ -1460,7 +1467,7 @@ def compute_safepoint_stats(
 def allocation_rate(
     events: list[GCEvent], *, whole_heap: bool = False
 ) -> tuple[float | None, str | None, float]:
-    """Allocation between consecutive GCs (P1.8): (MB/s, basis, seconds it was measured over).
+    """Allocation between consecutive GCs: (MB/s, basis, seconds it was measured over).
 
     Allocated between GC n-1 and GC n = occupancy before GC n - occupancy after GC n-1.
     The rate is per second the application was running: time inside pauses and downtime
@@ -1498,6 +1505,195 @@ def allocation_rate(
 # ============================================================
 # SUMMARY
 # ============================================================
+
+
+# ============================================================
+# INDIVIDUAL PAUSES SHOWN IN THE REPORT
+# ============================================================
+
+TOP_PAUSES = 10
+CLUSTER_TOP_PAUSES = 5
+CLUSTER_WINDOW_SECONDS = 900.0
+# The longest pauses must stand out from the typical pause before their timing is discussed
+CLUSTERING_MIN_RATIO_TO_MEDIAN = 2.0
+
+
+def longest_full_gc_streak(heap_full: list[GCEvent], thresholds: DiagnosticThresholds) -> int:
+    """Most heap-pressure Full GCs back to back within the streak window, in any one run."""
+    by_run: dict[int, list[GCEvent]] = {}
+    for event in heap_full:
+        by_run.setdefault(event.segment, []).append(event)
+    return max(
+        (
+            max_back_to_back(
+                [(event.pause_start - group[0].timestamp).total_seconds() for event in group],
+                [(event.pause_end - group[0].timestamp).total_seconds() for event in group],
+                thresholds.full_gc_streak_window_seconds,
+            )
+            for group in by_run.values()
+        ),
+        default=0,
+    )
+
+
+def describe_pause(event: GCEvent) -> str:
+    """'Full (Allocation Failure)' / 'Young (G1 Evacuation Pause)'."""
+    flags: list[str] = []
+    if event.concurrent_mode_failure:
+        flags.append("concurrent mode failure")
+    if event.promotion_failed:
+        flags.append("promotion failed")
+    if event.to_space_exhausted or event.evacuation_failed:
+        reason = event.evacuation_failure_reason or (
+            "Allocation" if event.to_space_exhausted else None
+        )
+        flags.append(f"evacuation failure ({reason})" if reason else "evacuation failure")
+    cause = event.cause or "cause not logged"
+    suffix = f"; {', '.join(flags)}" if flags else ""
+    return f"{event.gc_kind} ({cause}{suffix})"
+
+
+def pause_moment(event: GCEvent) -> PauseMoment:
+    """When ``event`` was logged."""
+    return PauseMoment(
+        timestamp=event.timestamp, wall_clock=event.wall_clock, uptime_seconds=event.uptime_seconds
+    )
+
+
+def find_top_pauses(
+    events: list[GCEvent],
+    *,
+    old_pct_capacity_kb: int | None,
+    max_heap_by_segment: dict[int, int | None],
+    g1: bool,
+    top_n: int = TOP_PAUSES,
+) -> list[TopPause]:
+    """The ``top_n`` longest pauses (``events`` in time order; ties keep that order).
+
+    Old-generation percentage: against each run's max heap for G1 across several runs,
+    against ``old_pct_capacity_kb`` when the summary fixes one, else the event's own
+    old-generation capacity.
+    """
+    top: list[TopPause] = []
+    for event in heapq.nlargest(top_n, events, key=lambda e: e.pause_time_seconds):
+        old_pct: float | None
+        if g1 and len(max_heap_by_segment) > 1:
+            capacity = max_heap_by_segment.get(event.segment)
+            old_pct = (
+                event.old_after_kb / capacity * 100
+                if capacity and event.old_after_kb is not None
+                else None
+            )
+        elif old_pct_capacity_kb and event.old_after_kb is not None:
+            old_pct = event.old_after_kb / old_pct_capacity_kb * 100
+        else:
+            old_pct = event.old_used_percentage
+        top.append(
+            TopPause(
+                at=pause_moment(event),
+                stamp_at_pause_end=event.stamp_at_pause_end,
+                pause_seconds=event.pause_time_seconds,
+                description=describe_pause(event),
+                has_heap_data=event.has_heap_data,
+                heap_before_kb=event.heap_before_kb,
+                heap_after_kb=event.heap_after_kb,
+                heap_total_kb=event.heap_total_kb,
+                old_after_kb=event.old_after_kb,
+                old_pct=old_pct,
+                cpu_user_seconds=event.cpu_user_seconds,
+                cpu_sys_seconds=event.cpu_sys_seconds,
+                cpu_real_seconds=event.cpu_real_seconds,
+                segment=event.segment,
+                source_file=event.source_file,
+                line_number=event.line_number,
+            )
+        )
+    return top
+
+
+def find_pause_clustering(
+    events: list[GCEvent],
+    top_n: int = CLUSTER_TOP_PAUSES,
+    window_s: float = CLUSTER_WINDOW_SECONDS,
+) -> PauseClustering | None:
+    """Whether the longest pauses happen together (``events`` in time order).
+
+    Only judged when the log is much longer than the window and the longest pauses stand out
+    from the typical one; None otherwise.
+    """
+    if len(events) < 2:
+        return None
+    total_span = (events[-1].timestamp - events[0].timestamp).total_seconds()
+    if total_span < window_s * 2:
+        return None
+    top = sorted(
+        heapq.nlargest(top_n, events, key=lambda e: e.pause_time_seconds), key=lambda e: e.timestamp
+    )
+    if len(top) < 3:
+        return None
+    typical = sorted(e.pause_time_seconds for e in events)[len(events) // 2]
+    if min(e.pause_time_seconds for e in top) < CLUSTERING_MIN_RATIO_TO_MEDIAN * typical:
+        return None  # the "longest" pauses are ordinary ones: where they fall means nothing
+    base = top[0].timestamp
+    best = max_events_in_window([(e.timestamp - base).total_seconds() for e in top], window_s)
+    result = PauseClustering(longest_count=len(top), window_seconds=window_s, clustered_count=best)
+    if best < 3:
+        return result
+    for start in range(len(top)):
+        origin = top[start].timestamp
+        inside = [e for e in top[start:] if (e.timestamp - origin).total_seconds() <= window_s]
+        if len(inside) == best:
+            result.span_seconds = (inside[-1].timestamp - inside[0].timestamp).total_seconds()
+            result.first, result.last = pause_moment(inside[0]), pause_moment(inside[-1])
+            return result
+    return None  # pragma: no cover - the best window starts at one of the pauses
+
+
+def find_run_heap_peaks(
+    events: list[GCEvent], max_heap_by_segment: dict[int, int | None]
+) -> list[RunHeapPeak]:
+    """Peak heap after a collecting pause in each run, as a fraction of that run's max heap."""
+    peak_by_run: dict[int, int] = {}
+    exceeds: set[int] = set()
+    for event in events:
+        if not event.has_heap_data:
+            continue
+        capacity = max_heap_by_segment.get(event.segment)
+        if capacity and max(event.heap_before_kb, event.heap_after_kb) > capacity:
+            exceeds.add(event.segment)
+        if event.gc_kind in COLLECTING_KINDS:
+            peak_by_run[event.segment] = max(peak_by_run.get(event.segment, 0), event.heap_after_kb)
+    peaks: list[RunHeapPeak] = []
+    for run, peak in sorted(peak_by_run.items()):
+        capacity = max_heap_by_segment.get(run)
+        peaks.append(
+            RunHeapPeak(
+                run=run,
+                peak_after_gc_kb=peak,
+                max_heap_kb=capacity,
+                fraction_of_max=peak / capacity if capacity and run not in exceeds else None,
+            )
+        )
+    return peaks
+
+
+def attach_pause_details(summary: GCSummary, events: list[GCEvent]) -> None:
+    """Fill the summary's per-pause figures from the analysed pauses."""
+    ordered = sorted(events, key=lambda e: e.timestamp)
+    summary.top_pauses = find_top_pauses(
+        ordered,
+        old_pct_capacity_kb=summary.old_pct_capacity_kb,
+        max_heap_by_segment=summary.max_heap_by_segment,
+        g1=summary.is_g1,
+    )
+    summary.pause_clustering = find_pause_clustering(ordered)
+    summary.run_heap_peaks = find_run_heap_peaks(ordered, summary.max_heap_by_segment)
+    summary.events_with_inconsistent_data = sum(1 for e in events if e.data_inconsistencies)
+    stamps = {e.stamp_at_pause_end for e in events}
+    summary.pause_stamps = (
+        None if not stamps else "mixed" if len(stamps) > 1 else "end" if True in stamps else "start"
+    )
+    summary.cpu_times_logged = any(e.cpu_real_seconds is not None for e in events)
 
 
 def build_comprehensive_summary(
@@ -1590,7 +1786,7 @@ def build_comprehensive_summary(
     rates_reliable = runtime_hours >= thresholds.min_rate_window_hours and runtime_hours > 0
     rate_hours = runtime_hours if rates_reliable else None
 
-    # Full GC causes (P1.2)
+    # Full GC causes
     cause_rows: dict[str, list[GCEvent]] = {}
     for event in full_events:
         cause_rows.setdefault(event.cause or "(cause not logged)", []).append(event)
@@ -1615,7 +1811,7 @@ def build_comprehensive_summary(
             counts = Counter(e.cause or "(cause not logged)" for e in kind_events)
             causes_by_kind[kind] = dict(counts.most_common())
 
-    # Heap-pressure Full GC timing (P1.2, P1.7)
+    # Heap-pressure Full GC timing
     intervals = [
         (later.timestamp - earlier.timestamp).total_seconds() / 60
         for earlier, later in pairwise(heap_full)
@@ -1634,19 +1830,9 @@ def build_comprehensive_summary(
             and s_statistic < 0
             and p_value < thresholds.trend_p_value
         )
-    full_by_run: dict[int, list[GCEvent]] = {}
-    for event in heap_full:
-        full_by_run.setdefault(event.segment, []).append(event)
-    max_streak = max(
-        (
-            max_back_to_back(
-                [(event.pause_start - group[0].timestamp).total_seconds() for event in group],
-                [(event.pause_end - group[0].timestamp).total_seconds() for event in group],
-                thresholds.full_gc_streak_window_seconds,
-            )
-            for group in full_by_run.values()
-        ),
-        default=0,
+    max_streak = longest_full_gc_streak(heap_full, thresholds)
+    max_streak_after_warmup = longest_full_gc_streak(
+        [event for event in heap_full if not _in_warmup(event, thresholds)], thresholds
     )
 
     # Pauses
@@ -1658,7 +1844,7 @@ def build_comprehensive_summary(
         if kind_events
     }
     # P99 that the headline and the warning use: the worst kind with enough pauses for a
-    # P99 to mean something (S11); otherwise all pauses together.
+    # P99 to mean something; otherwise all pauses together.
     worst_p99_kind: str | None = None
     worst_p99_seconds, worst_p99_count = overall.p99, overall.count
     eligible = {
@@ -1725,7 +1911,7 @@ def build_comprehensive_summary(
                 )
             )
 
-    # Heap vs max (P1.3, P1.5)
+    # Heap vs max
     max_heap_kb, max_heap_source = resolve_max_heap(
         jvm_heap_config, max_heap_bytes, max_heap_from_log_bytes
     )
@@ -1755,7 +1941,7 @@ def build_comprehensive_summary(
             observed_spans=merged_run_spans,
         )
 
-    # Old gen (sawtooth) and floors (P1.1). One denominator for every old-gen percentage:
+    # Old gen (sawtooth) and floors. One denominator for every old-gen percentage:
     # the sized old generation for generational collectors; for G1, which has no fixed old
     # generation, the max heap (or the committed heap when the max is unknown).
     is_g1 = "G1" in gc_type
@@ -1878,7 +2064,7 @@ def build_comprehensive_summary(
             and p_value < thresholds.trend_p_value
         )
 
-    # Promotion and allocation (P1.8). Every young GC with old-gen sizes counts, including
+    # Promotion and allocation. Every young GC with old-gen sizes counts, including
     # the ones that promoted nothing.
     # For G1 with region counts the growth of "Old regions" alone is used (promoted_kb).
     promotions = [
@@ -1962,6 +2148,7 @@ def build_comprehensive_summary(
         ),
         full_gc_accelerating=full_gc_accelerating,
         max_full_gc_streak=max_streak,
+        max_full_gc_streak_after_warmup=max_streak_after_warmup,
         total_gc_time_sec=total_gc_time,
         gc_overhead_pct=gc_overhead_pct,
         throughput_pct=max(0.0, 100 - gc_overhead_pct),
@@ -2060,6 +2247,7 @@ def build_comprehensive_summary(
     summary.environment = environment
     summary.health_warnings, summary.data_notes = build_health_warnings(summary, thresholds)
     summary.warnings = [warning.line for warning in summary.health_warnings]
+    attach_pause_details(summary, events)
     return summary
 
 
@@ -2100,14 +2288,6 @@ def not_assessed_notes(summary: GCSummary) -> list[str]:
             "in the log)"
         )
     return notes
-
-
-def build_warnings_and_notes(
-    summary: GCSummary, thresholds: DiagnosticThresholds
-) -> tuple[list[str], list[str]]:
-    """Health warnings as "CRITICAL: ..."/"WARNING: ..." lines, and data-quality notes."""
-    coded, notes = build_health_warnings(summary, thresholds)
-    return [warning.line for warning in coded], notes
 
 
 def build_health_warnings(
@@ -2330,12 +2510,19 @@ def build_health_warnings(
             f"{summary.longest_pause_cause}) at {summary.longest_pause_when} "
             f"(threshold {limit:g} s)",
         )
-    if summary.max_full_gc_streak >= t.full_gc_streak_count:
-        warn(
-            "full_gc_streak",
-            f"CRITICAL: {summary.max_full_gc_streak} heap-pressure Full GCs within "
-            f"{t.full_gc_streak_window_seconds / 60:.0f} minutes - memory thrashing",
-        )
+    # Back-to-back Full GCs that each reclaim little are thrashing; ones that reclaim well
+    # are frequent but working. Start-up streaks (the live data being loaded) are findings of
+    # their own (info), not health warnings.
+    streak = summary.max_full_gc_streak_after_warmup
+    if streak >= t.full_gc_streak_count:
+        window = f"{t.full_gc_streak_window_seconds / 60:.0f} minutes"
+        if summary.ineffective_full_gc_count:
+            warn(
+                "full_gc_streak",
+                f"CRITICAL: {streak} heap-pressure Full GCs within {window} - memory thrashing",
+            )
+        else:
+            warn("full_gc_streak", f"WARNING: {streak} heap-pressure Full GCs within {window}")
     # full_gc_accelerating and reclamation_declining raise no warning of their own: on their
     # own they are a comparison of two halves. They are shown as evidence beside the
     # independent signals above (rate, streak, ineffective Full GCs, a full or growing floor).

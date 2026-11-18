@@ -73,10 +73,22 @@ The application detects the format and collector automatically.
 ZGC, Shenandoah, and Epsilon logs are not supported. Basic Java 8 `PrintGC` logs can provide
 pause and heap statistics without identifying the collector or exposing all diagnostic data.
 
-Supply plain-text log files from **one JVM**, including its rotated files if needed. Files with
-different collectors must be analyzed separately. Extract compressed logs before running the
-application. Keep startup headers and detailed GC records when available: they provide heap
+Supply log files from **one JVM**, including its rotated files if needed. Files with different
+collectors must be analyzed separately. Gzip-compressed files (for example `gc.log.3.gz`) are
+read directly. Keep startup headers and detailed GC records when available: they provide heap
 limits, JVM configuration, and evidence needed for more complete findings.
+
+Files are read line by line and never held in memory, so memory use depends on the number of
+GC pauses, not on the size of the file: a multi-gigabyte `catalina.out` is fine.
+
+Without `-Xloggc`, Java 8 writes GC records to standard output, which Tomcat sends to
+`catalina.out`. That file can be analyzed directly. Application lines are ignored, including
+application text that another thread wrote into the middle of a GC record, on its own line or
+on the same line. A record split this way is only recovered when it carries a datestamp
+(`-XX:+PrintGCDateStamps`): with uptime alone, where the record begins cannot be told apart
+from digits the application wrote, so the record is counted as not parsed instead of being
+given a guessed time. The flags printed by `-XX:+PrintCommandLineFlags` supply the maximum heap
+and mark each JVM start.
 
 Both dated logs and logs containing only JVM uptime are supported. Uptime alone is sufficient
 for a general report; selecting a clock-time window or exporting events requires dated records
@@ -100,7 +112,20 @@ uv run --frozen gc-analyze analyze gc.log --brief --output gc-brief.md
 
 Without `--output`, `--brief` writes Markdown to standard output. Output paths are relative to
 the current directory unless absolute. Create the destination directory first; existing output
-files are overwritten.
+files are replaced as a whole (a reader never sees a half-written file).
+
+Write the report as JSON for scripts and dashboards:
+
+```sh
+uv run --frozen gc-analyze analyze gc.log --json gc-report.json
+uv run --frozen gc-analyze analyze gc.log --json - | jq .status
+```
+
+The JSON holds the status, exit code, diagnosis, findings, the full summary of figures (each
+percentage next to the field naming its denominator, such as `heap.max_heap_source`), JVM runs
+and parsing coverage. `schema_version` changes when its layout does. With `--json -` only the
+JSON is written to standard output; status messages go to standard error. The terminal,
+Markdown, brief and JSON outputs are all rendered from the same analysis, so they always agree.
 
 ### Analyze rotated files or JVM restarts
 
@@ -110,7 +135,13 @@ Pass the rotated files together. The application orders them by their recorded t
 uv run --frozen gc-analyze analyze gc.log.0 gc.log.1 gc.log.2.current
 ```
 
-When the input includes restarts, each detected JVM run becomes a numbered **segment**. By
+Java 8 (`-XX:+UseGCLogFileRotation`) repeats the JVM startup header at the top of every rotated
+file. The application recognizes the rotation marker before it, so rotated files of one JVM stay
+one run.
+
+A new JVM run is detected when uptime goes back to zero, when the process id changes (unified
+logs with both the `pid` and `tid` decorators), or when a JVM startup header appears between two
+pauses. When the input includes restarts, each detected JVM run becomes a numbered **segment**. By
 default, only the latest segment is analyzed. Use the **JVM Runs Found** table to choose another:
 
 ```sh
@@ -209,7 +240,9 @@ collection failures, and `INFO` otherwise; it is separate from the report's over
 ## Understand the report
 
 Sections appear when the log contains the necessary data. Findings include severity, evidence,
-confidence, and a recommended action with a documentation reference.
+confidence, and a recommended action with a documentation reference. Advice and references
+follow the JDK release in the log: Java 8 logs get Java 8 documentation and only flags that
+Java 8 accepts.
 
 | Report item | Meaning |
 |---|---|
@@ -220,11 +253,12 @@ confidence, and a recommended action with a documentation reference.
 | **Worst 5 minutes** | The five-minute stretch with the highest pause overhead, exposing incidents that a whole-log average can hide. |
 | **Heap after GC** | Memory remaining after a collecting pause. A high value after a young collection can include old garbage that has not yet been collected. |
 | **Highest post-Full-GC occupancy** | Heap remaining after Full GC as a share of that run's maximum, when known. |
+| **Full GC streaks** | Several heap-pressure Full GCs back to back (3 within 5 minutes by default, `--full-gc-streak`). A warning when each one still frees memory; critical ("memory thrashing") when they also free little and leave the heap nearly full. A streak only during JVM start-up (the first 10 minutes of uptime) is reported as information. |
 | **Full GC causes** | Heap pressure, explicit requests, metaspace, other known triggers, or unknown. Only recognized heap-pressure causes contribute to heap-pressure rates and streaks. |
 | **Post-GC Occupancy Trend** | A comparison of like collection types in one JVM run. A sustained rise warrants inspecting retention and workload. |
 | **Safepoint Timing** | Total elapsed time, time reaching the safepoint and time at it, where logged. VM operations and GC overlap are used to identify known and unmatched events. |
 | **Timeline** | Counts, overhead, longest pause, Full GCs, and heap occupancy in time slices. |
-| **Data Notes / Parsing Coverage** | Missing measurements, assumptions, and GC lines the parser could not understand. Coverage describes all supplied files, even when a segment or window is selected. |
+| **Data Notes / Parsing Coverage** | Missing measurements, assumptions, and GC lines the parser could not understand. Coverage describes all supplied files, even when a segment or window is selected. Pauses whose logged sizes contradict each other (for example, heap after GC above the committed heap) are counted under **Data limits** and left out of heap figures; their pause times still count. |
 
 Without a selected window, duration runs from the first pause's start to the last pause's end.
 Per-hour rates are shown only for windows of at least 60 minutes by default; shorter windows show

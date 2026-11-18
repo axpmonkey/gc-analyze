@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import re
 from datetime import UTC, datetime, timedelta
-from typing import Any
 
-from .models import GCEvent
+from .models import GCEvent, PauseRecord
 
 # Anchor for uptime-only logs without --jvm-start. Only differences between timestamps are
 # meaningful; display code checks GCEvent.wall_clock before printing a date.
 UPTIME_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+HEAP_AFTER_ABOVE_COMMITTED = "heap after GC above committed heap"
+OLD_AFTER_ABOVE_CAPACITY = "old generation after GC above its capacity"
 
 _OFFSET_SUFFIX = re.compile(r"(?:[+-]\d{2}:?\d{2}|Z)$")
 
@@ -35,19 +37,19 @@ def timestamp_has_offset(timestamp_str: str) -> bool:
 
 
 def normalize_event(
-    raw_event: dict[str, Any],
+    record: PauseRecord,
     jvm_start: datetime | None = None,
     source_file: str | None = None,
-) -> GCEvent | None:
-    """Convert a parser dict to a validated GCEvent.
+) -> GCEvent:
+    """Turn a parser's ``PauseRecord`` into a ``GCEvent``.
 
     Events without a wall-clock timestamp are placed at ``jvm_start + uptime`` when an
     anchor is given, otherwise at ``UPTIME_EPOCH + uptime`` with ``wall_clock=False``.
     Events without heap sizes are kept (their pause still counts) with
-    ``has_heap_data=False``. Returns None only for events with no usable pause time.
+    ``has_heap_data=False``.
     """
-    timestamp_str: str | None = raw_event.get("timestamp")
-    uptime: float | None = raw_event.get("uptime")
+    timestamp_str = record.timestamp
+    uptime = record.uptime
     wall_clock = True
     tz_source: str | None
     if timestamp_str:
@@ -61,67 +63,69 @@ def normalize_event(
         wall_clock = False
         tz_source = None
 
-    pause_time = raw_event.get("pause")
-    if pause_time is None:
-        return None
-    pause_time = max(0.0, float(pause_time))
-
-    heap_total = int(raw_event.get("heap_total") or 0)
+    # Values that cannot all be true are reported and left out of the statistics they would
+    # distort; they are never clamped into plausible-looking numbers.
+    inconsistencies = list(record.data_inconsistencies)
+    heap_total = record.heap_total or 0
     has_heap = heap_total > 0
-    heap_before = int(raw_event.get("heap_before") or 0) if has_heap else 0
-    heap_after = int(raw_event.get("heap_after") or 0) if has_heap else 0
-    heap_used_pct = max(0.0, min(100.0, heap_after / heap_total * 100)) if has_heap else 0.0
+    if has_heap and (record.heap_after or 0) > heap_total:
+        inconsistencies.append(HEAP_AFTER_ABOVE_COMMITTED)
+        has_heap = False  # the pause still counts; its heap sizes do not
+    heap_before = (record.heap_before or 0) if has_heap else 0
+    heap_after = (record.heap_after or 0) if has_heap else 0
+    heap_total = heap_total if has_heap else 0
 
-    old_total = raw_event.get("old_total")
-    old_after = raw_event.get("old_after")
+    old_total, old_after = record.old_total, record.old_after
     old_used_pct = None
     if old_total and old_total > 0 and old_after is not None:
-        old_used_pct = max(0.0, min(100.0, old_after / old_total * 100))
+        if old_after > old_total:
+            inconsistencies.append(OLD_AFTER_ABOVE_CAPACITY)
+        else:
+            old_used_pct = old_after / old_total * 100
 
-    line_index = raw_event.get("line_index")
+    line_index = record.line_index
     return GCEvent(
         timestamp=timestamp,
         uptime_seconds=uptime,
-        gc_kind=raw_event["gc_kind"],
+        gc_kind=record.gc_kind,
         wall_clock=wall_clock,
         timestamp_raw=timestamp_str,
         tz_source=tz_source,
-        pause_time_seconds=pause_time,
-        stamp_at_pause_end=bool(raw_event.get("stamp_at_pause_end", False)),
-        cause=raw_event.get("cause") or None,
+        pause_time_seconds=record.pause,
+        stamp_at_pause_end=record.stamp_at_pause_end,
+        cause=record.cause or None,
         has_heap_data=has_heap,
         heap_before_kb=heap_before,
         heap_after_kb=heap_after,
         heap_total_kb=heap_total,
-        heap_used_percentage=heap_used_pct,
-        young_before_kb=raw_event.get("young_before"),
-        young_after_kb=raw_event.get("young_after"),
-        young_total_kb=raw_event.get("young_total"),
-        old_before_kb=raw_event.get("old_before"),
+        young_before_kb=record.young_before,
+        young_after_kb=record.young_after,
+        old_before_kb=record.old_before,
         old_after_kb=old_after,
         old_total_kb=old_total,
         old_used_percentage=old_used_pct,
-        concurrent_start=raw_event.get("concurrent_start", False),
-        humongous_before_kb=raw_event.get("humongous_before"),
-        humongous_after_kb=raw_event.get("humongous_after"),
-        promoted_kb=raw_event.get("promoted"),
-        humongous_detected=raw_event.get("humongous_detected", False),
-        evacuation_failed=raw_event.get("evacuation_failed", False),
-        to_space_exhausted=raw_event.get("to_space_exhausted", False),
-        evacuation_failure_reason=raw_event.get("evacuation_failure_reason")
-        or ("Allocation" if raw_event.get("to_space_exhausted") else None),
-        concurrent_mode_failure=raw_event.get("concurrent_mode_failure", False),
-        promotion_failed=raw_event.get("promotion_failed", False),
-        metaspace_before_kb=raw_event.get("metaspace_before"),
-        metaspace_after_kb=raw_event.get("metaspace_after"),
-        metaspace_total_kb=raw_event.get("metaspace_total"),
-        cpu_user_seconds=raw_event.get("cpu_user"),
-        cpu_sys_seconds=raw_event.get("cpu_sys"),
-        cpu_real_seconds=raw_event.get("cpu_real"),
-        survivor_capacity_kb=raw_event.get("survivor_capacity"),
-        survivor_used_percentage=raw_event.get("survivor_used_pct"),
+        concurrent_start=record.concurrent_start,
+        humongous_before_kb=record.humongous_before,
+        humongous_after_kb=record.humongous_after,
+        promoted_kb=record.promoted,
+        humongous_detected=record.humongous_detected,
+        evacuation_failed=record.evacuation_failed,
+        to_space_exhausted=record.to_space_exhausted,
+        evacuation_failure_reason=record.evacuation_failure_reason
+        or ("Allocation" if record.to_space_exhausted else None),
+        concurrent_mode_failure=record.concurrent_mode_failure,
+        promotion_failed=record.promotion_failed,
+        metaspace_before_kb=record.metaspace_before,
+        metaspace_after_kb=record.metaspace_after,
+        cpu_user_seconds=record.cpu_user,
+        cpu_sys_seconds=record.cpu_sys,
+        cpu_real_seconds=record.cpu_real,
+        survivor_capacity_kb=record.survivor_capacity,
+        survivor_used_percentage=record.survivor_used_pct,
         source_file=source_file,
         line_number=line_index + 1 if line_index is not None else None,
+        data_inconsistencies=tuple(inconsistencies),
+        pid=record.pid,
     )
 
 

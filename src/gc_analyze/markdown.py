@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 
 from .report import Section, finding_lines, sanitize_text
 
-# --brief: what goes into a case file (P2.4), in this order
+# --brief: what goes into a case file, in this order
 BRIEF_SECTION_IDS: tuple[str, ...] = (
     "header",
     "unparsed",
@@ -126,12 +126,6 @@ def render_markdown(sections: list[Section], generated: datetime | None = None) 
     return "".join(parts)
 
 
-def _paused_share(row: list[str]) -> float:
-    """Share of time paused from a timeline row ("87.4% (262.2 s)"; "—" when none)."""
-    text = row[2].split("%", 1)[0]
-    return float(text) if text.replace(".", "", 1).isdigit() else 0.0
-
-
 def _brief_section(section: Section, detail: BriefDetail) -> Section:
     floors_limit = detail.floors
     if section.id == "findings" and section.findings:
@@ -152,8 +146,11 @@ def _brief_section(section: Section, detail: BriefDetail) -> Section:
         return Section(id="brief_findings", title="Findings", kind="bullets", items=items)
     if section.id == "timeline" and len(section.table_rows) > detail.timeline_rows:
         # the slices where the application was stopped most, kept in time order
-        ranked = sorted(section.table_rows, key=_paused_share, reverse=True)[: detail.timeline_rows]
-        rows = [row for row in section.table_rows if any(row is kept for kept in ranked)]
+        weights = section.row_weights or [0.0] * len(section.table_rows)
+        ranked = sorted(
+            range(len(section.table_rows)), key=lambda index: weights[index], reverse=True
+        )[: detail.timeline_rows]
+        rows = [section.table_rows[index] for index in sorted(ranked)]
         return Section(
             id=section.id,
             title=(
